@@ -859,9 +859,32 @@ kk_image_plane_create_texture(struct kk_image_plane *plane,
                               struct kk_image_layout *layout, uint64_t offset_B)
 {
    uint64_t mem_offset_B = plane->mem_offset_B + offset_B;
-   if (plane->layout.linear)
-      return mtl_new_texture_with_descriptor_linear(plane->mem->bo->map, layout,
-                                                    mem_offset_B);
+   if (plane->layout.linear) {
+      /* Metal requires buffer-backed textures to be plain 2D, so a linear
+       * array layout gets a 2D texture and an array view of it. */
+      if (layout->type != MTL_TEXTURE_TYPE_2D_ARRAY || layout->layers != 1)
+         return mtl_new_texture_with_descriptor_linear(plane->mem->bo->map,
+                                                       layout, mem_offset_B);
+
+      struct kk_image_layout layout_2d = *layout;
+      layout_2d.type = MTL_TEXTURE_TYPE_2D;
+      mtl_texture *texture = mtl_new_texture_with_descriptor_linear(
+         plane->mem->bo->map, &layout_2d, mem_offset_B);
+      if (!texture)
+         return NULL;
+
+      const struct kk_view_layout view_layout = {
+         .view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+         .sample_count_sa = 1,
+         .format.pipe = layout->format.pipe,
+         .format.mtl = layout->format.mtl,
+         .num_levels = 1,
+         .array_len = 1,
+      };
+      mtl_texture *view = mtl_new_texture_view_with_no_swizzle(texture, &view_layout);
+      mtl_release(texture);
+      return view;
+   }
 
    return mtl_new_texture_with_descriptor(plane->mem->bo->mtl_handle, layout,
                                           mem_offset_B);
