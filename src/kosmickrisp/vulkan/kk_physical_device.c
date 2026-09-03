@@ -1198,13 +1198,22 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
       .used = kk_get_sysmem_heap_used,
    };
 
+   /* Must precede the host-visible type: the spec orders a type whose
+    * propertyFlags are a strict subset of another's first. */
    pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      .heapIndex = sysmem_heap_idx,
+   };
+
+   uint32_t host_visible_idx = pdev->mem_type_count++;
+   pdev->mem_types[host_visible_idx] = (VkMemoryType){
       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
       .heapIndex = sysmem_heap_idx,
    };
+   pdev->host_visible_mem_types = BITFIELD_BIT(host_visible_idx);
 
    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));

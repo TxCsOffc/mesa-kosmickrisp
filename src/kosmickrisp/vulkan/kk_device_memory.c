@@ -79,8 +79,7 @@ kk_GetMemoryHostPointerPropertiesEXT(
    default:
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    }
-   pMemoryHostPointerProperties->memoryTypeBits =
-      BITFIELD_MASK(pdev->mem_type_count);
+   pMemoryHostPointerProperties->memoryTypeBits = pdev->host_visible_mem_types;
 
    return VK_SUCCESS;
 }

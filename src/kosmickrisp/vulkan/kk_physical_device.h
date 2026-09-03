@@ -68,6 +68,7 @@ struct kk_physical_device {
    // TODO: add mapable VRAM heap if possible
    struct kk_memory_heap mem_heaps[3];
    VkMemoryType mem_types[3];
+   uint32_t host_visible_mem_types;
    uint8_t mem_heap_count;
    uint8_t mem_type_count;
 
