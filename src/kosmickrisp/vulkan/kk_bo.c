@@ -81,11 +81,11 @@ fail_heap:
 void
 kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
 {
-   /* We may only have a mapped buffer, for example if the memory was imported
-    * from a host pointer */
+   /* A host pointer import keeps its buffer resident, and has a heap only once
+    * a tiled image was bound to it */
    if (bo->mtl_handle)
       kk_device_remove_heap_from_residency_set(dev, bo->mtl_handle);
-   else
+   if (bo->host_import)
       kk_device_remove_buffer_from_residency_set(dev, bo->map);
 
    mtl_release(bo->map);

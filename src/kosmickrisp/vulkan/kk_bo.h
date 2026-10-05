@@ -23,6 +23,9 @@ struct kk_bo {
    uint64_t size_B;
    uint64_t gpu; // GPU address
    void *cpu;    // CPU address
+   /* map was imported from a host pointer; mtl_handle, if set, is a private
+    * heap that only backs tiled images */
+   bool host_import;
 };
 
 struct kk_ptr {

@@ -155,13 +155,13 @@ kk_bind_buffer_memory(struct kk_device *dev, const VkBindBufferMemoryInfo *info)
    VK_FROM_HANDLE(kk_device_memory, mem, info->memory);
    VK_FROM_HANDLE(kk_buffer, buffer, info->buffer);
 
-   if (mem->bo->mtl_handle) {
+   if (!mem->bo->host_import) {
       buffer->metal.handle = mtl_new_buffer_with_length(
          mem->bo->mtl_handle, buffer->vk.size, info->memoryOffset);
       buffer->metal.offset = 0u;
    } else {
-      /* If the memory is not heap backed, for example if we imported a host
-       * pointer, use the mapped buffer directly and retain a reference */
+      /* A host pointer import uses its mapped buffer directly, even once a
+       * tiled image gave it a private heap, and retains a reference */
       buffer->metal.handle = mem->bo->map;
       buffer->metal.offset = info->memoryOffset;
       mtl_retain(buffer->metal.handle);

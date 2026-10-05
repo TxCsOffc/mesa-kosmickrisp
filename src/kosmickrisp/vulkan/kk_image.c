@@ -16,6 +16,8 @@
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
 
+#include "util/u_atomic.h"
+
 #include "vk_enum_defines.h"
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
@@ -400,14 +402,10 @@ kk_GetPhysicalDeviceImageFormatProperties2(
          ext_mem_props = &kk_mtlheap_mem_props;
          break;
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
-      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT: {
-         if (pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR) {
-            return vk_errorf(pdev, VK_ERROR_FORMAT_NOT_SUPPORTED,
-                             "host memory import image must be linear");
-         }
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT:
+         /* Tiled images get a private heap when bound (kk_image_plane_bind) */
          ext_mem_props = &kk_host_mem_props;
          break;
-      }
       default:
          /* From the Vulkan 1.3.256 spec:
           *
@@ -852,7 +850,20 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
                                &plane_align_B);
    *offset_B = align64(*offset_B, plane_align_B);
 
-   assert(plane->layout.linear || mem->bo->mtl_handle);
+   /* Memory imported from a host pointer has no heap, which tiled textures
+    * need. Give it a private heap of its size on the first tiled bind: tiled
+    * contents are opaque to the host, so they needn't live in the imported
+    * pages. Binds may race, so only one heap is kept. */
+   if (!plane->layout.linear && !mem->bo->mtl_handle) {
+      mtl_heap *heap =
+         mtl_new_heap(dev->mtl_handle, mem->bo->size_B, KK_MTL_RESOURCE_OPTIONS);
+      if (!heap)
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      if (p_atomic_cmpxchg_ptr(&mem->bo->mtl_handle, NULL, heap) == NULL)
+         kk_device_add_heap_to_residency_set(dev, heap);
+      else
+         mtl_release(heap);
+   }
 
    /* Linear textures in Metal need to be allocated through a buffer... */
    plane->mem = mem;

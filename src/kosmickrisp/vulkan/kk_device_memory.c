@@ -130,10 +130,12 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          mem->bo->size_B = mtl_heap_get_size(mem->bo->mtl_handle);
          kk_device_add_heap_to_residency_set(dev, mem->bo->mtl_handle);
       } else if (import_host) {
-         /* We can't create a heap from a host pointer. The imported memory will
-          * only be usable for buffers */
+         /* We can't create a heap from a host pointer. Buffers and linear
+          * images use the imported buffer; tiled images get a private heap
+          * when first bound (kk_image_plane_bind) */
          mem->bo->map = mtl_new_buffer_with_bytes_no_copy(
             dev->mtl_handle, host_info->pHostPointer, mem->vk.size);
+         mem->bo->host_import = true;
          mem->bo->size_B = mtl_buffer_get_length(mem->bo->map);
          kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
       }
@@ -295,8 +297,9 @@ kk_GetMemoryMetalHandleEXT(
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT);
    VK_FROM_HANDLE(kk_device_memory, mem, pGetMetalHandleInfo->memory);
 
-   /* In some cases, such as host pointer imports, we don't have a MTLHeap */
-   if (!mem->bo->mtl_handle)
+   /* A host pointer import has no MTLHeap to export; a private heap there only
+    * backs tiled images */
+   if (mem->bo->host_import)
       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    /* From the Vulkan spec of vkGetMemoryMetalHandleEXT:
