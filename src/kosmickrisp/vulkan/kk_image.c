@@ -274,16 +274,13 @@ kk_GetPhysicalDeviceImageFormatProperties2(
        pImageFormatInfo->type == VK_IMAGE_TYPE_3D)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-   /* TODO_KOSMICKRISP Linear images cannot be used as color attachments as long
-    * as input attachments are changed to arrays. Vulkan specifies that any
-    * image format supporting the color attachment feature also supports being
-    * used as an input attachment, and Metal disallows arrays for linear
-    * textures.
+   /* Linear (buffer-backed) textures are 2D only, input attachments are 2D
+    * arrays: a linear plane gets a 2D texture and a 2D array view of it (see
+    * kk_image_plane_create_texture), so linear images can be input attachments.
+    * Depth/stencil formats have no linear support in Metal.
     */
    if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR &&
-       (pImageFormatInfo->usage &
-        (VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
-         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
+       (pImageFormatInfo->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    if (ycbcr_info && pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
