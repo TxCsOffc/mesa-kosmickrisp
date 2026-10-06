@@ -1439,6 +1439,10 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
       }
    }
 
+   if (IS_DIRTY(RS_POLYGON_MODE))
+      mtl_set_triangle_fill_mode(
+         enc, vk_polygon_mode_to_mtl_triangle_fill_mode(dyn->rs.polygon_mode));
+
    /* We enable raster discard by setting scissor to size (0, 0) */
    if (!(rast_discard || gfx->is_cull_front_and_back) &&
        (IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS) ||

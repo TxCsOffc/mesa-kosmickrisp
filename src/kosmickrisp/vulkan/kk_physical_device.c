@@ -230,6 +230,7 @@ kk_get_device_features(
       .depthBiasClamp = true,
       .depthBounds = pdev->info.gpu_apple_family >= 10,
       .depthClamp = true,
+      .fillModeNonSolid = true,
       .drawIndirectFirstInstance = true,
       .dualSrcBlend = true,
       .fragmentStoresAndAtomics = true,
