@@ -341,6 +341,9 @@ mtl_command_queue_error_to_string(enum mtl_command_queue_error error)
    case MTL_COMMAND_QUEUE_ERROR_INTERNAL:
       return "MTL_COMMAND_QUEUE_ERROR_INTERNAL";
    default:
-      UNREACHABLE("Unsupported error value");
+      /* Reached from a Metal completion handler: an error code this
+       * enumeration doesn't know (or a new one) must not be undefined
+       * behaviour in a release build. */
+      return "unknown MTL4CommandQueueError";
    }
 }

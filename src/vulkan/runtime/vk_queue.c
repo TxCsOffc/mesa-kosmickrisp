@@ -25,6 +25,7 @@
 
 #include "util/perf/cpu_trace.h"
 #include "util/u_debug.h"
+#include "util/log.h"
 #include <inttypes.h>
 
 #include "vk_alloc.h"
@@ -130,6 +131,12 @@ _vk_queue_set_lost(struct vk_queue *queue,
    va_start(ap, msg);
    vsnprintf(queue->_lost.error_msg, sizeof(queue->_lost.error_msg), msg, ap);
    va_end(ap);
+
+   /* Reported through __vk_errorf() by the next vk_device_is_lost(), which
+    * only logs in debug builds or to a debug messenger.
+    */
+   mesa_loge("VK_ERROR_DEVICE_LOST: queue lost: %s (%s:%d)",
+             queue->_lost.error_msg, file, line);
 
    p_atomic_inc(&queue->base.device->_lost.lost);
 

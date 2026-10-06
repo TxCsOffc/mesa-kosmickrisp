@@ -41,6 +41,7 @@
 #include "util/perf/cpu_trace.h"
 #include "util/ralloc.h"
 #include "util/timespec.h"
+#include "util/log.h"
 
 /* Breaks linking cycles since WSI common depends on runtime,
  * and Meson does not allow runtime to depend on WSI common. */
@@ -436,10 +437,18 @@ _vk_device_set_lost(struct vk_device *device,
    p_atomic_inc(&device->_lost.lost);
    device->_lost.reported = true;
 
+   char buf[512];
    va_list ap;
    va_start(ap, msg);
-   __vk_errorv(device, VK_ERROR_DEVICE_LOST, file, line, msg, ap);
+   vsnprintf(buf, sizeof(buf), msg, ap);
    va_end(ap);
+
+   /* __vk_errorf() only logs in debug builds or to a debug messenger: a
+    * release build lost the device silently, and the application only saw
+    * VK_ERROR_DEVICE_LOST from some later call.
+    */
+   mesa_loge("VK_ERROR_DEVICE_LOST: %s (%s:%d)", buf, file, line);
+   __vk_errorf(device, VK_ERROR_DEVICE_LOST, file, line, "%s", buf);
 
    vk_logd(VK_LOG_OBJS(device), "Timeline mode is %s.",
            timeline_mode_str(device));

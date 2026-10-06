@@ -45,8 +45,9 @@ check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
 {
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
       vk_device_set_lost(
-         &dev->vk, "Command queue error: %s, with message \"%s\"",
-         mtl_command_queue_error_to_string(data->error), data->error_message);
+         &dev->vk, "Command queue error %d (%s), with message \"%s\"",
+         (int)data->error, mtl_command_queue_error_to_string(data->error),
+         data->error_message ? data->error_message : "");
    }
 }
 
