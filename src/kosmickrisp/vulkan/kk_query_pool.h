@@ -12,11 +12,18 @@
 
 #include "vulkan/runtime/vk_query_pool.h"
 
+/* Entries of one Metal counter heap: Metal refuses larger timestamp heaps
+ * ("Requested Heap size is too large (requested 8192 max is 4096)").
+ */
+#define KK_TS_HEAP_MAX_ENTRIES 4096u
+
 struct kk_ts_state {
-   /* Metal 4 counter heap backing VK_QUERY_TYPE_TIMESTAMP pools. Timestamps are
-    * sampled into this heap and later resolved into `bo` (see kk_query_pool.c).
-    * NULL for non-timestamp pools. */
-   mtl_counter_heap *heap;
+   /* Metal 4 counter heaps backing VK_QUERY_TYPE_TIMESTAMP pools, query q in
+    * heaps[q / KK_TS_HEAP_MAX_ENTRIES] at q % KK_TS_HEAP_MAX_ENTRIES.
+    * Timestamps are sampled into them and later resolved into `bo` (see
+    * kk_query_pool.c). NULL for non-timestamp pools. */
+   mtl_counter_heap **heaps;
+   uint32_t heap_count;
 };
 
 struct kk_oq_state {
