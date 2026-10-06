@@ -41,6 +41,22 @@ struct kk_storage_image_descriptor {
 static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
               "kk_storage_image_descriptor has no holes");
 
+/* Uniform and storage texel buffers. Metal needs buffer-backed textures at
+ * KK_MIN_TEXEL_BUFFER_ALIGNMENT, Vulkan allows views at any texel
+ * (storage/uniformTexelBufferOffsetSingleTexelAlignment, required by
+ * vkd3d-proton): the Metal texture starts at the aligned offset below the
+ * view, and shaders add texel_offset to coordinates (and take it off sizes).
+ * image_gpu_resource_id is first, like in the other image descriptors.
+ */
+struct kk_texel_buffer_descriptor {
+   uint64_t image_gpu_resource_id;
+   uint32_t texel_offset;
+   uint32_t pad;
+};
+
+static_assert(sizeof(struct kk_texel_buffer_descriptor) == 16,
+              "kk_texel_buffer_descriptor has no holes");
+
 /* This has to match nir_address_format_64bit_bounded_global */
 struct kk_buffer_address {
    uint64_t base_addr;

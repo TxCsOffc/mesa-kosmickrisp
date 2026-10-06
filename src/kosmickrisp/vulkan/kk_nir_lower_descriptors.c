@@ -393,7 +393,31 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
       .access = nir_intrinsic_access(intr) | var->data.access,
       .flags = msl_convert_access_flag(var->data.access));
 
+   /* Texel buffers: the Metal texture starts texel_offset texels before the
+    * view (struct kk_texel_buffer_descriptor).
+    */
+   nir_def *texel_offset = NULL;
+   if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF) {
+      texel_offset = load_resource_deref_desc(
+         b, 1, 32, deref,
+         offsetof(struct kk_texel_buffer_descriptor, texel_offset), ctx);
+      if (intr->intrinsic != nir_intrinsic_image_deref_size) {
+         nir_def *coord = intr->src[1].ssa;
+         nir_def *x = nir_iadd(b, nir_channel(b, coord, 0),
+                               nir_u2uN(b, texel_offset, coord->bit_size));
+         nir_src_rewrite(&intr->src[1], nir_vector_insert_imm(b, coord, x, 0));
+      }
+   }
+
    nir_rewrite_image_intrinsic(intr, handle, nir_image_intrinsic_type_bindless);
+
+   if (texel_offset && intr->intrinsic == nir_intrinsic_bindless_image_size) {
+      b->cursor = nir_after_instr(&intr->instr);
+      nir_def *size = &intr->def;
+      nir_def *x = nir_isub(b, nir_channel(b, size, 0),
+                            nir_u2uN(b, texel_offset, size->bit_size));
+      nir_def_rewrite_uses_after(size, nir_vector_insert_imm(b, size, x, 0));
+   }
 
    return true;
 }
@@ -566,6 +590,33 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
             .image_dim = tex->sampler_dim, .image_array = tex->is_array);
       }
       nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
+
+      /* Texel buffers: the Metal texture starts texel_offset texels before
+       * the view (struct kk_texel_buffer_descriptor).
+       */
+      if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
+         nir_def *texel_offset = load_resource_deref_desc(
+            b, 1, 32, nir_src_as_deref(nir_src_for_ssa(texture)),
+            plane_offset_B +
+               offsetof(struct kk_texel_buffer_descriptor, texel_offset),
+            ctx);
+         const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+         if (tex->op == nir_texop_txs) {
+            b->cursor = nir_after_instr(&tex->instr);
+            nir_def *size = &tex->def;
+            nir_def *x = nir_isub(b, nir_channel(b, size, 0),
+                                  nir_u2uN(b, texel_offset, size->bit_size));
+            nir_def_rewrite_uses_after(size,
+                                       nir_vector_insert_imm(b, size, x, 0));
+            b->cursor = nir_before_instr(&tex->instr);
+         } else if (coord_idx >= 0) {
+            nir_def *coord = tex->src[coord_idx].src.ssa;
+            nir_def *x = nir_iadd(b, nir_channel(b, coord, 0),
+                                  nir_u2uN(b, texel_offset, coord->bit_size));
+            nir_src_rewrite(&tex->src[coord_idx].src,
+                            nir_vector_insert_imm(b, coord, x, 0));
+         }
+      }
    }
 
    if (sampler != NULL) {

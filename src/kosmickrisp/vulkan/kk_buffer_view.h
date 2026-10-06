@@ -23,6 +23,9 @@ struct kk_buffer_view {
    struct vk_buffer_view vk;
    mtl_texture *mtl_texel_buffer_handle;
    uint64_t texel_buffer_gpu_id;
+   /* Texels from the start of the Metal texture (aligned down) to the view
+    * (struct kk_texel_buffer_descriptor). */
+   uint32_t texel_offset;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer_view, vk.base, VkBufferView,
