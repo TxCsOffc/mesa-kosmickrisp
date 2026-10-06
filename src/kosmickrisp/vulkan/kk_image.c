@@ -565,6 +565,31 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
                            &image->planes[plane].layout);
    }
 
+   /* virglrenderer (Venus on macOS) emulates dma-bufs with LINEAR host images
+    * and keeps the importer's VkImageDrmFormatModifierExplicitCreateInfoEXT
+    * chained: the image must use the exporter's row pitch, or the shared
+    * memory is read with the wrong stride.
+    */
+   const VkImageDrmFormatModifierExplicitCreateInfoEXT *explicit_info =
+      vk_find_struct_const(pCreateInfo->pNext,
+                           IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+   if (explicit_info && pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR) {
+      struct kk_image_layout *layout = &image->planes[0].layout;
+      const VkSubresourceLayout *plane_layout = &explicit_info->pPlaneLayouts[0];
+      const uint64_t row_B =
+         util_format_get_stride(layout->format.pipe, layout->width_px);
+      if (image->plane_count != 1 ||
+          explicit_info->drmFormatModifierPlaneCount != 1 ||
+          plane_layout->offset != 0 || plane_layout->rowPitch < row_B ||
+          plane_layout->rowPitch > UINT32_MAX ||
+          plane_layout->rowPitch % layout->align_B)
+         return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+      layout->linear_stride_B = plane_layout->rowPitch;
+      layout->layer_stride_B = plane_layout->rowPitch * layout->height_px;
+      layout->size_B = layout->layer_stride_B;
+      layout->level_offsets_B[1] = layout->layer_stride_B;
+   }
+
    return VK_SUCCESS;
 }
 
