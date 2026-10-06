@@ -1953,6 +1953,14 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
                                      local_size_threads, &s->pipeline.cs);
    } else {
       gather_graphics_pipeline_create_info(state, shaders, total_shaders);
+      struct kk_shader *vs = shaders[0];
+      const uint32_t samples =
+         kk_supported_sample_count(kk_device_physical(dev), vs->info.vs.sample_count);
+      if (samples != vs->info.vs.sample_count) {
+         mesa_logw("kk: rasterizationSamples %u is not supported, using %u",
+                   vs->info.vs.sample_count, samples);
+         vs->info.vs.sample_count = samples;
+      }
       result = kk_compile_graphics_pipeline(dev, shaders[0]);
    }
 

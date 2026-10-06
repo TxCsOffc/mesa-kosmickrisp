@@ -87,6 +87,19 @@ kk_min_cbuf_alignment()
    return 16;
 }
 
+/* The largest sample count the device supports that is not above samples
+ * (Apple GPUs: 1, 2, 4). Apps and guest drivers (D3D games through DXVK and
+ * Venus) still ask for 8, and Metal fails such pipelines and textures.
+ */
+static inline uint32_t
+kk_supported_sample_count(const struct kk_physical_device *pdev,
+                          uint32_t samples)
+{
+   const VkSampleCountFlags mask =
+      pdev->info.supported_sample_counts & ((samples << 1) - 1);
+   return mask ? 1u << (31 - __builtin_clz(mask)) : 1u;
+}
+
 VK_DEFINE_HANDLE_CASTS(kk_physical_device, vk.base, VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 

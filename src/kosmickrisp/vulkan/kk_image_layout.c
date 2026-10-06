@@ -235,7 +235,9 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
    layout->swizzle.green = supported_format->unswizzle.green;
    layout->swizzle.blue = supported_format->unswizzle.blue;
    layout->swizzle.alpha = supported_format->unswizzle.alpha;
-   layout->sample_count_sa = image->samples;
+   /* Unsupported counts (8) as the pipelines get them: Metal cannot create
+    * such textures. */
+   layout->sample_count_sa = kk_supported_sample_count(pdev, image->samples);
 
    /*
     * Metal requires adding MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW if we are going
