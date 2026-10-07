@@ -2012,6 +2012,15 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       nir_src *min_lod_clamp = nir_tex_get_src(tex, nir_tex_src_min_lod);
       nir_src *offset = nir_tex_get_src(tex, nir_tex_src_offset);
       nir_src *comparator = nir_tex_get_src(tex, nir_tex_src_comparator);
+      /* Metal samples the last level for LODs past it but reports residency
+       * of the level past it (NEAREST: the rounded LOD, LINEAR: both levels),
+       * which doesn't exist: not resident. Sparse samples keep the LOD at or
+       * below the last level (msl_sparse_lod_limit); single level textures
+       * aren't affected and keep their LOD (minification filter). Implicit
+       * LODs are limited through the bias, explicit gradients below. */
+      const bool implicit_lod =
+         sparse && ctx->shader->info.stage == MESA_SHADER_FRAGMENT &&
+         (tex->op == nir_texop_tex || tex->op == nir_texop_txb);
       src_to_msl(ctx, texhandle);
       if (comparator) {
          P(ctx, ".%ssample_compare(", sp);
@@ -2025,14 +2034,42 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
          P(ctx, ", ");
          src_to_msl(ctx, comparator);
       }
-      if (bias) {
+      if (implicit_lod) {
+         P(ctx, ", bias(min(");
+         if (bias) {
+            P(ctx, "float(");
+            src_to_msl(ctx, bias);
+            P(ctx, ")");
+         } else {
+            P(ctx, "0.0f");
+         }
+         P(ctx, ", msl_sparse_lod_limit(");
+         src_to_msl(ctx, texhandle);
+         P(ctx, ") - ");
+         src_to_msl(ctx, texhandle);
+         P(ctx, ".calculate_unclamped_lod(");
+         src_to_msl(ctx, sampler);
+         P(ctx, ", ");
+         src_to_msl(ctx, nir_tex_get_src(tex, nir_tex_src_coord));
+         if (tex->is_array)
+            P(ctx, ".%s",
+              tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ? "xyz" : "xy");
+         P(ctx, ")))");
+      } else if (bias) {
          P(ctx, ", bias(");
          src_to_msl(ctx, bias);
          P(ctx, ")");
       }
       if (lod) {
          P(ctx, ", level(");
+         if (sparse)
+            P(ctx, "min(float(");
          src_to_msl(ctx, lod);
+         if (sparse) {
+            P(ctx, "), msl_sparse_lod_limit(");
+            src_to_msl(ctx, texhandle);
+            P(ctx, "))");
+         }
          P(ctx, ")");
       }
       if (ddx) {
@@ -2044,7 +2081,14 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       }
       if (min_lod_clamp) {
          P(ctx, ", min_lod_clamp(");
+         if (sparse)
+            P(ctx, "min(float(");
          src_to_msl(ctx, min_lod_clamp);
+         if (sparse) {
+            P(ctx, "), msl_sparse_lod_limit(");
+            src_to_msl(ctx, texhandle);
+            P(ctx, "))");
+         }
          P(ctx, ")");
       }
       if (offset) {
@@ -2052,6 +2096,49 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
          src_to_msl(ctx, offset);
       }
       P(ctx, ")%s;\n", sparse_end);
+
+      /* With explicit gradients the LOD isn't known (anisotropy): when the
+       * sample reported non-resident texels and the gradients' isotropic LOD
+       * (Metal's is at least that without anisotropy) is past the last
+       * level, which the sample then used, the residency is that of the last
+       * level. */
+      if (sparse && ddx && tex->sampler_dim == GLSL_SAMPLER_DIM_2D) {
+         P_IND(ctx, "if (tr%d == 0u) {\n", tex->def.index);
+         ctx->indentlevel++;
+         P_IND(ctx, "float2 sz = float2(");
+         src_to_msl(ctx, texhandle);
+         P(ctx, ".get_width(), ");
+         src_to_msl(ctx, texhandle);
+         P(ctx, ".get_height());\n");
+         P_IND(ctx, "float rho = max(length(");
+         src_to_msl(ctx, ddx);
+         P(ctx, " * sz), length(");
+         src_to_msl(ctx, ddy);
+         P(ctx, " * sz));\n");
+         P_IND(ctx, "float limit = msl_sparse_lod_limit(");
+         src_to_msl(ctx, texhandle);
+         P(ctx, ");\n");
+         P_IND(ctx, "if (log2(rho) > limit)\n");
+         ctx->indentlevel++;
+         P_IND(ctx, "tr%d = uint(", tex->def.index);
+         src_to_msl(ctx, texhandle);
+         P(ctx, ".sparse_sample%s(", comparator ? "_compare" : "");
+         src_to_msl(ctx, sampler);
+         P(ctx, ", ");
+         tex_coord_swizzle(ctx, tex);
+         if (comparator) {
+            P(ctx, ", ");
+            src_to_msl(ctx, comparator);
+         }
+         P(ctx, ", level(limit)");
+         if (offset) {
+            P(ctx, ", ");
+            src_to_msl(ctx, offset);
+         }
+         P(ctx, ").resident());\n");
+         ctx->indentlevel -= 2;
+         P_IND(ctx, "}\n");
+      }
       break;
    }
    case nir_texop_txf: {
@@ -2862,6 +2949,12 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
               "{\n"
               "   resident = uint(color.resident());\n"
               "   return color.value();\n"
+              "}\n"
+              "template <typename T>\n"
+              "METAL_FUNC float msl_sparse_lod_limit(T image)\n"
+              "{\n"
+              "   uint levels = image.get_num_mip_levels();\n"
+              "   return levels > 1u ? float(levels - 1u) : INFINITY;\n"
               "}\n");
    }
 
