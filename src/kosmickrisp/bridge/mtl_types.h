@@ -415,7 +415,13 @@ struct mtl_sparse_buffer_mapping {
 
 struct mtl_feedback_data {
    void *user_data;
+   uint64_t tag;
    const char *error_message;
+   /* The error's userInfo on one line, or NULL */
+   const char *error_info;
+   /* Host times in seconds on the GPU times' clock: the commit, the feedback */
+   double commit_time;
+   double feedback_time;
    double gpu_start;
    double gpu_end;
    enum mtl_command_queue_error error;

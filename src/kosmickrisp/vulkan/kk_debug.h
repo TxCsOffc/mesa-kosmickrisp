@@ -15,6 +15,9 @@ enum kk_debug {
    /* Log sampler min/max reduction emulation events (reduction samplers,
     * emulating programs compiled, re-recorded command buffers) */
    KK_DEBUG_MINMAX = 1ull << 3,
+   /* Log command buffers that started late, ran long on the GPU or completed
+    * late, and device creations/destructions with their application */
+   KK_DEBUG_COMMITS = 1ull << 4,
 };
 
 extern enum kk_debug kk_mesa_debug_flags;

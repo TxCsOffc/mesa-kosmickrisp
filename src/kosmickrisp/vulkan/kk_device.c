@@ -10,6 +10,7 @@
 #include "kk_buffer.h"
 #include "kk_buffer_view.h"
 #include "kk_cmd_buffer.h"
+#include "kk_debug.h"
 #include "kk_entrypoints.h"
 #include "kk_image.h"
 #include "kk_image_view.h"
@@ -29,6 +30,9 @@
 #include "vulkan/wsi/wsi_common.h"
 #include "vk_pipeline_cache.h"
 
+#include "util/os_time.h"
+
+#include <stdio.h>
 #include <time.h>
 
 struct kk_mtl_compiler {
@@ -240,6 +244,82 @@ kk_sampler_heap_remove(struct kk_device *dev, struct kk_rc_sampler *rc)
    simple_mtx_unlock(&h->lock);
 }
 
+void
+kk_device_app_name(const struct kk_device *dev, char *name, size_t size)
+{
+   const struct vk_app_info *app = &dev->vk.physical->instance->app_info;
+
+   if (app->app_name && app->engine_name)
+      snprintf(name, size, "%s (%s)", app->app_name, app->engine_name);
+   else if (app->app_name || app->engine_name)
+      snprintf(name, size, "%s", app->app_name ? app->app_name : app->engine_name);
+   else
+      snprintf(name, size, "an unnamed application");
+}
+
+/* Device creations and destructions in the process: a command queue error
+ * logs how long ago the last ones were, which tells whether another guest
+ * device came or went right before. */
+static struct {
+   simple_mtx_t lock;
+   uint32_t alive;
+   int64_t created_ns, destroyed_ns;
+   char created_app[64], destroyed_app[64];
+} kk_device_lifecycle = {.lock = SIMPLE_MTX_INITIALIZER};
+
+static void
+kk_device_note_lifecycle(struct kk_device *dev, bool created)
+{
+   const int64_t now = os_time_get_nano();
+   char app[sizeof(kk_device_lifecycle.created_app)];
+   kk_device_app_name(dev, app, sizeof(app));
+
+   simple_mtx_lock(&kk_device_lifecycle.lock);
+   if (created) {
+      kk_device_lifecycle.alive++;
+      kk_device_lifecycle.created_ns = now;
+      memcpy(kk_device_lifecycle.created_app, app, sizeof(app));
+   } else {
+      kk_device_lifecycle.alive--;
+      kk_device_lifecycle.destroyed_ns = now;
+      memcpy(kk_device_lifecycle.destroyed_app, app, sizeof(app));
+   }
+   const uint32_t alive = kk_device_lifecycle.alive;
+   simple_mtx_unlock(&kk_device_lifecycle.lock);
+
+   if (KK_DEBUG(COMMITS)) {
+      if (created)
+         mesa_logi("kk: device %p of %s created, %u alive", dev, app, alive);
+      else
+         mesa_logi("kk: device %p of %s destroyed after %.1f ms, %u alive", dev,
+                   app, (now - dev->created_ns) / 1e6, alive);
+   }
+}
+
+void
+kk_device_log_lifecycle(void)
+{
+   const int64_t now = os_time_get_nano();
+
+   simple_mtx_lock(&kk_device_lifecycle.lock);
+   if (kk_device_lifecycle.destroyed_ns) {
+      mesa_loge("kk: %u devices alive; the last one was created %.1f ms ago "
+                "(%s), the last one destroyed %.1f ms ago (%s)",
+                kk_device_lifecycle.alive,
+                (now - kk_device_lifecycle.created_ns) / 1e6,
+                kk_device_lifecycle.created_app,
+                (now - kk_device_lifecycle.destroyed_ns) / 1e6,
+                kk_device_lifecycle.destroyed_app);
+   } else {
+      mesa_loge("kk: %u devices alive; the last one was created %.1f ms ago "
+                "(%s), none destroyed",
+                kk_device_lifecycle.alive,
+                (now - kk_device_lifecycle.created_ns) / 1e6,
+                kk_device_lifecycle.created_app);
+   }
+   simple_mtx_unlock(&kk_device_lifecycle.lock);
+}
+
 static VkResult
 kk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
 {
@@ -337,6 +417,9 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
       mtl_start_gpu_capture(dev->mtl_handle, capture_directory);
    }
 
+   dev->created_ns = os_time_get_nano();
+   kk_device_note_lifecycle(dev, true);
+
    *pDevice = kk_device_to_handle(dev);
 
    return VK_SUCCESS;
@@ -373,6 +456,8 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    if (!dev)
       return;
+
+   kk_device_note_lifecycle(dev, false);
 
    /* End capture before we start releasing resources. Otherwise, Metal capture
     * may run into issues. */

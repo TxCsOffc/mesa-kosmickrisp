@@ -35,10 +35,15 @@ struct kk_queue {
    mtx_t mutex;
    cnd_t cond;
 
-   /* vkQueueBindSparse (kk_sparse.c): a one page placement sparse buffer and
-    * the heap page it maps after unmaps of buffer pages, and the event that
-    * separates texture mapping updates from earlier buffer mapping updates.
-    * lock orders the queue's mapping updates. */
+   /* Under `mutex`: commits whose feedback handler has not run yet
+    * (kk_queue_finish waits for them, the handlers use the queue), the
+    * number of the last command buffer committed and the GPU end time
+    * (seconds) of the last one completed, for command queue error
+    * diagnostics. */
+   uint32_t feedbacks_pending;
+   uint64_t commit_seq;
+   double last_gpu_end;
+
    /* The last KK_QUEUE_PENDING_WAITS semaphore waits that were not signalled
     * yet when submitted (wait before signal), retained, under `mutex`: a
     * command queue error names the ones still unsignalled. Metal ends a queue
@@ -51,6 +56,10 @@ struct kk_queue {
    } pending_waits[KK_QUEUE_PENDING_WAITS];
    uint32_t pending_wait_next;
 
+   /* vkQueueBindSparse (kk_sparse.c): a one page placement sparse buffer and
+    * the heap page it maps after unmaps of buffer pages, and the event that
+    * separates texture mapping updates from earlier buffer mapping updates.
+    * lock orders the queue's mapping updates. */
    struct {
       mtl_buffer *flush_buffer;
       struct kk_bo *flush_bo;

@@ -112,6 +112,9 @@ struct kk_device {
    /* Serializes compiling the second program of such a pipeline on first
     * use (kk_cmd_shader_pipeline) */
    simple_mtx_t lazy_pipeline_lock;
+
+   /* os_time_get_nano() at creation (command queue error diagnostics) */
+   int64_t created_ns;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
@@ -139,6 +142,13 @@ void kk_device_add_allocation_to_residency_set(struct kk_device *dev,
 void kk_device_remove_allocation_from_residency_set(
    struct kk_device *dev, mtl_allocation *allocation);
 void kk_device_make_resources_resident(struct kk_device *dev);
+
+/* The guest application of a device ("gamescope", "steamwebhelper (mesa
+ * zink)"): Venus passes VkApplicationInfo on. */
+void kk_device_app_name(const struct kk_device *dev, char *name, size_t size);
+/* Logs the devices alive in the process (every guest device under
+ * virglrenderer) and the last ones created and destroyed. */
+void kk_device_log_lifecycle(void);
 
 /* Required to create a sampler */
 mtl_sampler *kk_sampler_create(struct kk_device *dev,

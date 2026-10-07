@@ -12,6 +12,7 @@ const struct debug_named_value debug_flags[] = {
    {"msl", KK_DEBUG_MSL},
    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
    {"minmax", KK_DEBUG_MINMAX},
+   {"commits", KK_DEBUG_COMMITS},
    {NULL, 0},
 };
 

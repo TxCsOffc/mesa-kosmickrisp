@@ -11,12 +11,25 @@
 
 #include <stdint.h>
 
-/* MTL4CommitOptions */
+/* MTL4CommitOptions. The feedback data passes tag on and has the host time
+ * (seconds, GPUStartTime's clock) of the handler's addition, just before the
+ * commit, and of the feedback. */
 mtl_commit_options *mtl_new_commit_options(void);
 void
 mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
                                         mtl_feedback_handler_callback callback,
-                                        void *data);
+                                        void *data, uint64_t tag);
+
+/* Calls cb for the error and fault messages that the process' GPU frameworks
+ * (Metal, IOGPU, AGX) logged to os_log in the last `seconds` (at most
+ * max_lines, oldest first): Metal 4 reports a GPU page fault, a hang, a
+ * timeout and the discard of a victim of another command buffer's recovery
+ * all as MTL4CommandQueueErrorTimeout, the IOGPU reason only goes to os_log.
+ * Reading the log takes about a second. */
+void mtl_log_recent_gpu_errors(double seconds, unsigned max_lines,
+                               void (*cb)(const char *sender,
+                                          const char *message, void *data),
+                               void *data);
 
 /* MTL4CommandQueue */
 mtl_command_queue *mtl_new_command_queue(mtl_device *device);

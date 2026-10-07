@@ -26,11 +26,12 @@ struct kk_commit_data {
    struct kk_cmd_buffer *cmd;
 };
 
+/* Feedback handlers use the queue and the device: wait for all of them. */
 static void
-kk_queue_wait_for_commits(struct kk_queue *queue)
+kk_queue_wait_for_feedbacks(struct kk_queue *queue)
 {
    mtx_lock(&queue->mutex);
-   while (queue->commits_in_flight > 0u)
+   while (queue->feedbacks_pending > 0u)
       cnd_wait(&queue->cond, &queue->mutex);
    mtx_unlock(&queue->mutex);
 }
@@ -43,17 +44,58 @@ kk_queue_release_cmd_buffer_locked(struct kk_queue *queue,
    util_dynarray_append(&queue->free_cmd_buffers, &cmd->vk);
 }
 
-/* Names the semaphore waits submitted before their signal that are still
- * unsignalled, and the GPU time of the failed command buffer: a never
- * signalled wait shows up as a wait here and no GPU time. */
 static void
-kk_queue_log_pending_waits(struct kk_queue *queue,
-                           struct mtl_feedback_data *data)
+kk_queue_log_gpu_error(const char *sender, const char *message, void *data)
 {
-   const int64_t now = os_time_get_nano();
+   mesa_loge("kk: os_log %s: %s", sender, message);
+}
 
-   mesa_loge("kk: command buffer failed after %.1f ms of GPU time",
-             (data->gpu_end - data->gpu_start) * 1000.0);
+/* STEAMAC-G: a command queue error has to tell GPU work that ran too long
+ * from a command buffer that never started (a semaphore wait, the GPU busy
+ * elsewhere) and name what came right before: the queue's last completed
+ * work and the last guest device created or destroyed in the process. Never
+ * signalled semaphore waits submitted before their signal are listed. */
+static void
+kk_queue_log_failure(struct kk_queue *queue,
+                     const struct mtl_feedback_data *data)
+{
+   struct kk_device *dev = kk_queue_device(queue);
+   const int64_t now = os_time_get_nano();
+   char app[64];
+   kk_device_app_name(dev, app, sizeof(app));
+
+   mtx_lock(&queue->mutex);
+   const uint64_t committed = queue->commit_seq;
+   const uint32_t awaiting = queue->feedbacks_pending;
+   const double last_gpu_end = queue->last_gpu_end;
+   mtx_unlock(&queue->mutex);
+
+   mesa_loge("kk: command buffer %" PRIu64 " of %s failed %.1f ms after its "
+             "commit (device created %.1f s ago, %" PRIu64 " command buffers "
+             "committed, %u awaiting feedback)",
+             data->tag, app,
+             (data->feedback_time - data->commit_time) * 1000.0,
+             (now - dev->created_ns) / 1e9, committed, awaiting);
+   if (data->gpu_start > 0.0) {
+      mesa_loge("kk: it started %.1f ms after its commit and ran %.1f ms on "
+                "the GPU (GPU start %.6f s, end %.6f s, commit %.6f s)",
+                (data->gpu_start - data->commit_time) * 1000.0,
+                (data->gpu_end - data->gpu_start) * 1000.0, data->gpu_start,
+                data->gpu_end, data->commit_time);
+   } else {
+      mesa_loge("kk: it never started on the GPU (GPU start %.6f s, end "
+                "%.6f s, commit %.6f s)",
+                data->gpu_start, data->gpu_end, data->commit_time);
+   }
+   if (last_gpu_end > 0.0) {
+      mesa_loge("kk: the queue's last completed command buffer ended %.1f ms "
+                "after this commit",
+                (last_gpu_end - data->commit_time) * 1000.0);
+   } else {
+      mesa_loge("kk: no command buffer of the queue completed before");
+   }
+   if (data->error_info)
+      mesa_loge("kk: Metal error info: %s", data->error_info);
 
    mtx_lock(&queue->mutex);
    for (uint32_t i = 0; i < KK_QUEUE_PENDING_WAITS; i++) {
@@ -70,24 +112,72 @@ kk_queue_log_pending_waits(struct kk_queue *queue,
       }
    }
    mtx_unlock(&queue->mutex);
+
+   kk_device_log_lifecycle();
+
+   /* Once per process: reading os_log takes about a second, and the first
+    * failure names the cause (later ones are often its victims). */
+   static bool os_log_read;
+   if (!p_atomic_xchg(&os_log_read, true))
+      mtl_log_recent_gpu_errors(10.0, 16u, kk_queue_log_gpu_error, NULL);
+}
+
+/* MESA_KK_DEBUG=commits */
+static void
+kk_queue_log_slow_commit(struct kk_queue *queue,
+                         const struct mtl_feedback_data *data)
+{
+   const double delay_ms = (data->gpu_start - data->commit_time) * 1000.0;
+   const double gpu_ms = (data->gpu_end - data->gpu_start) * 1000.0;
+   const double feedback_ms = (data->feedback_time - data->commit_time) * 1000.0;
+   if (delay_ms < 20.0 && gpu_ms < 50.0 && feedback_ms < 100.0)
+      return;
+
+   char app[64];
+   kk_device_app_name(kk_queue_device(queue), app, sizeof(app));
+   mesa_logi("kk: command buffer %" PRIu64 " of %s started %.1f ms after its "
+             "commit, ran %.1f ms on the GPU, feedback after %.1f ms",
+             data->tag, app, delay_ms, gpu_ms, feedback_ms);
 }
 
 static void
-check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
+kk_queue_check_feedback(struct kk_queue *queue, struct mtl_feedback_data *data)
 {
+   struct kk_device *dev = kk_queue_device(queue);
+
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
-      kk_queue_log_pending_waits(&dev->queue, data);
+      kk_queue_log_failure(queue, data);
       vk_device_set_lost(
          &dev->vk, "Command queue error %d (%s), with message \"%s\"",
          (int)data->error, mtl_command_queue_error_to_string(data->error),
          data->error_message ? data->error_message : "");
+   } else if (KK_DEBUG(COMMITS)) {
+      kk_queue_log_slow_commit(queue, data);
    }
+}
+
+/* The handler's last use of the queue: kk_queue_finish may free it after. */
+static void
+kk_queue_feedback_done(struct kk_queue *queue,
+                       const struct mtl_feedback_data *data)
+{
+   mtx_lock(&queue->mutex);
+   if (data->error == MTL_COMMAND_QUEUE_ERROR_NONE &&
+       data->gpu_end > queue->last_gpu_end)
+      queue->last_gpu_end = data->gpu_end;
+   assert(queue->feedbacks_pending > 0u);
+   if (--queue->feedbacks_pending == 0u)
+      cnd_broadcast(&queue->cond);
+   mtx_unlock(&queue->mutex);
 }
 
 static void
 commit_callback(struct mtl_feedback_data *data)
 {
-   check_device_lost((struct kk_device *)data->user_data, data);
+   struct kk_queue *queue = &((struct kk_device *)data->user_data)->queue;
+
+   kk_queue_check_feedback(queue, data);
+   kk_queue_feedback_done(queue, data);
 }
 
 static void
@@ -97,7 +187,7 @@ rerecord_commit_callback(struct mtl_feedback_data *data)
    struct kk_queue *queue = commit->queue;
    struct kk_device *dev = kk_queue_device(queue);
 
-   check_device_lost(dev, data);
+   kk_queue_check_feedback(queue, data);
 
    /* Completion callbacks are called from multiple threads, so we need to
     * ensure the access to queue resources is safe. */
@@ -109,12 +199,13 @@ rerecord_commit_callback(struct mtl_feedback_data *data)
    if (--queue->commits_in_flight == 0u) {
       kk_ResetCommandPool(kk_device_to_handle(dev),
                           kk_cmd_pool_to_handle(queue->cmd_pool), 0u);
-      cnd_broadcast(&queue->cond);
    }
 
    mtx_unlock(&queue->mutex);
 
    vk_free(&dev->vk.alloc, commit);
+
+   kk_queue_feedback_done(queue, data);
 }
 
 static bool
@@ -147,8 +238,13 @@ kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
 {
    assert(kk_cmd_buffer_has_work(cmd));
 
+   mtx_lock(&queue->mutex);
+   const uint64_t seq = ++queue->commit_seq;
+   queue->feedbacks_pending++;
+   mtx_unlock(&queue->mutex);
+
    mtl_commit_options *options = mtl_new_commit_options();
-   mtl_commit_options_add_feedback_handler(options, callback, user_data);
+   mtl_commit_options_add_feedback_handler(options, callback, user_data, seq);
 
    mtl_command_queue_commit(queue->mtl_handle, &cmd->metal.cmd_buf, 1u,
                             options);
@@ -213,9 +309,9 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    kk_device_make_resources_resident(dev);
 
    queue->commits_in_flight++;
-   kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
-
    mtx_unlock(&queue->mutex);
+
+   kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
    return VK_SUCCESS;
 
 release:
@@ -357,6 +453,9 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
    memset(queue->pending_waits, 0, sizeof(queue->pending_waits));
    queue->pending_wait_next = 0;
    queue->commits_in_flight = 0u;
+   queue->feedbacks_pending = 0u;
+   queue->commit_seq = 0u;
+   queue->last_gpu_end = 0.0;
    mtx_init(&queue->mutex, mtx_plain);
    cnd_init(&queue->cond);
 
@@ -380,8 +479,9 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
 void
 kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
 {
-   /* There may be in-flight command buffers, wait for them to finish. */
-   kk_queue_wait_for_commits(queue);
+   /* There may be in-flight command buffers, and feedback handlers of
+    * completed ones may still run (after vkDeviceWaitIdle): wait for them. */
+   kk_queue_wait_for_feedbacks(queue);
 
    kk_queue_sparse_finish(dev, queue);
 

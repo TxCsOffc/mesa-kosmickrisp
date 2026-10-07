@@ -16,7 +16,15 @@ mtl_new_commit_options(void)
 void
 mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
                                         mtl_feedback_handler_callback callback,
-                                        void *data)
+                                        void *data, uint64_t tag)
+{
+}
+
+void
+mtl_log_recent_gpu_errors(double seconds, unsigned max_lines,
+                          void (*cb)(const char *sender, const char *message,
+                                     void *data),
+                          void *data)
 {
 }
 

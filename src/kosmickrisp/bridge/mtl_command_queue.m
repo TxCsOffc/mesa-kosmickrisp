@@ -8,6 +8,19 @@
 
 #include <Metal/MTLDevice.h>
 #include <Metal/MTLCommandQueue.h>
+#include <OSLog/OSLog.h>
+
+#include <mach/mach_time.h>
+
+/* Seconds on the clock of MTL4CommitFeedback's GPU times (CACurrentMediaTime) */
+static double
+mtl_host_time(void)
+{
+   static mach_timebase_info_data_t timebase;
+   if (timebase.denom == 0u)
+      mach_timebase_info(&timebase);
+   return (double)mach_absolute_time() * timebase.numer / timebase.denom / 1e9;
+}
 
 /* MTL4CommitOptions */
 mtl_commit_options *
@@ -21,17 +34,28 @@ mtl_new_commit_options(void)
 void
 mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
                                         mtl_feedback_handler_callback callback,
-                                        void *data)
+                                        void *data, uint64_t tag)
 {
    @autoreleasepool {
       MTL4CommitOptions* opt = (MTL4CommitOptions *)options;
+      const double commit_time = mtl_host_time();
       [opt addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
          @autoreleasepool {
             NSError *error = feedback.error;
             struct mtl_feedback_data feedback_data = (struct mtl_feedback_data){
                .user_data = data,
+               .tag = tag,
                .error_message =
                   error ? error.localizedDescription.UTF8String : NULL,
+               .error_info =
+                  error && error.userInfo.count
+                     ? [[error.userInfo.description
+                          componentsSeparatedByCharactersInSet:
+                             NSCharacterSet.newlineCharacterSet]
+                          componentsJoinedByString:@" "].UTF8String
+                     : NULL,
+               .commit_time = commit_time,
+               .feedback_time = mtl_host_time(),
                .gpu_start = feedback.GPUStartTime,
                .gpu_end = feedback.GPUEndTime,
                .error = error
@@ -41,6 +65,43 @@ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
             callback(&feedback_data);
          }
       }];
+   }
+}
+
+void
+mtl_log_recent_gpu_errors(double seconds, unsigned max_lines,
+                          void (*cb)(const char *sender, const char *message,
+                                     void *data),
+                          void *data)
+{
+   @autoreleasepool {
+      NSError *error = nil;
+      OSLogStore *store =
+         [OSLogStore storeWithScope:OSLogStoreCurrentProcessIdentifier
+                              error:&error];
+      if (!store)
+         return;
+      OSLogPosition *position =
+         [store positionWithDate:[NSDate dateWithTimeIntervalSinceNow:-seconds]];
+      NSPredicate *predicate = [NSPredicate
+         predicateWithFormat:@"messageType == error OR messageType == fault"];
+      OSLogEnumerator *entries =
+         [store entriesEnumeratorWithOptions:0
+                                    position:position
+                                   predicate:predicate
+                                       error:&error];
+      unsigned lines = 0u;
+      for (OSLogEntry *entry in entries) {
+         if (![entry isKindOfClass:[OSLogEntryLog class]])
+            continue;
+         NSString *sender = ((OSLogEntryLog *)entry).sender;
+         if (![sender containsString:@"Metal"] &&
+             ![sender containsString:@"IOGPU"] && ![sender hasPrefix:@"AGX"])
+            continue;
+         cb(sender.UTF8String, entry.composedMessage.UTF8String, data);
+         if (++lines == max_lines)
+            break;
+      }
    }
 }
 
