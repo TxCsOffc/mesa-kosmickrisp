@@ -1588,8 +1588,15 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       P(ctx, ".get_num_mip_levels();\n");
       break;
    case nir_intrinsic_bindless_image_load:
+   case nir_intrinsic_bindless_image_sparse_load: {
+      /* Sparse loads (see msl_lower_sparse_fetches) store their residency in
+       * tr<def> through msl_sparse_value */
+      const bool sparse =
+         instr->intrinsic == nir_intrinsic_bindless_image_sparse_load;
+      if (sparse)
+         P(ctx, "msl_sparse_value(tr%d, ", instr->def.index);
       src_to_msl(ctx, &instr->src[0]);
-      P(ctx, ".read(");
+      P(ctx, sparse ? ".sparse_read(" : ".read(");
       image_coord_swizzle(ctx, instr);
       if (nir_intrinsic_image_dim(instr) != GLSL_SAMPLER_DIM_BUF) {
          P(ctx, ", ");
@@ -1597,11 +1604,15 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       }
       /* read will always return vec4 and we may try to assign that to an uint
        * which is illegal. */
-      P(ctx, ").");
+      P(ctx, ")%s.", sparse ? ")" : "");
       for (uint32_t i = 0u; i < instr->def.num_components; ++i) {
          P(ctx, "%c", "xyzw"[i]);
       }
       P(ctx, ";\n");
+      break;
+   }
+   case nir_intrinsic_sparse_residency_kk:
+      P(ctx, "tr%d;\n", instr->src[0].ssa->index);
       break;
    case nir_intrinsic_bindless_image_store:
       P_INDENT(ctx);
@@ -1815,7 +1826,15 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
    // Projectors have to be lowered away to regular arithmetic
    assert(!nir_tex_get_src(tex, nir_tex_src_projector));
 
+   /* Sparse fetches return a sparse_color: msl_sparse_value stores its
+    * residency in tr<def> (read by nir_intrinsic_sparse_residency_kk) and
+    * returns the color. */
+   const bool sparse = tex->backend_flags & MSL_TEX_FLAG_SPARSE;
+   const char *sp = sparse ? "sparse_" : "";
+   const char *sparse_end = sparse ? ")" : "";
    P_IND(ctx, "t%d = ", tex->def.index);
+   if (sparse)
+      P(ctx, "msl_sparse_value(tr%d, ", tex->def.index);
 
    switch (tex->op) {
    case nir_texop_tex:
@@ -1831,9 +1850,9 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       nir_src *comparator = nir_tex_get_src(tex, nir_tex_src_comparator);
       src_to_msl(ctx, texhandle);
       if (comparator) {
-         P(ctx, ".sample_compare(");
+         P(ctx, ".%ssample_compare(", sp);
       } else {
-         P(ctx, ".sample(");
+         P(ctx, ".%ssample(", sp);
       }
       src_to_msl(ctx, sampler);
       P(ctx, ", ");
@@ -1868,19 +1887,19 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
          P(ctx, ", ");
          src_to_msl(ctx, offset);
       }
-      P(ctx, ");\n");
+      P(ctx, ")%s;\n", sparse_end);
       break;
    }
    case nir_texop_txf: {
       src_to_msl(ctx, texhandle);
-      P(ctx, ".read(");
+      P(ctx, ".%sread(", sp);
       tex_coord_swizzle(ctx, tex);
       nir_src *lod = nir_tex_get_src(tex, nir_tex_src_lod);
       if (lod) {
          P(ctx, ", ");
          src_to_msl(ctx, lod);
       }
-      P(ctx, ");\n");
+      P(ctx, ")%s;\n", sparse_end);
       break;
    }
    case nir_texop_txf_ms:
@@ -1940,9 +1959,9 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       nir_src *comparator = nir_tex_get_src(tex, nir_tex_src_comparator);
       src_to_msl(ctx, texhandle);
       if (comparator) {
-         P(ctx, ".gather_compare(");
+         P(ctx, ".%sgather_compare(", sp);
       } else {
-         P(ctx, ".gather(");
+         P(ctx, ".%sgather(", sp);
       }
       src_to_msl(ctx, sampler);
       P(ctx, ", ");
@@ -1967,7 +1986,7 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
          P(ctx, ", component::%c", "xyzw"[tex->component]);
       }
 
-      P(ctx, ");\n");
+      P(ctx, ")%s;\n", sparse_end);
       break;
    }
 
@@ -2288,6 +2307,138 @@ msl_preprocess_nir(struct nir_shader *nir)
    msl_nir_lower_subgroups(nir);
 }
 
+static uint8_t
+msl_wide_phi_width(const nir_instr *instr, const void *data)
+{
+   return nir_instr_as_phi(instr)->def.num_components > 4 ? 1 : 0;
+}
+
+static bool
+msl_is_wide_alu(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   return alu->def.num_components > 4 && !nir_op_is_vec(alu->op);
+}
+
+static bool
+msl_lower_sparse_residency_ops(nir_builder *b, nir_intrinsic_instr *intr,
+                               void *data)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *res;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_is_sparse_texels_resident:
+      res = nir_ine_imm(b, intr->src[0].ssa, 0);
+      if (intr->def.bit_size == 32)
+         res = nir_b2b32(b, res);
+      break;
+   case nir_intrinsic_sparse_residency_code_and:
+      res = nir_iand(b, intr->src[0].ssa, intr->src[1].ssa);
+      break;
+   default:
+      return false;
+   }
+   nir_def_replace(&intr->def, res);
+   return true;
+}
+
+/* A sparse fetch's def is the color plus a residency code: 1 if all texels
+ * were resident (MSL sparse_color::resident()). MSL has no vectors of five, so
+ * the def shrinks to the color and the code's users read
+ * nir_intrinsic_sparse_residency_kk instead. Users are ALU instructions
+ * (spirv_to_nir splits the fetch's result struct with movs; wider phis and
+ * ALU values were scalarized before). */
+static bool
+msl_split_sparse_fetch(nir_builder *b, nir_instr *instr, void *data)
+{
+   nir_def *def;
+   /* Multisampled and buffer images are never sparse (no sparseResidency*
+    * samples features, Vulkan has no sparse texel buffers): their texels are
+    * all resident and MSL has no sparse read for them. */
+   bool always_resident;
+   if (instr->type == nir_instr_type_tex && nir_instr_as_tex(instr)->is_sparse) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      def = &tex->def;
+      always_resident = tex->op == nir_texop_txf_ms ||
+                        tex->sampler_dim == GLSL_SAMPLER_DIM_BUF;
+   } else if (instr->type == nir_instr_type_intrinsic &&
+              nir_instr_as_intrinsic(instr)->intrinsic ==
+                 nir_intrinsic_bindless_image_sparse_load) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      def = &intr->def;
+      always_resident = nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_MS ||
+                        nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF;
+   } else {
+      return false;
+   }
+
+   const unsigned code_comp = def->num_components - 1;
+   b->cursor = nir_after_instr(instr);
+   nir_def *code = always_resident ? nir_imm_int(b, 1)
+                                   : nir_sparse_residency_kk(b, def);
+
+   nir_foreach_use_including_if_safe(src, def) {
+      nir_instr *user = nir_src_use_instr(src);
+      if (user == nir_def_instr(code))
+         continue;
+      assert(!nir_src_is_if(src) && user->type == nir_instr_type_alu);
+      nir_alu_instr *alu = nir_instr_as_alu(user);
+      nir_alu_src *alu_src = container_of(src, nir_alu_src, src);
+      const unsigned srcn = alu_src - alu->src;
+      const unsigned comps = nir_ssa_alu_instr_src_components(alu, srcn);
+
+      bool reads_code = false;
+      for (unsigned c = 0; c < comps; c++) {
+         reads_code |= nir_alu_instr_channel_used(alu, srcn, c) &&
+                       alu_src->swizzle[c] == code_comp;
+      }
+      if (!reads_code)
+         continue;
+
+      b->cursor = nir_before_instr(user);
+      nir_scalar channels[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned c = 0; c < comps; c++) {
+         channels[c] = alu_src->swizzle[c] == code_comp
+                          ? nir_get_scalar(code, 0)
+                          : nir_get_scalar(def, alu_src->swizzle[c]);
+      }
+      nir_src_rewrite(src, nir_vec_scalars(b, channels, comps));
+      for (unsigned c = 0; c < NIR_MAX_VEC_COMPONENTS; c++)
+         alu_src->swizzle[c] = c < comps ? c : 0;
+   }
+
+   def->num_components = code_comp;
+   if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      tex->is_sparse = false;
+      if (!always_resident)
+         tex->backend_flags |= MSL_TEX_FLAG_SPARSE;
+   } else {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      intr->num_components = code_comp;
+      if (always_resident)
+         intr->intrinsic = nir_intrinsic_bindless_image_load;
+   }
+   return true;
+}
+
+static bool
+msl_lower_sparse_fetches(nir_shader *nir)
+{
+   bool progress = false;
+   NIR_PASS(progress, nir, nir_shader_intrinsics_pass,
+            msl_lower_sparse_residency_ops, nir_metadata_control_flow, NULL);
+   NIR_PASS(progress, nir, nir_lower_phis_to_scalar, msl_wide_phi_width, NULL);
+   NIR_PASS(progress, nir, nir_lower_alu_to_scalar, msl_is_wide_alu, NULL);
+   NIR_PASS(progress, nir, nir_opt_copy_prop);
+   NIR_PASS(progress, nir, nir_opt_dce);
+   NIR_PASS(progress, nir, nir_shader_instructions_pass, msl_split_sparse_fetch,
+            nir_metadata_control_flow, NULL);
+   return progress;
+}
+
 bool
 msl_optimize_nir(struct nir_shader *nir)
 {
@@ -2330,6 +2481,7 @@ msl_optimize_nir(struct nir_shader *nir)
    NIR_PASS(_, nir, nir_opt_shrink_stores, false);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, msl_nir_lower_algebraic_late);
+   NIR_PASS(_, nir, msl_lower_sparse_fetches);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    NIR_PASS(_, nir, nir_trivialize_registers);
    NIR_PASS(_, nir, nir_opt_copy_prop);
@@ -2421,6 +2573,29 @@ msl_gather_info(struct nir_to_msl_ctx *ctx, struct nir_to_msl_options *options)
    }
 }
 
+/* Fetches split by msl_lower_sparse_fetches: their residency goes to tr<def> */
+static bool
+msl_instr_is_sparse_fetch(const nir_instr *instr)
+{
+   if (instr->type == nir_instr_type_tex)
+      return nir_instr_as_tex(instr)->backend_flags & MSL_TEX_FLAG_SPARSE;
+   return instr->type == nir_instr_type_intrinsic &&
+          nir_instr_as_intrinsic(instr)->intrinsic ==
+             nir_intrinsic_bindless_image_sparse_load;
+}
+
+static bool
+msl_shader_has_sparse_fetch(nir_function_impl *impl)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (msl_instr_is_sparse_fetch(instr))
+            return true;
+      }
+   }
+   return false;
+}
+
 static void
 predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
 {
@@ -2460,6 +2635,8 @@ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
                P_IND(ctx, "%s t%u;\n", type, def->index);
             } else
                P_IND(ctx, "%s t%u = %s(0);\n", type, def->index, type);
+            if (msl_instr_is_sparse_fetch(instr))
+               P_IND(ctx, "uint tr%u = 0u;\n", def->index);
          }
       }
    }
@@ -2509,6 +2686,16 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
       P(&ctx, "#include <metal_compute>\n");
    P(&ctx, "#include <metal_stdlib>\n");
    P(&ctx, "using namespace metal;\n");
+
+   if (msl_shader_has_sparse_fetch(impl)) {
+      P(&ctx, "template <typename T>\n"
+              "METAL_FUNC T msl_sparse_value(thread uint &resident, "
+              "sparse_color<T> color)\n"
+              "{\n"
+              "   resident = uint(color.resident());\n"
+              "   return color.value();\n"
+              "}\n");
+   }
 
    msl_emit_constant_data(&ctx, shader);
 

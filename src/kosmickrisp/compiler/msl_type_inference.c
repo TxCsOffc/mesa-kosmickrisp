@@ -423,10 +423,14 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
                ti_type_from_pipe_format(nir_intrinsic_format(instr)));
       break;
    case nir_intrinsic_bindless_image_load:
+   case nir_intrinsic_bindless_image_sparse_load:
       set_type(types, &instr->def,
                ti_type_from_nir(nir_intrinsic_dest_type(instr)));
       set_type(types, &instr->src[1], TYPE_UINT); // coords
       set_type(types, &instr->src[3], TYPE_UINT); // level
+      break;
+   case nir_intrinsic_sparse_residency_kk:
+      set_type(types, &instr->def, TYPE_UINT);
       break;
    case nir_intrinsic_bindless_image_levels:
       set_type(types, &instr->def, TYPE_UINT);

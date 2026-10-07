@@ -10,6 +10,11 @@
 
 #define MSL_MAX_SAMPLERS 4096
 
+/* nir_tex_instr::backend_flags: a sparse fetch (MSL sparse_sample, ...) whose
+ * def holds only the color; nir_intrinsic_sparse_residency_kk reads its
+ * residency. Set by msl_optimize_nir for is_sparse instructions. */
+#define MSL_TEX_FLAG_SPARSE (1u << 31)
+
 enum pipe_format;
 struct vk_input_attachment_location_state;
 struct vk_color_attachment_location_state;

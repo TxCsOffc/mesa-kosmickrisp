@@ -3322,6 +3322,12 @@ load("depth_texture_kk", [1], [IMAGE_DIM, IMAGE_ARRAY], [CAN_ELIMINATE])
 intrinsic("load_sampler_handle_kk", [1], 1, [],
           flags=[CAN_ELIMINATE, CAN_REORDER],
           bit_sizes=[16])
+# Residency code of the sparse texture fetch (MSL_TEX_FLAG_SPARSE) or
+# bindless_image_sparse_load whose color-only result is src[0], which MSL's
+# sparse_sample/sparse_read return together: 1 if every texel accessed was
+# resident, 0 otherwise.
+intrinsic("sparse_residency_kk", src_comp=[0], dest_comp=1, bit_sizes=[32],
+          flags=[CAN_ELIMINATE])
 # Texture fence to ensure writes.
 image("fence_kk")
 # Store clip distance to vertex output.

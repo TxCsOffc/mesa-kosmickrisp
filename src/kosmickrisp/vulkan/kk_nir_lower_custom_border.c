@@ -68,6 +68,13 @@ lower(nir_builder *b, nir_tex_instr *tex, UNUSED void *_data)
          border = nir_replicate(b, nir_channel(b, border, tex->component), 4);
       }
 
+      /* Sparse fetches end with a residency code: combine only the colors,
+       * and report the texels resident if both fetches were. */
+      const unsigned color_comps = tex->def.num_components - tex->is_sparse;
+      nir_def *color_0 = nir_trim_vector(b, clamp_to_0, color_comps);
+      nir_def *color_1 = nir_trim_vector(b, clamp_to_1, color_comps);
+      border = nir_trim_vector(b, border, color_comps);
+
       /* Combine together with the border */
       if (nir_alu_type_get_base_type(tex->dest_type) == nir_type_float &&
           tex->op != nir_texop_tg4) {
@@ -79,15 +86,26 @@ lower(nir_builder *b, nir_tex_instr *tex, UNUSED void *_data)
           *
           * Linear filtering is linear (duh), so lerping is compatible.
           */
-         replaced = nir_flrp(b, clamp_to_0, clamp_to_1, border);
+         replaced = nir_flrp(b, color_0, color_1, border);
          b->shader->info.flrp_lowered = false;
       } else {
          /* For integers, just select componentwise since there is no linear
           * filtering. Gathers also use this path since they are unfiltered in
           * each component.
           */
-         replaced = nir_bcsel(b, nir_ieq(b, clamp_to_0, clamp_to_1), clamp_to_0,
-                              border);
+         replaced =
+            nir_bcsel(b, nir_ieq(b, color_0, color_1), color_0, border);
+      }
+
+      if (tex->is_sparse) {
+         nir_scalar result[NIR_MAX_VEC_COMPONENTS];
+         for (unsigned c = 0; c < color_comps; c++)
+            result[c] = nir_get_scalar(replaced, c);
+         nir_def *code =
+            nir_iand(b, nir_channel(b, clamp_to_0, color_comps),
+                     nir_channel(b, clamp_to_1, color_comps));
+         result[color_comps] = nir_get_scalar(code, 0);
+         replaced = nir_vec_scalars(b, result, color_comps + 1);
       }
    }
    nir_pop_if(b, NULL);
