@@ -11,6 +11,7 @@
 #include "kk_private.h"
 
 #include "kk_shader.h"
+#include "kosmickrisp/compiler/nir_to_msl.h"
 
 #include "nir.h"
 #include "nir_builder.h"
@@ -37,6 +38,8 @@ lower(nir_builder *b, nir_tex_instr *tex, UNUSED void *_data)
 {
    if (!nir_tex_instr_need_sampler(tex) || nir_tex_instr_is_query(tex))
       return false;
+   if (tex->backend_flags & MSL_TEX_FLAG_MINMAX)
+      return false; /* The helper reconstructs borders before reduction. */
 
    /* XXX: this is a really weird edge case, is this even well-defined? */
    if (tex->is_shadow)

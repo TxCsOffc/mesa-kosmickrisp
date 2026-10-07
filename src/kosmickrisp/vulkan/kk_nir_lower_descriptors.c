@@ -427,6 +427,14 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
                  const struct lower_descriptors_ctx *ctx)
 {
    switch (intrin->intrinsic) {
+   case nir_intrinsic_load_sampler_state_kk: {
+      b->cursor = nir_before_instr(&intrin->instr);
+      nir_def *state = load_resource_deref_desc(
+         b, intrin->def.num_components, intrin->def.bit_size,
+         nir_src_as_deref(intrin->src[0]), nir_intrinsic_base(intrin), ctx);
+      nir_def_replace(&intrin->def, state);
+      return true;
+   }
    case nir_intrinsic_load_vulkan_descriptor:
       return try_lower_load_vulkan_descriptor(b, intrin, ctx);
 

@@ -191,6 +191,7 @@ bool kk_nir_lower_poly(struct nir_shader *nir);
 bool kk_nir_lower_null_images(nir_shader *nir);
 
 bool kk_nir_lower_textures(nir_shader *nir);
+bool kk_nir_lower_sampler_minmax(nir_shader *nir);
 
 bool kk_nir_lower_vs_multiview(nir_shader *nir, uint32_t view_mask);
 bool kk_nir_lower_fs_multiview(nir_shader *nir, uint32_t view_mask);

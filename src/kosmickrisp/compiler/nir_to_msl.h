@@ -15,6 +15,10 @@
  * residency. Set by msl_optimize_nir for is_sparse instructions. */
 #define MSL_TEX_FLAG_SPARSE (1u << 31)
 
+/* Software reduction call: backend1 = uint3(flags, clamp0 index, has border),
+ * backend2 = float4 custom border. Footprint processing is out-of-line. */
+#define MSL_TEX_FLAG_MINMAX (1u << 30)
+
 enum pipe_format;
 struct vk_input_attachment_location_state;
 struct vk_color_attachment_location_state;

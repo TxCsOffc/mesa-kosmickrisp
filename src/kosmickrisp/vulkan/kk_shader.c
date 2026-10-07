@@ -176,6 +176,7 @@ enum kk_feature_key {
    KK_FEAT_CUSTOM_BORDER = BITFIELD_BIT(0),
    KK_FEAT_NULL_DESCRIPTOR = BITFIELD_BIT(1),
    KK_FEAT_IMAGE_VIEW_MIN_LOD = BITFIELD_BIT(2),
+   KK_FEAT_SAMPLER_MINMAX = BITFIELD_BIT(3),
 };
 
 static enum kk_feature_key
@@ -188,6 +189,8 @@ kk_make_feature_key(const struct vk_features *feats)
       key |= KK_FEAT_NULL_DESCRIPTOR;
    if (feats->minLod)
       key |= KK_FEAT_IMAGE_VIEW_MIN_LOD;
+   if (feats->samplerFilterMinmax)
+      key |= KK_FEAT_SAMPLER_MINMAX;
    return key;
 }
 
@@ -793,11 +796,17 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
       kk_lower_fs(dev, nir, state);
    }
 
-   if (features & KK_FEAT_CUSTOM_BORDER)
-      NIR_PASS(_, nir, kk_nir_lower_custom_border);
-
    if (features & KK_FEAT_IMAGE_VIEW_MIN_LOD)
       NIR_PASS(_, nir, kk_nir_lower_image_view_min_lod);
+
+   /* Apply view clamps to lambda, not to the individual integer-level fetches.
+    * Border emulation then operates on those point samples. */
+   if (pdev->info.gpu_apple_family < 10 &&
+       (features & KK_FEAT_SAMPLER_MINMAX))
+      NIR_PASS(_, nir, kk_nir_lower_sampler_minmax);
+
+   if (features & KK_FEAT_CUSTOM_BORDER)
+      NIR_PASS(_, nir, kk_nir_lower_custom_border);
 
    /* Descriptor lowering needs to happen after lowering blend since we will
     * generate a nir_intrinsic_load_blend_const_color_rgba which gets lowered by

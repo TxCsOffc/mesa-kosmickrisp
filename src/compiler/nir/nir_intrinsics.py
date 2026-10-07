@@ -3328,6 +3328,9 @@ intrinsic("load_sampler_handle_kk", [1], 1, [],
 # resident, 0 otherwise.
 intrinsic("sparse_residency_kk", src_comp=[0], dest_comp=1, bit_sizes=[32],
           flags=[CAN_ELIMINATE])
+# Read sampler descriptor data at BASE bytes from a sampler deref.
+intrinsic("load_sampler_state_kk", [1], 0, [BASE],
+          flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[16, 32])
 # Texture fence to ensure writes.
 image("fence_kk")
 # Store clip distance to vertex output.

@@ -1818,6 +1818,142 @@ tex_coord_swizzle(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
                              tex->coord_components, false, tex->is_array);
 }
 
+/* One non-inlined footprint loop per texture type, not per sample site.
+ * Keeping this out of NIR avoids exponential Metal optimizer work on large
+ * shaders when samplerFilterMinmax is enabled but almost all samplers are
+ * weighted-average. Anisotropy is intentionally ignored. Cube interiors are
+ * exact; seam centers are reprojected to adjacent faces and cube corners use
+ * nearest neighboring texels rather than the special three-face contribution.
+ */
+static void
+emit_minmax_helper(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
+{
+   const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   const unsigned dims = tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3 : 2;
+   const unsigned coords = (cube ? 3 : dims) + tex->is_array;
+   const bool sparse = tex->backend_flags & MSL_TEX_FLAG_SPARSE;
+   const char *dim = texture_dim(tex->sampler_dim);
+   const char *array = tex->is_array ? "_array" : "";
+   const char *sp = sparse ? "_sparse" : "";
+   P(ctx, "__attribute__((noinline)) float4 kk_minmax_%s%s%s("
+          "texture%s%s<float, access::sample> image, sampler smp, sampler smp0,"
+          " float%u coord, float lambda, uint3 params, float4 border, int%u offset",
+     dim, array, sp, dim, array, coords, dims);
+   if (sparse)
+      P(ctx, ", thread uint &resident");
+   P(ctx, ")\n{\n"
+          "   bool is_min = (params.x & 1u) != 0;\n"
+          "   bool linear = (params.x & (lambda <= 0.0f ? 8u : 4u)) != 0;\n"
+          "   bool mip_linear = (params.x & 16u) != 0;\n"
+          "   bool unnormalized = (params.x & 32u) != 0;\n"
+          "   lambda = clamp(lambda, 0.0f, float(image.get_num_mip_levels()-1));\n"
+          "   uint first = uint(floor(mip_linear ? lambda : lambda + 0.5f));\n"
+          "   uint count = mip_linear && fract(lambda) != 0.0f ? 2u : 1u;\n"
+          "   float4 result = float4(is_min ? INFINITY : -INFINITY);\n");
+   if (sparse)
+      P(ctx, "   resident = 1u;\n");
+   if (tex->is_array)
+      P(ctx, "   uint layer = uint(max(int(rint(coord.%c)), 0));\n",
+        "xyzw"[coords - 1]);
+   if (cube) {
+      P(ctx, "   float3 a = abs(coord.xyz);\n"
+             "   uint axis = a.x >= a.y && a.x >= a.z ? 0u : a.y >= a.z ? 1u : 2u;\n"
+             "   bool positive = coord[axis] >= 0.0f;\n"
+             "   uint face = 2u*axis + uint(!positive);\n"
+             "   float sc = axis == 0u ? (positive ? -coord.z : coord.z) : "
+             "axis == 1u ? coord.x : (positive ? coord.x : -coord.x);\n"
+             "   float tc = axis == 1u ? (positive ? coord.z : -coord.z) : -coord.y;\n"
+             "   float2 uv = float2(sc, tc) / a[axis] * 0.5f + 0.5f;\n");
+   } else {
+      P(ctx, "   float%u uv = coord.%s;\n", dims, dims == 3 ? "xyz" : "xy");
+   }
+   P(ctx, "   for (uint mip = 0; mip < count; ++mip) {\n"
+          "      uint level_index = first + mip;\n"
+          "      float%u size = float%u(image.get_width(level_index), "
+          "image.get_height(level_index)", dims, dims);
+   if (dims == 3)
+      P(ctx, ", image.get_depth(level_index)");
+   P(ctx, ");\n"
+          "      float%u p = (unnormalized ? uv : uv*size) + float%u(offset);\n"
+          "      float%u base = floor(linear ? p-0.5f : p);\n"
+          "      float%u fraction = fract(p-0.5f);\n"
+          "      for (uint corner = 0; corner < %uu; ++corner) {\n"
+          "         bool include = true;\n"
+          "         float%u center;\n"
+          "         for (uint axis = 0; axis < %uu; ++axis) {\n"
+          "            bool high = (corner & (1u << axis)) != 0;\n"
+          "            include &= linear ? (!high || fraction[axis] != 0.0f) : !high;\n"
+          "            center[axis] = base[axis] + (high ? 1.5f : 0.5f);\n"
+          "         }\n"
+          "         if (!include) continue;\n"
+          "         if (!unnormalized) center /= size;\n",
+     dims, dims, dims, dims, 1u << dims, dims, dims);
+   if (cube) {
+      P(ctx, "         float2 st = center*2.0f-1.0f;\n"
+             "         float3 direction;\n"
+             "         switch (face) {\n"
+             "         case 0: direction = float3(1,-st.y,-st.x); break;\n"
+             "         case 1: direction = float3(-1,-st.y,st.x); break;\n"
+             "         case 2: direction = float3(st.x,1,st.y); break;\n"
+             "         case 3: direction = float3(st.x,-1,-st.y); break;\n"
+             "         case 4: direction = float3(st.x,-st.y,1); break;\n"
+             "         default: direction = float3(-st.x,-st.y,-1); break;\n"
+             "         }\n");
+   }
+   const char *position = cube ? "direction" : "center";
+   const char *layer = tex->is_array ? ", layer" : "";
+   const char *sample = sparse ? "sparse_sample" : "sample";
+   if (sparse) {
+      P(ctx, "         auto sample = image.%s(smp, %s%s, level(float(level_index)));\n"
+             "         resident &= uint(sample.resident());\n"
+             "         float4 value = sample.value();\n",
+        sample, position, layer);
+   } else {
+      P(ctx, "         float4 value = image.sample(smp, %s%s, level(float(level_index)));\n",
+        position, layer);
+   }
+   P(ctx, "         if (params.z != 0u) {\n");
+   if (sparse) {
+      P(ctx, "            auto sample0 = image.sparse_sample(smp0, %s%s, level(float(level_index)));\n"
+             "            resident &= uint(sample0.resident());\n"
+             "            value = mix(sample0.value(), value, border);\n",
+        position, layer);
+   } else {
+      P(ctx, "            float4 value0 = image.sample(smp0, %s%s, level(float(level_index)));\n"
+             "            value = mix(value0, value, border);\n",
+        position, layer);
+   }
+   P(ctx, "         }\n"
+          "         result = is_min ? min(result, value) : max(result, value);\n"
+          "      }\n"
+          "   }\n"
+          "   return result;\n"
+          "}\n");
+}
+
+static void
+emit_minmax_helpers(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
+{
+   uint32_t emitted = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_tex)
+            continue;
+         nir_tex_instr *tex = nir_instr_as_tex(instr);
+         if (!(tex->backend_flags & MSL_TEX_FLAG_MINMAX))
+            continue;
+         unsigned dim = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ? 2 :
+                        tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 1 : 0;
+         unsigned key = 4 * dim + 2 * tex->is_array +
+                        !!(tex->backend_flags & MSL_TEX_FLAG_SPARSE);
+         if (!(emitted & BITFIELD_BIT(key))) {
+            emit_minmax_helper(ctx, tex);
+            emitted |= BITFIELD_BIT(key);
+         }
+      }
+   }
+}
+
 static void
 tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
 {
@@ -1833,6 +1969,34 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
    const char *sp = sparse ? "sparse_" : "";
    const char *sparse_end = sparse ? ")" : "";
    P_IND(ctx, "t%d = ", tex->def.index);
+   if (tex->backend_flags & MSL_TEX_FLAG_MINMAX) {
+      nir_src *params = nir_tex_get_src(tex, nir_tex_src_backend1);
+      P(ctx, "kk_minmax_%s%s%s(", texture_dim(tex->sampler_dim),
+        tex->is_array ? "_array" : "", sparse ? "_sparse" : "");
+      src_to_msl(ctx, texhandle);
+      P(ctx, ", ");
+      src_to_msl(ctx, sampler);
+      P(ctx, ", sampler_table.handles[");
+      src_to_msl(ctx, params);
+      P(ctx, ".y], ");
+      src_to_msl(ctx, nir_tex_get_src(tex, nir_tex_src_coord));
+      P(ctx, ", ");
+      src_to_msl(ctx, nir_tex_get_src(tex, nir_tex_src_lod));
+      P(ctx, ", ");
+      src_to_msl(ctx, params);
+      P(ctx, ", ");
+      src_to_msl(ctx, nir_tex_get_src(tex, nir_tex_src_backend2));
+      P(ctx, ", ");
+      nir_src *offset = nir_tex_get_src(tex, nir_tex_src_offset);
+      if (offset)
+         src_to_msl(ctx, offset);
+      else
+         P(ctx, "int%u(0)", tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3 : 2);
+      if (sparse)
+         P(ctx, ", tr%d", tex->def.index);
+      P(ctx, ");\n");
+      return;
+   }
    if (sparse)
       P(ctx, "msl_sparse_value(tr%d, ", tex->def.index);
 
@@ -2007,6 +2171,8 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       src_to_msl(ctx, sampler);
       P(ctx, ", ");
       src_to_msl(ctx, coord);
+      if (tex->is_array)
+         P(ctx, ".%s", tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ? "xyz" : "xy");
       P(ctx, ") + ");
       src_to_msl(ctx, bias);
       P(ctx, ", ");
@@ -2019,6 +2185,8 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       src_to_msl(ctx, sampler);
       P(ctx, ", ");
       src_to_msl(ctx, coord);
+      if (tex->is_array)
+         P(ctx, ".%s", tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ? "xyz" : "xy");
       P(ctx, ")");
       P(ctx, ");\n");
       break;
@@ -2696,6 +2864,8 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
               "   return color.value();\n"
               "}\n");
    }
+
+   emit_minmax_helpers(&ctx, impl);
 
    msl_emit_constant_data(&ctx, shader);
 

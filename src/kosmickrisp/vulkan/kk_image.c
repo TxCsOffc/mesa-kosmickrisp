@@ -53,9 +53,15 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
 
    if (va_format->filter) {
       features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-      if (pdev->vk.supported_extensions.EXT_sampler_filter_minmax)
-         features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
    }
+
+   /* Software reduction only needs point sampling. In particular R32_SFLOAT
+    * and depth formats need not support linear interpolation. Integer and
+    * stencil-only views have no floating-point filtering operation. */
+   if (pdev->vk.supported_extensions.EXT_sampler_filter_minmax &&
+       !util_format_is_pure_integer(p_format) &&
+       (vk_format_has_depth(vk_format) || !vk_format_has_stencil(vk_format)))
+      features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
 
    /* TODO: VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT */
    if (vk_format_has_depth(vk_format)) {

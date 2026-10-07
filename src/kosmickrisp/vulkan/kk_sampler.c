@@ -8,6 +8,7 @@
 #include "kk_sampler.h"
 
 #include "kk_entrypoints.h"
+#include "kk_descriptor_types.h"
 #include "kk_physical_device.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
@@ -19,6 +20,7 @@
 #include "util/bitpack_helpers.h"
 #include "util/format/format_utils.h"
 #include "util/format_srgb.h"
+#include <float.h>
 
 static bool
 uses_border(const VkSamplerCreateInfo *info)
@@ -110,6 +112,9 @@ create_sampler_descriptor(const struct kk_device *dev,
                           const struct mtl_sampler_packed *packed)
 {
    const struct kk_physical_device *pdev = kk_device_physical(dev);
+   const bool emulate =
+      pdev->info.gpu_apple_family < 10 &&
+      packed->reduction_mode != MTL_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
 
    mtl_sampler_descriptor *descriptor = mtl_new_sampler_descriptor();
    mtl_sampler_descriptor_set_normalized_coordinates(
@@ -117,16 +122,21 @@ create_sampler_descriptor(const struct kk_device *dev,
    mtl_sampler_descriptor_set_address_mode(descriptor, packed->mode_u,
                                            packed->mode_v, packed->mode_w);
    mtl_sampler_descriptor_set_border_color(descriptor, packed->border_color);
-   mtl_sampler_descriptor_set_filters(descriptor, packed->min_filter,
-                                      packed->mag_filter, packed->mip_filter);
-   mtl_sampler_descriptor_set_lod_clamp(descriptor, packed->min_lod,
-                                        packed->max_lod);
-   mtl_sampler_descriptor_set_max_anisotropy(descriptor,
-                                             packed->max_anisotropy);
+   /* Software reduction samples individual texels, never interpolated values.
+    * The shader applies the application's LOD clamp before choosing levels. */
+   mtl_sampler_descriptor_set_filters(
+      descriptor, emulate ? MTL_SAMPLER_MIN_MAG_FILTER_NEAREST : packed->min_filter,
+      emulate ? MTL_SAMPLER_MIN_MAG_FILTER_NEAREST : packed->mag_filter,
+      emulate ? MTL_SAMPLER_MIP_FILTER_NEAREST : packed->mip_filter);
+   mtl_sampler_descriptor_set_lod_clamp(
+      descriptor, emulate ? 0.0f : packed->min_lod,
+      emulate ? FLT_MAX : packed->max_lod);
+   mtl_sampler_descriptor_set_max_anisotropy(
+      descriptor, emulate ? 1 : packed->max_anisotropy);
    mtl_sampler_descriptor_set_compare_function(descriptor,
                                                packed->compare_func);
 
-   if (pdev->vk.supported_extensions.EXT_sampler_filter_minmax)
+   if (pdev->info.gpu_apple_family >= 10)
       mtl_sampler_descriptor_set_reduction_mode(descriptor,
                                                 packed->reduction_mode);
 
@@ -236,6 +246,19 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
    sampler->lod_bias_fp16 = _mesa_float_to_half(pCreateInfo->mipLodBias);
    sampler->lod_min_fp16 = _mesa_float_to_half(pCreateInfo->minLod);
    sampler->lod_max_fp16 = _mesa_float_to_half(pCreateInfo->maxLod);
+
+   if (kk_device_physical(dev)->info.gpu_apple_family < 10 &&
+       packed.reduction_mode != MTL_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE) {
+      sampler->filter_flags =
+         packed.reduction_mode == MTL_SAMPLER_REDUCTION_MODE_MINIMUM
+            ? KK_SAMPLER_REDUCTION_MIN : KK_SAMPLER_REDUCTION_MAX;
+      sampler->filter_flags |=
+         (pCreateInfo->minFilter == VK_FILTER_LINEAR ? KK_SAMPLER_MIN_LINEAR : 0) |
+         (pCreateInfo->magFilter == VK_FILTER_LINEAR ? KK_SAMPLER_MAG_LINEAR : 0) |
+         (pCreateInfo->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR
+             ? KK_SAMPLER_MIP_LINEAR : 0) |
+         (pCreateInfo->unnormalizedCoordinates ? KK_SAMPLER_UNNORMALIZED : 0);
+   }
 
    *pSampler = kk_sampler_to_handle(sampler);
 

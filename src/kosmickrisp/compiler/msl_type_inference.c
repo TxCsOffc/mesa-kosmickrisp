@@ -6,6 +6,7 @@
 
 #include "vulkan/vulkan_core.h"
 #include "msl_private.h"
+#include "nir_to_msl.h"
 
 typedef enum ti_type {
    /* We haven't been able to assign a type yet */
@@ -558,6 +559,14 @@ infer_types_from_tex(struct hash_table *types, nir_tex_instr *tex)
       case nir_tex_src_ddx:
       case nir_tex_src_ddy:
          set_type(types, src, TYPE_FLOAT);
+         break;
+      case nir_tex_src_backend1:
+         if (tex->backend_flags & MSL_TEX_FLAG_MINMAX)
+            set_type(types, src, TYPE_UINT);
+         break;
+      case nir_tex_src_backend2:
+         if (tex->backend_flags & MSL_TEX_FLAG_MINMAX)
+            set_type(types, src, TYPE_FLOAT);
          break;
       default:
          break;
