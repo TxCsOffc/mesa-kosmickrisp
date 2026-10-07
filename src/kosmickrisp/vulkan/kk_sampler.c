@@ -8,7 +8,9 @@
 #include "kk_sampler.h"
 
 #include "kk_entrypoints.h"
+#include "kk_debug.h"
 #include "kk_descriptor_types.h"
+#include "kk_device.h"
 #include "kk_physical_device.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
@@ -21,6 +23,7 @@
 #include "util/format/format_utils.h"
 #include "util/format_srgb.h"
 #include <float.h>
+#include "util/log.h"
 
 static bool
 uses_border(const VkSamplerCreateInfo *info)
@@ -290,6 +293,8 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
          (pCreateInfo->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR
              ? KK_SAMPLER_MIP_LINEAR : 0) |
          (pCreateInfo->unnormalizedCoordinates ? KK_SAMPLER_UNNORMALIZED : 0);
+      if (KK_DEBUG(MINMAX))
+         mesa_logi("kk: sampler with a min/max reduction created (emulated)");
    }
 
    *pSampler = kk_sampler_to_handle(sampler);

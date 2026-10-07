@@ -47,6 +47,10 @@ struct kk_descriptor_set {
    void *mapped_ptr;
    uint64_t addr;
    uint32_t size;
+   /* Sampler descriptors with a min/max reduction written or copied into the
+    * set (never decremented): draws with such a set bound use their
+    * pipeline's min/max emulating program before Apple10. */
+   uint32_t reduction_samplers;
 
    struct kk_buffer_address dynamic_buffers[];
 };
@@ -66,6 +70,8 @@ kk_descriptor_set_addr(const struct kk_descriptor_set *set)
 struct kk_push_descriptor_set {
    uint8_t data[KK_PUSH_DESCRIPTOR_SET_SIZE];
    struct kk_descriptor_set_layout *layout;
+   /* As kk_descriptor_set::reduction_samplers */
+   uint32_t reduction_samplers;
 };
 
 void kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,

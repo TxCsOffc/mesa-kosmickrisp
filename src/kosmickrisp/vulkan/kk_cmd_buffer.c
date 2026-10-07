@@ -56,6 +56,7 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->post_render_writes);
    util_dynarray_clear(&cmd->ts_resolves);
    util_dynarray_clear(&cmd->ts_stage_map);
+   util_dynarray_clear(&cmd->minmax_uab_sets);
 }
 
 /* Ends Metal command buffer recording and returns allocator to pool for reuse */
@@ -97,6 +98,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    util_dynarray_fini(&cmd->post_render_writes);
    util_dynarray_fini(&cmd->ts_resolves);
    util_dynarray_fini(&cmd->ts_stage_map);
+   util_dynarray_fini(&cmd->minmax_uab_sets);
 
    vk_free(&pool->vk.alloc, cmd);
 }
@@ -129,6 +131,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    cmd->ts_resolves = UTIL_DYNARRAY_INIT;
    cmd->ts_stage_map = UTIL_DYNARRAY_INIT;
    cmd->post_render_writes = UTIL_DYNARRAY_INIT;
+   cmd->minmax_uab_sets = UTIL_DYNARRAY_INIT;
 
    {
       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
@@ -214,6 +217,7 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
    cmd->one_time_submit =
       pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+   cmd->replay = false;
 
    /* vk_command_buffer_begin will reset the command buffer meaning the
     * allocator may be returned to the pool. Request a new one. */

@@ -33,8 +33,11 @@ kk_flush_compute_state(struct kk_cmd_buffer *cmd)
    if (desc->root.addr)
       kk_cmd_bind_root_to_argument_table(cmd, desc->root.addr);
 
+   /* The CS's program with or without sampler min/max emulation */
    mtl_compute_set_pipeline_state(
-      encoder, cmd->state.shaders[MESA_SHADER_COMPUTE]->pipeline.cs);
+      encoder,
+      kk_cmd_shader_pipeline(cmd, cmd->state.shaders[MESA_SHADER_COMPUTE], desc)
+         ->cs);
 }
 
 static void

@@ -1011,8 +1011,7 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
    }
 
    if (IS_SHADER_DIRTY(VERTEX)) {
-      struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
-      mtl_render_set_pipeline_state(enc, vs->pipeline.gfx.render);
+      mtl_render_set_pipeline_state(enc, gfx->pipe->gfx.render);
       if (gfx->depth_stencil_state)
          mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
    }
@@ -1589,6 +1588,14 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
 {
    struct kk_graphics_state *gfx = &cmd->state.gfx;
    struct kk_descriptor_state *desc = &gfx->descriptors;
+
+   /* The VS's program with or without sampler min/max emulation */
+   const struct kk_pipeline_handles *pipe = kk_cmd_shader_pipeline(
+      cmd, cmd->state.shaders[MESA_SHADER_VERTEX], desc);
+   if (pipe != gfx->pipe) {
+      gfx->pipe = pipe;
+      cmd->state.dirty_shaders |= BITFIELD_BIT(MESA_SHADER_VERTEX);
+   }
 
    kk_flush_render_pass(cmd);
    kk_flush_pipeline(cmd);
@@ -2194,7 +2201,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
 
    mtl_compute_encoder *enc = cs_get_compute(cmd);
    {
-      mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[0];
+      mtl_compute_pipeline_state *pipeline = gfx->pipe->gfx.pre_render[0];
       struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
       mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                        MTL_STAGE_DISPATCH);
@@ -2202,7 +2209,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
       kk_dispatch_compute(enc, grid_vs, local_size);
    }
    {
-      mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[1];
+      mtl_compute_pipeline_state *pipeline = gfx->pipe->gfx.pre_render[1];
       struct mtl_size local_size = {tcs->info.tess.tcs_output_patch_size, 1, 1};
       /* Avoid Metal validation error by trying to launch empty compute. Return
        * empty data. We set restart to true to avoid unroll. */
@@ -2322,14 +2329,15 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
 
    /* The stage feeding the GS and its compute pass are the last two pre-render
     * pipelines */
-   uint32_t pre_render_count = vs->pipeline.gfx.pre_render_count;
+   const struct kk_pipeline_handles *pipe = gfx->pipe;
+   uint32_t pre_render_count = pipe->gfx.pre_render_count;
    struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
    mtl_compute_encoder *enc = cs_get_compute(cmd);
 
    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                     MTL_STAGE_DISPATCH);
    mtl_compute_set_pipeline_state(
-      enc, vs->pipeline.gfx.pre_render[pre_render_count - 2u]);
+      enc, pipe->gfx.pre_render[pre_render_count - 2u]);
    kk_dispatch_compute(enc, grid_vs, local_size);
 
    /* Prefix sum the dynamic counts to find each primitive's capture offset.
@@ -2339,7 +2347,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
       if (gs->count_words) {
          mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                           MTL_STAGE_DISPATCH);
-         mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.gs_count);
+         mtl_compute_set_pipeline_state(enc, pipe->gfx.gs_count);
          kk_dispatch_compute(enc, grid_gs, local_size);
       }
 
@@ -2350,7 +2358,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
 
       mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                        MTL_STAGE_DISPATCH);
-      mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.pre_gs);
+      mtl_compute_set_pipeline_state(enc, pipe->gfx.pre_gs);
       mtl_dispatch_threads(enc, (struct mtl_size){1u, 1u, 1u},
                            (struct mtl_size){1u, 1u, 1u});
    }
@@ -2358,7 +2366,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                     MTL_STAGE_DISPATCH);
    mtl_compute_set_pipeline_state(
-      enc, vs->pipeline.gfx.pre_render[pre_render_count - 1u]);
+      enc, pipe->gfx.pre_render[pre_render_count - 1u]);
    kk_dispatch_compute(enc, grid_gs, local_size);
 
    struct kk_draw_data rast = {

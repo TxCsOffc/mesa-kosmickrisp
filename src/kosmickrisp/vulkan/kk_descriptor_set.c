@@ -19,6 +19,7 @@
 
 #include "util/format/u_format.h"
 #include "util/half_float.h"
+#include "util/u_atomic.h"
 
 static inline uint32_t
 align_u32(uint32_t v, uint32_t a)
@@ -136,6 +137,20 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
    memcpy(dst, desc, sizeof(desc[0]) * plane_count);
 }
 
+/* Sampler min/max reduction emulation before Apple10 (kk_shader.c) */
+static void
+count_reduction_sampler(struct kk_descriptor_set *set)
+{
+   struct kk_device *dev =
+      container_of(set->layout->vk.base.device, struct kk_device, vk);
+
+   p_atomic_inc(&set->reduction_samplers);
+   if (!p_atomic_read(&set->layout->reduction_samplers))
+      p_atomic_set(&set->layout->reduction_samplers, true);
+   if (!p_atomic_read(&dev->reduction_sampler_sets))
+      p_atomic_set(&dev->reduction_sampler_sets, true);
+}
+
 static void
 write_sampled_image_view_desc(struct kk_descriptor_set *set,
                               const VkDescriptorImageInfo *const _info,
@@ -152,6 +167,10 @@ write_sampled_image_view_desc(struct kk_descriptor_set *set,
          info.sampler =
             kk_sampler_to_handle(binding_layout->immutable_samplers[elem]);
       }
+      VK_FROM_HANDLE(kk_sampler, sampler, info.sampler);
+      if (sampler && (sampler->filter_flags & (KK_SAMPLER_REDUCTION_MIN |
+                                               KK_SAMPLER_REDUCTION_MAX)))
+         count_reduction_sampler(set);
    }
 
    uint32_t dst_size;
@@ -362,6 +381,25 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
          }
       }
 
+      /* Copied reduction samplers count for the destination too. Mutable
+       * descriptors can't be told apart: count one if the source has any. */
+      if (src_binding_layout->stride > 0 &&
+          p_atomic_read(&src->reduction_samplers)) {
+         if (src_binding_layout->type == VK_DESCRIPTOR_TYPE_SAMPLER ||
+             src_binding_layout->type ==
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+            for (uint32_t j = 0; j < copy->descriptorCount; j++) {
+               const struct kk_sampled_image_descriptor *desc = desc_ubo_data(
+                  src, copy->srcBinding, copy->srcArrayElement + j, NULL);
+               if (desc->sampler_filter_flags &
+                   (KK_SAMPLER_REDUCTION_MIN | KK_SAMPLER_REDUCTION_MAX))
+                  count_reduction_sampler(dst);
+            }
+         } else if (src_binding_layout->type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
+            count_reduction_sampler(dst);
+         }
+      }
+
       switch (src_binding_layout->type) {
       case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
@@ -438,6 +476,7 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
          break;
       }
    }
+   push_set->reduction_samplers += set.reduction_samplers;
 }
 
 static void kk_descriptor_pool_free(struct kk_descriptor_pool *pool,
@@ -850,4 +889,5 @@ kk_push_descriptor_set_update_template(
       .mapped_ptr = push_set->data,
    };
    kk_descriptor_set_write_template(&tmp_set, template, data);
+   push_set->reduction_samplers += tmp_set.reduction_samplers;
 }

@@ -160,6 +160,9 @@ struct kk_graphics_state {
    enum kk_dirty dirty;
    uint32_t pipeline_sample_count;
 
+   /* Program of the bound VS draws use (kk_cmd_shader_pipeline) */
+   const struct kk_pipeline_handles *pipe;
+
    struct {
       enum mtl_visibility_result_mode mode;
 
@@ -294,6 +297,14 @@ struct kk_cmd_buffer {
    /* Metal command buffers are single-shot: a resubmission must re-record
     * by replaying the enqueued commands (see rerecord_cmd_buffer). */
    bool submitted;
+   /* Recorded by kk_queue_submit's replay of another command buffer */
+   bool replay;
+   /* Update-after-bind descriptor sets without reduction samplers that draws
+    * and dispatches used a pipeline's program without sampler min/max
+    * emulation for (struct kk_descriptor_set *, kk_cmd_shader_pipeline): if
+    * one of them holds a reduction sampler at submission, the command buffer
+    * is re-recorded. */
+   struct util_dynarray minmax_uab_sets;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_cmd_buffer, vk.base, VkCommandBuffer,

@@ -314,6 +314,9 @@ kk_CreateDescriptorSetLayout(VkDevice device,
             /* We zalloc the object, so it's safe to hash the whole thing */
             if (sampler != NULL && sampler->vk.ycbcr_conversion != NULL)
                BLAKE3_UPDATE_VALUE(sampler->vk.ycbcr_conversion->state);
+            /* Min/max emulation is resolved at compile time for these */
+            if (sampler != NULL)
+               BLAKE3_UPDATE_VALUE(sampler->filter_flags);
          }
       }
    }

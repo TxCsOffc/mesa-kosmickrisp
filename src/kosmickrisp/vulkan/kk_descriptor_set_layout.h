@@ -50,6 +50,11 @@ struct kk_descriptor_set_layout {
 
    VkDescriptorSetLayoutCreateFlagBits flags;
 
+   /* A set of this layout got a sampler with a min/max reduction (never
+    * cleared): pipelines with this layout compile their min/max emulating
+    * program when they are created (kk_shader.c) */
+   bool reduction_samplers;
+
    /* Size of the descriptor buffer for this descriptor set */
    /* Does not contain the size needed for variable count descriptors */
    uint32_t non_variable_descriptor_buffer_size;

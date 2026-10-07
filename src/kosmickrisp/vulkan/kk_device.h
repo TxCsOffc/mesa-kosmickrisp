@@ -103,6 +103,15 @@ struct kk_device {
    /* Geomtry heap */
    struct kk_bo *heap;
    util_once_flag heap_init_once;
+
+   /* Sampler min/max reduction emulation before Apple10 (kk_shader.c): a
+    * descriptor set got a reduction sampler, so pipelines read from a
+    * pipeline cache (no set layouts to check) compile their min/max
+    * emulating program first */
+   bool reduction_sampler_sets;
+   /* Serializes compiling the second program of such a pipeline on first
+    * use (kk_cmd_shader_pipeline) */
+   simple_mtx_t lazy_pipeline_lock;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)

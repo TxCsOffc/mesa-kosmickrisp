@@ -20,6 +20,7 @@
 #include "vk_shader.h"
 
 struct kk_cmd_buffer;
+struct kk_descriptor_state;
 
 struct kk_tess_info {
    enum tess_primitive_mode mode : 8;
@@ -53,6 +54,10 @@ struct kk_shader_info {
 
    /* Required for fragment shader cull distance discards. */
    uint8_t num_cull_distances;
+
+   /* VS or CS with a minmax program: descriptor sets whose reduction samplers
+    * need it (kk_compile_programs) */
+   uint32_t minmax_sets;
 
    union {
       /* Vertex shader is the pipeline, store all relevant data here. */
@@ -157,6 +162,13 @@ struct kk_shader {
    /* XFB pre-GS and count shader; code is NULL when the program isn't needed. */
    struct msl_compile_data gs_count;
    struct msl_compile_data pre_gs;
+
+   /* VS or CS: the program emulating min/max reduction for samplers from
+    * descriptor sets, or NULL (kk_compile_programs) */
+   struct kk_shader *minmax;
+   /* Metal pipelines created, when minmax isn't NULL (one of the two
+    * programs is compiled on first use) */
+   bool pipeline_ready;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
@@ -191,7 +203,10 @@ bool kk_nir_lower_poly(struct nir_shader *nir);
 bool kk_nir_lower_null_images(nir_shader *nir);
 
 bool kk_nir_lower_textures(nir_shader *nir);
-bool kk_nir_lower_sampler_minmax(nir_shader *nir);
+bool kk_nir_lower_sampler_minmax(nir_shader *nir, bool dynamic,
+                                 uint32_t set_layout_count,
+                                 struct vk_descriptor_set_layout *const *set_layouts,
+                                 uint32_t *dynamic_sets_out);
 
 bool kk_nir_lower_vs_multiview(nir_shader *nir, uint32_t view_mask);
 bool kk_nir_lower_fs_multiview(nir_shader *nir, uint32_t view_mask);
@@ -208,5 +223,9 @@ VkResult kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
 
 void kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd,
                                 struct kk_shader *shader);
+
+const struct kk_pipeline_handles *
+kk_cmd_shader_pipeline(struct kk_cmd_buffer *cmd, struct kk_shader *shader,
+                       const struct kk_descriptor_state *desc);
 
 #endif /* KK_SHADER_H */

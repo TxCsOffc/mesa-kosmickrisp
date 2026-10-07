@@ -294,6 +294,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.command_buffer_ops = &kk_cmd_buffer_ops;
    dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
    dev->vk.get_timestamp = kk_get_timestamp;
+   simple_mtx_init(&dev->lazy_pipeline_lock, mtx_plain);
 
    /* Create a new Metal pipeline compiler for the device */
    dev->mtl_compiler_handle = kk_acquire_compiler(dev);
@@ -358,6 +359,7 @@ fail_vab_memory:
 fail_compiler:
    kk_release_compiler(dev);
 fail_init:
+   simple_mtx_destroy(&dev->lazy_pipeline_lock);
    vk_device_finish(&dev->vk);
 fail_alloc:
    vk_free(&dev->vk.alloc, dev);
@@ -399,6 +401,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    simple_mtx_destroy(&dev->residency_set.mutex);
 
    kk_release_compiler(dev);
+   simple_mtx_destroy(&dev->lazy_pipeline_lock);
 
    vk_device_finish(&dev->vk);
 

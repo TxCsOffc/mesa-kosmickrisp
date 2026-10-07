@@ -8,6 +8,8 @@
 #include "kk_queue.h"
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
+#include "kk_debug.h"
+#include "kk_descriptor_set.h"
 #include "kk_device.h"
 #include "kk_entrypoints.h"
 #include "kk_physical_device.h"
@@ -91,6 +93,24 @@ kk_cmd_buffer_has_work(struct kk_cmd_buffer *cmd)
    return cmd->metal.cmd_buf;
 }
 
+/* Draws or dispatches used a pipeline's program without sampler min/max
+ * emulation for an update-after-bind set that got a reduction sampler after
+ * recording (kk_cmd_shader_pipeline). */
+static bool
+kk_cmd_buffer_needs_minmax_replay(struct kk_cmd_buffer *cmd)
+{
+   util_dynarray_foreach(&cmd->minmax_uab_sets, struct kk_descriptor_set *,
+                         set) {
+      if (p_atomic_read(&(*set)->reduction_samplers)) {
+         if (KK_DEBUG(MINMAX))
+            mesa_logi("kk: command buffer re-recorded: an update-after-bind "
+                      "set got a sampler with a min/max reduction");
+         return true;
+      }
+   }
+   return false;
+}
+
 static void
 kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
                 mtl_feedback_handler_callback callback, void *user_data)
@@ -138,6 +158,7 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    result = kk_BeginCommandBuffer(rerecord_handle, &begin_info);
    if (result != VK_SUCCESS)
       goto release;
+   rerecord->replay = true;
 
    vk_cmd_queue_execute(&cmd->vk.cmd_queue, rerecord_handle,
                         &dev->vk.dispatch_table);
@@ -212,8 +233,10 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       }
 
       /* Metal's command buffers are one time use, re-record multiple
-       * submissions. */
-      if (cmd_buffer->submitted) {
+       * submissions, and command buffers whose sampler min/max emulation
+       * changed after recording. */
+      if (cmd_buffer->submitted ||
+          kk_cmd_buffer_needs_minmax_replay(cmd_buffer)) {
          VkResult result = rerecord_and_commit_cmd_buffer(queue, cmd_buffer);
          if (result != VK_SUCCESS)
             return result;
