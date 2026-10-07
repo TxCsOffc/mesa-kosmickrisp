@@ -36,6 +36,10 @@ void kk_image_get_sparse_memory_requirements(
    const struct kk_image *image, uint32_t *count,
    VkSparseImageMemoryRequirements2 *requirements);
 
+/* Resources of vkQueueBindSparse on the queue (sparseBinding enabled) */
+VkResult kk_queue_sparse_init(struct kk_device *dev, struct kk_queue *queue);
+void kk_queue_sparse_finish(struct kk_device *dev, struct kk_queue *queue);
+
 /* vkQueueBindSparse binds of a submit, as Metal 4 queue mapping updates */
 void kk_queue_bind_sparse(struct kk_queue *queue,
                           const struct vk_queue_submit *submit);

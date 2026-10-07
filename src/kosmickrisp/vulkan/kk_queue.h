@@ -31,6 +31,13 @@ struct kk_queue {
    uint32_t commits_in_flight;
    mtx_t mutex;
    cnd_t cond;
+
+   /* A one page placement sparse buffer and the heap page it maps after
+    * vkQueueBindSparse unmaps pages (kk_sparse.c) */
+   struct {
+      mtl_buffer *buffer;
+      struct kk_bo *bo;
+   } sparse_flush;
 };
 
 static inline struct kk_device *

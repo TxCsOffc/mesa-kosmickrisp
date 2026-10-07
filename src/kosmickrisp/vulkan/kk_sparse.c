@@ -5,6 +5,7 @@
 
 #include "kk_sparse.h"
 
+#include "kk_bo.h"
 #include "kk_buffer.h"
 #include "kk_device.h"
 #include "kk_device_memory.h"
@@ -223,11 +224,13 @@ kk_sparse_memory_heap(const struct kk_device_memory *mem)
    return mem ? mem->bo->mtl_handle : NULL;
 }
 
-static void
+/* Returns whether a page was unmapped */
+static bool
 kk_sparse_bind_buffer(struct kk_queue *queue,
                       const VkSparseBufferMemoryBindInfo *info)
 {
    VK_FROM_HANDLE(kk_buffer, buffer, info->buffer);
+   bool unmapped = false;
 
    for (uint32_t i = 0; i < info->bindCount; ++i) {
       const VkSparseMemoryBind *bind = &info->pBinds[i];
@@ -243,7 +246,55 @@ kk_sparse_bind_buffer(struct kk_queue *queue,
                                                buffer->metal.handle,
                                                kk_sparse_memory_heap(mem),
                                                &mapping, 1u);
+      unmapped |= mem == NULL;
    }
+
+   return unmapped;
+}
+
+/* Metal (macOS 27.0.1, M1 Max) holds back unmaps of placement sparse buffer
+ * pages until the queue maps a page of a resident resource: unmapped pages
+ * kept reading and writing their old memory. Mapping the queue's resident one
+ * page buffer applies them. */
+VkResult
+kk_queue_sparse_init(struct kk_device *dev, struct kk_queue *queue)
+{
+   VkResult result = kk_alloc_sparse_bo(dev, &queue->vk.base,
+                                        KK_SPARSE_PAGE_SIZE_B,
+                                        &queue->sparse_flush.bo);
+   if (result != VK_SUCCESS)
+      return result;
+
+   queue->sparse_flush.buffer =
+      mtl_new_placement_sparse_buffer(dev->mtl_handle, KK_SPARSE_PAGE_SIZE_B);
+   if (queue->sparse_flush.buffer == NULL)
+      return vk_error(queue, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   kk_device_add_allocation_to_residency_set(dev, queue->sparse_flush.buffer);
+
+   return VK_SUCCESS;
+}
+
+void
+kk_queue_sparse_finish(struct kk_device *dev, struct kk_queue *queue)
+{
+   if (queue->sparse_flush.buffer) {
+      kk_device_remove_allocation_from_residency_set(
+         dev, queue->sparse_flush.buffer);
+      mtl_release(queue->sparse_flush.buffer);
+   }
+   if (queue->sparse_flush.bo)
+      kk_destroy_bo(dev, queue->sparse_flush.bo);
+}
+
+static void
+kk_sparse_apply_unmaps(struct kk_queue *queue)
+{
+   const struct mtl_sparse_buffer_mapping mapping = {
+      .length = 1u,
+   };
+   mtl_command_queue_update_buffer_mappings(
+      queue->mtl_handle, queue->sparse_flush.buffer,
+      queue->sparse_flush.bo->mtl_handle, &mapping, 1u);
 }
 
 /* Page `page` of the opaque layout (see struct kk_image_sparse) as the start
@@ -355,8 +406,9 @@ void
 kk_queue_bind_sparse(struct kk_queue *queue,
                      const struct vk_queue_submit *submit)
 {
+   bool unmapped = false;
    for (uint32_t i = 0; i < submit->buffer_bind_count; ++i)
-      kk_sparse_bind_buffer(queue, &submit->buffer_binds[i]);
+      unmapped |= kk_sparse_bind_buffer(queue, &submit->buffer_binds[i]);
 
    struct util_dynarray mappings;
    util_dynarray_init(&mappings, NULL);
@@ -367,4 +419,7 @@ kk_queue_bind_sparse(struct kk_queue *queue,
 
    for (uint32_t i = 0; i < submit->image_bind_count; ++i)
       kk_sparse_bind_image(queue, &submit->image_binds[i]);
+
+   if (unmapped)
+      kk_sparse_apply_unmaps(queue);
 }

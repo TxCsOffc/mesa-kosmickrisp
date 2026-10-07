@@ -300,6 +300,14 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
 
    queue->vk.driver_submit = kk_queue_submit;
 
+   if (dev->vk.enabled_features.sparseBinding) {
+      result = kk_queue_sparse_init(dev, queue);
+      if (result != VK_SUCCESS) {
+         kk_queue_finish(dev, queue);
+         return result;
+      }
+   }
+
    return VK_SUCCESS;
 }
 
@@ -308,6 +316,8 @@ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
 {
    /* There may be in-flight command buffers, wait for them to finish. */
    kk_queue_wait_for_commits(queue);
+
+   kk_queue_sparse_finish(dev, queue);
 
    mtl_command_queue_remove_residency_set(queue->mtl_handle,
                                           dev->residency_set.handle);
