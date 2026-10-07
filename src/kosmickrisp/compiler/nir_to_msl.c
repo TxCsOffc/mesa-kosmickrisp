@@ -2609,9 +2609,11 @@ static bool
 msl_split_sparse_fetch(nir_builder *b, nir_instr *instr, void *data)
 {
    nir_def *def;
-   /* Multisampled and buffer images are never sparse (no sparseResidency*
-    * samples features, Vulkan has no sparse texel buffers): their texels are
-    * all resident and MSL has no sparse read for them. */
+   /* Multisampled images are never sparse (no sparseResidency*Samples
+    * features) and MSL has no sparse read of texture buffers: these reads
+    * are resident here. Texel buffers of sparse buffers get the residency of
+    * their page from the driver (kk_nir_lower_descriptors.c), ANDed into the
+    * code. */
    bool always_resident;
    if (instr->type == nir_instr_type_tex && nir_instr_as_tex(instr)->is_sparse) {
       nir_tex_instr *tex = nir_instr_as_tex(instr);

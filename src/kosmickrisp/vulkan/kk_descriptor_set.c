@@ -239,6 +239,10 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
 
       desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
       desc.texel_offset = view->texel_offset;
+      desc.residency_gpu_resource_id = view->residency_gpu_id;
+      desc.residency_first_page = view->sparse_first_page;
+      desc.residency_page_shift = view->residency_page_shift;
+      desc.residency_last_page = view->residency_last_page;
    }
    write_desc(set, binding, elem, &desc, sizeof(desc));
 }

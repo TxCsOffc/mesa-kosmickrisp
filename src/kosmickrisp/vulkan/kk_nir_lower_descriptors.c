@@ -360,6 +360,71 @@ load_resource_deref_desc(nir_builder *b, unsigned num_components,
                           offset_B, ctx);
 }
 
+/* Residency of texel x (from the start of the Metal texture) of a texel
+ * buffer: Metal has no sparse read of texture buffers, so views of sparse
+ * residency buffers read their page's tile in the buffer's residency texture
+ * (struct kk_texel_buffer_descriptor); other views are always resident. */
+static nir_def *
+load_texel_buffer_residency(nir_builder *b, nir_deref_instr *deref,
+                            nir_def *x, const struct lower_descriptors_ctx *ctx)
+{
+   const unsigned offs =
+      offsetof(struct kk_texel_buffer_descriptor, residency_gpu_resource_id);
+   nir_def *desc = load_resource_deref_desc(b, 4, 32, deref, offs, ctx);
+   nir_def *first_page = load_resource_deref_desc(
+      b, 1, 32, deref,
+      offsetof(struct kk_texel_buffer_descriptor, residency_first_page), ctx);
+
+   nir_def *handle = nir_load_texture_handle_kk(
+      b, 1, 64, load_resource_addr(b, 1, 64, deref, offs, ctx),
+      .dest_type = nir_type_uint32, .image_dim = GLSL_SAMPLER_DIM_2D,
+      .image_array = true, .access = ACCESS_NON_WRITEABLE,
+      .flags = MSL_ACCESS_READ);
+   nir_def *page = nir_umin(
+      b,
+      nir_iadd(b, first_page,
+               nir_ushr(b, nir_u2u32(b, x), nir_channel(b, desc, 2))),
+      nir_channel(b, desc, 3));
+   const unsigned row_mask = (1u << KK_SPARSE_RESIDENCY_ROW_TILES_LOG2) - 1u;
+   const unsigned rows_mask = (1u << (KK_SPARSE_RESIDENCY_LAYER_TILES_LOG2 -
+                                      KK_SPARSE_RESIDENCY_ROW_TILES_LOG2)) -
+                              1u;
+   nir_def *coord = nir_vec4(
+      b,
+      nir_ishl_imm(b, nir_iand_imm(b, page, row_mask),
+                   KK_SPARSE_RESIDENCY_TILE_PX_LOG2),
+      nir_ishl_imm(b,
+                   nir_iand_imm(b,
+                                nir_ushr_imm(b, page,
+                                             KK_SPARSE_RESIDENCY_ROW_TILES_LOG2),
+                                rows_mask),
+                   KK_SPARSE_RESIDENCY_TILE_PX_LOG2),
+      nir_ushr_imm(b, page, KK_SPARSE_RESIDENCY_LAYER_TILES_LOG2),
+      nir_imm_int(b, 0));
+   nir_def *zero = nir_imm_int(b, 0), *resident = nir_imm_int(b, 1);
+   nir_push_if(b, nir_ine_imm(b, nir_ior(b, nir_channel(b, desc, 0),
+                                         nir_channel(b, desc, 1)),
+                              0));
+   nir_def *read = nir_bindless_image_sparse_load(
+      b, 5, 32, handle, coord, zero, zero, .image_dim = GLSL_SAMPLER_DIM_2D,
+      .image_array = true, .dest_type = nir_type_uint32,
+      .access = ACCESS_NON_WRITEABLE);
+   nir_def *code = nir_channel(b, read, 4);
+   nir_pop_if(b, NULL);
+   return nir_if_phi(b, code, resident);
+}
+
+/* ANDs a residency code into the last component of a sparse load's def */
+static void
+and_sparse_residency(nir_builder *b, nir_instr *instr, nir_def *def,
+                     nir_def *residency)
+{
+   b->cursor = nir_after_instr(instr);
+   const unsigned code_comp = def->num_components - 1;
+   nir_def *code = nir_iand(b, nir_channel(b, def, code_comp), residency);
+   nir_def_rewrite_uses_after(def, nir_vector_insert_imm(b, def, code, code_comp));
+}
+
 static bool
 lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
                    const struct lower_descriptors_ctx *ctx)
@@ -396,7 +461,7 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
    /* Texel buffers: the Metal texture starts texel_offset texels before the
     * view (struct kk_texel_buffer_descriptor).
     */
-   nir_def *texel_offset = NULL;
+   nir_def *texel_offset = NULL, *residency = NULL;
    if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF) {
       texel_offset = load_resource_deref_desc(
          b, 1, 32, deref,
@@ -406,10 +471,15 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
          nir_def *x = nir_iadd(b, nir_channel(b, coord, 0),
                                nir_u2uN(b, texel_offset, coord->bit_size));
          nir_src_rewrite(&intr->src[1], nir_vector_insert_imm(b, coord, x, 0));
+         if (intr->intrinsic == nir_intrinsic_image_deref_sparse_load)
+            residency = load_texel_buffer_residency(b, deref, x, ctx);
       }
    }
 
    nir_rewrite_image_intrinsic(intr, handle, nir_image_intrinsic_type_bindless);
+
+   if (residency)
+      and_sparse_residency(b, &intr->instr, &intr->def, residency);
 
    if (texel_offset && intr->intrinsic == nir_intrinsic_bindless_image_size) {
       b->cursor = nir_after_instr(&intr->instr);
@@ -623,6 +693,12 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
                                   nir_u2uN(b, texel_offset, coord->bit_size));
             nir_src_rewrite(&tex->src[coord_idx].src,
                             nir_vector_insert_imm(b, coord, x, 0));
+            if (tex->is_sparse) {
+               nir_def *residency = load_texel_buffer_residency(
+                  b, nir_src_as_deref(nir_src_for_ssa(texture)), x, ctx);
+               and_sparse_residency(b, &tex->instr, &tex->def, residency);
+               b->cursor = nir_before_instr(&tex->instr);
+            }
          }
       }
    }
@@ -861,8 +937,9 @@ kk_nir_lower_descriptors(nir_shader *nir,
     * TODO: See if we can unify this, not sure if the fast path matters on
     * Apple. This is inherited from NVK.
     */
+   /* Sparse texel buffer loads add control flow (load_texel_buffer_residency) */
    bool pass_lower_descriptors = nir_shader_instructions_pass(
-      nir, try_lower_descriptors_instr, nir_metadata_control_flow, &ctx);
+      nir, try_lower_descriptors_instr, nir_metadata_none, &ctx);
 
    bool pass_lower_ssbo = nir_shader_intrinsics_pass(
       nir, lower_ssbo_descriptor, nir_metadata_control_flow, &ctx);

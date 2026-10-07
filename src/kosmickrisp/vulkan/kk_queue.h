@@ -17,6 +17,7 @@
 #include "vk_queue.h"
 
 #include "c11/threads.h"
+#include "util/simple_mtx.h"
 
 struct kk_queue {
    struct vk_queue vk;
@@ -32,12 +33,19 @@ struct kk_queue {
    mtx_t mutex;
    cnd_t cond;
 
-   /* A one page placement sparse buffer and the heap page it maps after
-    * vkQueueBindSparse unmaps pages (kk_sparse.c) */
+   /* vkQueueBindSparse (kk_sparse.c): a one page placement sparse buffer and
+    * the heap page it maps after unmaps of buffer pages, and the event that
+    * separates texture mapping updates from earlier buffer mapping updates.
+    * lock orders the queue's mapping updates. */
    struct {
-      mtl_buffer *buffer;
-      struct kk_bo *bo;
-   } sparse_flush;
+      mtl_buffer *flush_buffer;
+      struct kk_bo *flush_bo;
+      mtl_event *separator;
+      uint64_t separator_value;
+      simple_mtx_t lock;
+      bool texture_mapped;
+      bool buffer_after_texture;
+   } sparse;
 };
 
 static inline struct kk_device *

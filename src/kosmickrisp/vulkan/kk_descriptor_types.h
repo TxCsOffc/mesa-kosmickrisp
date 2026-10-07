@@ -55,15 +55,33 @@ static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
  * vkd3d-proton): the Metal texture starts at the aligned offset below the
  * view, and shaders add texel_offset to coordinates (and take it off sizes).
  * image_gpu_resource_id is first, like in the other image descriptors.
+ *
+ * Views of sparse residency buffers: Metal has no sparse read of texture
+ * buffers, so sparse loads read the residency of their page from the buffer's
+ * residency texture (kk_sparse.c, KK_SPARSE_RESIDENCY_*): texel x of the Metal
+ * texture is in buffer page
+ * min(residency_first_page + (x >> residency_page_shift), residency_last_page).
+ * residency_gpu_resource_id is 0 for other views (always resident).
  */
 struct kk_texel_buffer_descriptor {
    uint64_t image_gpu_resource_id;
    uint32_t texel_offset;
-   uint32_t pad;
+   uint32_t residency_first_page;
+   uint64_t residency_gpu_resource_id;
+   uint32_t residency_page_shift;
+   uint32_t residency_last_page;
 };
 
-static_assert(sizeof(struct kk_texel_buffer_descriptor) == 16,
+static_assert(sizeof(struct kk_texel_buffer_descriptor) == 32,
               "kk_texel_buffer_descriptor has no holes");
+
+/* The residency texture of a sparse residency buffer: an R8Uint 2D array of
+ * 256x256 texel (64 KiB) tiles, one per buffer page, 64 tiles per row and
+ * 64 rows per layer: page p is the tile at texel
+ * ((p % 64) * 256, (p / 64 % 64) * 256) of layer p / 4096. */
+#define KK_SPARSE_RESIDENCY_TILE_PX_LOG2     8u
+#define KK_SPARSE_RESIDENCY_ROW_TILES_LOG2   6u
+#define KK_SPARSE_RESIDENCY_LAYER_TILES_LOG2 12u
 
 /* This has to match nir_address_format_64bit_bounded_global */
 struct kk_buffer_address {

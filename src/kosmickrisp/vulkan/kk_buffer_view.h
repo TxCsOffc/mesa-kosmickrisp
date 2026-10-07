@@ -36,6 +36,11 @@ struct kk_buffer_view {
    struct list_head sparse_link;
    uint64_t sparse_first_page;
    uint64_t sparse_page_count;
+   /* Residency texture of a sparse residency buffer and the descriptor's
+    * page lookup (struct kk_texel_buffer_descriptor); 0 otherwise. */
+   uint64_t residency_gpu_id;
+   uint32_t residency_page_shift;
+   uint32_t residency_last_page;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer_view, vk.base, VkBufferView,
