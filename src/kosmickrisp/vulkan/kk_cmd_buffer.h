@@ -166,10 +166,15 @@ struct kk_graphics_state {
    struct {
       enum mtl_visibility_result_mode mode;
 
-      /* If enabled, index of the current occlusion query in the occlusion heap.
-       * There can only be one active at a time (hardware constraint).
+      /* If enabled, index of the current occlusion query in its chunk of the
+       * occlusion heap (kk_oq_heap). There can only be one active at a time
+       * (hardware constraint).
        */
-      uint16_t index;
+      uint32_t index;
+      /* Chunk of the current occlusion query */
+      uint32_t chunk;
+      /* Chunk the render pass descriptor writes visibility results to */
+      uint32_t pass_chunk;
    } occlusion;
 
    /* Index buffer */

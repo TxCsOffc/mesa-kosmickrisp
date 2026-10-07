@@ -319,8 +319,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_mem_cache;
 
-   result = kk_query_table_init(dev, &dev->occlusion_queries,
-                                KK_MAX_OCCLUSION_QUERIES);
+   result = kk_oq_heap_init(dev, &dev->occlusion_queries);
    if (result != VK_SUCCESS)
       goto fail_meta;
 
@@ -345,7 +344,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
 fail_sampler_heap:
    kk_destroy_sampler_heap(dev, &dev->samplers);
 fail_query_table:
-   kk_query_table_finish(dev, &dev->occlusion_queries);
+   kk_oq_heap_finish(dev, &dev->occlusion_queries);
 fail_meta:
    kk_device_finish_meta(dev);
 fail_mem_cache:
@@ -384,7 +383,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    /* Meta first since it may destroy Vulkan objects */
    kk_device_finish_meta(dev);
    kk_device_finish_lib(dev);
-   kk_query_table_finish(dev, &dev->occlusion_queries);
+   kk_oq_heap_finish(dev, &dev->occlusion_queries);
    kk_destroy_sampler_heap(dev, &dev->samplers);
 
    /* Geometry heap */

@@ -11,15 +11,19 @@
 #include "kk_query.h"
 
 static inline global uint64_t *
-query_report(global uint64_t *results, global uint16_t *oq_index,
-             uint reports_per_query, uint query)
+query_report(global uint64_t *results, global uint32_t *oq_index,
+             global uint64_t *oq_chunks, uint reports_per_query, uint query)
 {
-   /* For occlusion queries, results[] points to the device global heap. We
-    * need to remap indices according to the query pool's allocation.
+   /* Occlusion queries are indices into the device's result chunks, remapped
+    * by the query pool's allocation.
     */
-   uint result_index = oq_index ? oq_index[query] : query;
+   if (oq_index) {
+      uint index = oq_index[query];
+      return (global uint64_t *)oq_chunks[index / KK_OQ_CHUNK_QUERIES] +
+             (index % KK_OQ_CHUNK_QUERIES);
+   }
 
-   return results + (result_index * reports_per_query);
+   return results + (query * reports_per_query);
 }
 
 /**
@@ -28,7 +32,8 @@ query_report(global uint64_t *results, global uint16_t *oq_index,
  */
 KERNEL(1)
 libkk_reset_query(global uint32_t *availability, global uint64_t *results,
-                  global uint16_t *oq_index, uint32_t first_query,
+                  global uint32_t *oq_index, global uint64_t *oq_chunks,
+                  uint32_t first_query,
                   uint16_t reports_per_query, int set_available)
 {
    uint32_t query = first_query + cl_global_id.x;
@@ -41,7 +46,7 @@ libkk_reset_query(global uint32_t *availability, global uint64_t *results,
    }
 
    global uint64_t *report =
-      query_report(results, oq_index, reports_per_query, query);
+      query_report(results, oq_index, oq_chunks, reports_per_query, query);
 
    /* XXX: is this supposed to happen on the begin? */
    for (unsigned j = 0; j < reports_per_query; ++j) {
@@ -72,7 +77,8 @@ libkk_copy_xfb_counters(constant struct libkk_xfb_counter_copy *copy)
 
 KERNEL(1)
 libkk_copy_queries(global uint32_t *availability, global uint64_t *results,
-                   global uint16_t *oq_index, uint64_t dst_addr,
+                   global uint32_t *oq_index, global uint64_t *oq_chunks,
+                   uint64_t dst_addr,
                    uint64_t dst_stride, uint32_t first_query,
                    VkQueryResultFlagBits flags, uint16_t reports_per_query)
 {
@@ -87,14 +93,11 @@ libkk_copy_queries(global uint32_t *availability, global uint64_t *results,
       available = (results[query] != LIBKK_QUERY_UNAVAILABLE);
 
    if (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
-      /* For occlusion queries, results[] points to the device global heap. We
-       * need to remap indices according to the query pool's allocation.
-       */
-      uint result_index = oq_index ? oq_index[query] : query;
-      uint idx = result_index * reports_per_query;
+      global uint64_t *report =
+         query_report(results, oq_index, oq_chunks, reports_per_query, query);
 
       for (unsigned i = 0; i < reports_per_query; ++i) {
-         vk_write_query(dst, i, flags, results[idx + i]);
+         vk_write_query(dst, i, flags, report[i]);
       }
    }
 

@@ -18,12 +18,12 @@
 #define KK_TS_HEAP_MAX_ENTRIES 4096u
 
 struct kk_ts_state {
-   /* Metal 4 counter heaps backing VK_QUERY_TYPE_TIMESTAMP pools, query q in
-    * heaps[q / KK_TS_HEAP_MAX_ENTRIES] at q % KK_TS_HEAP_MAX_ENTRIES.
-    * Timestamps are sampled into them and later resolved into `bo` (see
-    * kk_query_pool.c). NULL for non-timestamp pools. */
-   mtl_counter_heap **heaps;
-   uint32_t heap_count;
+   /* Chunks of the process' shared Metal 4 counter heaps backing a
+    * VK_QUERY_TYPE_TIMESTAMP pool (kk_ts_slots in kk_query_pool.c): query q
+    * is entry q % KK_TS_CHUNK of chunk chunks[q / KK_TS_CHUNK]. Timestamps
+    * are sampled there and later resolved into `bo`. */
+   uint16_t *chunks;
+   uint32_t chunk_count;
 };
 
 struct kk_oq_state {
@@ -48,6 +48,6 @@ struct kk_query_pool {
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_query_pool, vk.base, VkQueryPool,
                                VK_OBJECT_TYPE_QUERY_POOL)
 
-uint16_t *kk_pool_index_ptr(const struct kk_query_pool *pool);
+uint32_t *kk_pool_index_ptr(const struct kk_query_pool *pool);
 
 #endif /* KK_QUERY_POOL_H */

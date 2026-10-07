@@ -23,4 +23,11 @@ struct libkk_imm_write {
 
 #define LIBKK_QUERY_UNAVAILABLE (uint64_t)((int64_t)-1)
 
+/* Occlusion query results live in chunks of 32768 64-bit values: Metal's
+ * maximum visibility query offset is 256 KB (Metal feature set tables, Apple7
+ * and later), so one visibility result buffer holds 32768 queries. A pool's
+ * queries are indices into the device's chunks; libkk finds a chunk's address
+ * in the device's chunk table. */
+#define KK_OQ_CHUNK_QUERIES 32768u
+
 #endif /* KK_QUERY_H */

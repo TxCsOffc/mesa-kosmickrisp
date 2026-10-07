@@ -429,9 +429,12 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                render->stencil_att.resolve_mode));
    }
 
-   /* Set global visibility buffer */
+   /* Visibility results go to the chunk of the occlusion heap the active
+    * query (or the last one) is in; kk_flush_render_pass switches chunks. */
+   cmd->state.gfx.occlusion.pass_chunk = cmd->state.gfx.occlusion.chunk;
    mtl_render_pass_descriptor_set_visibility_buffer(
-      pass_descriptor, dev->occlusion_queries.bo->map);
+      pass_descriptor,
+      dev->occlusion_queries.chunks[cmd->state.gfx.occlusion.chunk].bo->map);
 
    // TODO_KOSMICKRISP Fragment shading rate support goes here if Metal supports
    // it
@@ -955,6 +958,21 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
    struct kk_rendering_state *render = &cmd->state.gfx.render;
    bool needs_restart = kk_flush_sample_locations(cmd);
    bool color_attachment_map_changed = false;
+
+   /* An occlusion query of another chunk of the occlusion heap: Metal writes
+    * the visibility results of a render pass to one buffer, so the pass
+    * restarts writing to that chunk. */
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   if ((gfx->dirty & KK_DIRTY_OCCLUSION) &&
+       gfx->occlusion.mode != MTL_VISIBILITY_RESULT_MODE_DISABLED &&
+       gfx->occlusion.chunk != gfx->occlusion.pass_chunk) {
+      struct kk_device *dev = kk_cmd_buffer_device(cmd);
+      mtl_render_pass_descriptor_set_visibility_buffer(
+         gfx->render_pass_descriptor,
+         dev->occlusion_queries.chunks[gfx->occlusion.chunk].bo->map);
+      gfx->occlusion.pass_chunk = gfx->occlusion.chunk;
+      needs_restart = true;
+   }
 
    if (IS_DIRTY(COLOR_ATTACHMENT_MAP)) {
       if (memcmp(render->color_map, dyn->cal.color_map,

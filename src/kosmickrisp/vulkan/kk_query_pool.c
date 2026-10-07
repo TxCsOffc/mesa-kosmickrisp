@@ -21,14 +21,113 @@
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
+#include "util/bitset.h"
+#include "util/simple_mtx.h"
+
+/* Metal allows 32 counter heaps per process (Metal feature set tables:
+ * "Maximum number of sample buffers", 32 on every Apple family; newCounterHeap
+ * then fails with "there are too many heaps already allocated in this process
+ * or on the system"). Every Vulkan device of the process shares that budget:
+ * under virglrenderer, every guest application's device. Timestamp pools take
+ * chunks of KK_TS_CHUNK entries of counter heaps created once for the process
+ * and shared by all devices, instead of heaps of their own.
+ */
+#define KK_TS_HEAP_COUNT      32u
+#define KK_TS_CHUNK           32u
+#define KK_TS_CHUNKS_PER_HEAP (KK_TS_HEAP_MAX_ENTRIES / KK_TS_CHUNK)
+#define KK_TS_CHUNK_COUNT     (KK_TS_HEAP_COUNT * KK_TS_CHUNKS_PER_HEAP)
+
+static struct {
+   simple_mtx_t mutex;
+   mtl_device *device;
+   uint32_t heap_count;
+   mtl_counter_heap *heaps[KK_TS_HEAP_COUNT];
+   BITSET_DECLARE(used, KK_TS_CHUNK_COUNT);
+} kk_ts_slots = {.mutex = SIMPLE_MTX_INITIALIZER};
+
+static uint32_t
+kk_ts_free_chunks_locked(void)
+{
+   uint32_t used = 0;
+   for (uint32_t c = 0; c < kk_ts_slots.heap_count * KK_TS_CHUNKS_PER_HEAP; c++)
+      used += BITSET_TEST(kk_ts_slots.used, c);
+   return kk_ts_slots.heap_count * KK_TS_CHUNKS_PER_HEAP - used;
+}
+
+/* Picks `count` free chunks into `chunks`, creating shared heaps as needed. */
+static VkResult
+kk_ts_alloc_chunks(struct kk_device *dev, uint16_t *chunks, uint32_t count)
+{
+   VkResult result = VK_SUCCESS;
+
+   simple_mtx_lock(&kk_ts_slots.mutex);
+
+   if (kk_ts_slots.device == NULL)
+      kk_ts_slots.device = dev->mtl_handle;
+   if (kk_ts_slots.device != dev->mtl_handle) {
+      result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                         "timestamp counter heaps belong to another MTLDevice");
+      goto unlock;
+   }
+
+   uint32_t free_chunks = kk_ts_free_chunks_locked();
+   while (free_chunks < count && kk_ts_slots.heap_count < KK_TS_HEAP_COUNT) {
+      mtl_counter_heap *heap =
+         mtl_new_timestamp_counter_heap(dev->mtl_handle, KK_TS_HEAP_MAX_ENTRIES);
+      if (heap == NULL)
+         break;
+      kk_ts_slots.heaps[kk_ts_slots.heap_count++] = heap;
+      free_chunks += KK_TS_CHUNKS_PER_HEAP;
+   }
+   if (free_chunks < count) {
+      result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                         "out of timestamp counter heap entries (%u of %u "
+                         "heaps of %u)",
+                         kk_ts_slots.heap_count, KK_TS_HEAP_COUNT,
+                         KK_TS_HEAP_MAX_ENTRIES);
+      goto unlock;
+   }
+
+   uint32_t n = 0;
+   for (uint32_t c = 0; n < count; c++) {
+      if (!BITSET_TEST(kk_ts_slots.used, c)) {
+         BITSET_SET(kk_ts_slots.used, c);
+         chunks[n++] = c;
+      }
+   }
+
+unlock:
+   simple_mtx_unlock(&kk_ts_slots.mutex);
+   return result;
+}
+
+static void
+kk_ts_free_chunks(const uint16_t *chunks, uint32_t count)
+{
+   simple_mtx_lock(&kk_ts_slots.mutex);
+   for (uint32_t i = 0; i < count; i++)
+      BITSET_CLEAR(kk_ts_slots.used, chunks[i]);
+   simple_mtx_unlock(&kk_ts_slots.mutex);
+}
+
+/* The shared counter heap entry of timestamp query `query`. */
+static mtl_counter_heap *
+kk_ts_slot(const struct kk_query_pool *pool, uint32_t query, uint32_t *index)
+{
+   uint32_t slot =
+      pool->ts.chunks[query / KK_TS_CHUNK] * KK_TS_CHUNK + query % KK_TS_CHUNK;
+   *index = slot % KK_TS_HEAP_MAX_ENTRIES;
+   return kk_ts_slots.heaps[slot / KK_TS_HEAP_MAX_ENTRIES];
+}
+
 struct kk_query_report {
    uint64_t value;
 };
 
-uint16_t *
+uint32_t *
 kk_pool_index_ptr(const struct kk_query_pool *pool)
 {
-   return (uint16_t *)((uint8_t *)pool->bo->cpu + pool->index_start);
+   return (uint32_t *)((uint8_t *)pool->bo->cpu + pool->index_start);
 }
 
 static uint32_t
@@ -76,12 +175,13 @@ static uint64_t
 kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
                      uint32_t query)
 {
-   struct kk_bo *bo =
-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+   if (kk_pool_is_oq(pool)) {
+      uint32_t index = kk_pool_index_ptr(pool)[query];
+      return kk_oq_heap_chunk_bo(&dev->occlusion_queries, index)->gpu +
+             (index % KK_OQ_CHUNK_QUERIES) * sizeof(uint64_t);
+   }
 
-   uint32_t index =
-      kk_pool_is_oq(pool) ? kk_pool_index_ptr(pool)[query] : query;
-   return bo->gpu + pool->query_start + (index * pool->query_stride);
+   return pool->bo->gpu + pool->query_start + (query * pool->query_stride);
 }
 
 static uint64_t
@@ -95,14 +195,16 @@ static struct kk_query_report *
 kk_query_report_map(struct kk_device *dev, struct kk_query_pool *pool,
                     uint32_t query)
 {
-   struct kk_bo *bo =
-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+   if (kk_pool_is_oq(pool)) {
+      uint32_t index = kk_pool_index_ptr(pool)[query];
+      return (struct kk_query_report *)kk_oq_heap_chunk_bo(
+                &dev->occlusion_queries, index)
+                ->cpu +
+             index % KK_OQ_CHUNK_QUERIES;
+   }
 
-   uint32_t index =
-      kk_pool_is_oq(pool) ? kk_pool_index_ptr(pool)[query] : query;
-
-   return (struct kk_query_report *)(bo->cpu + pool->query_start +
-                                     index * pool->query_stride);
+   return (struct kk_query_report *)(pool->bo->cpu + pool->query_start +
+                                     query * pool->query_stride);
 }
 
 static void
@@ -155,7 +257,7 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    uint32_t index_size = 0;
    if (!kk_pool_is_ts(pool)) {
       availability_size = pool->vk.query_count * sizeof(uint32_t);
-      index_size = sizeof(uint16_t) * pool->vk.query_count;
+      index_size = sizeof(uint32_t) * pool->vk.query_count;
    }
 
    pool->index_start = align(availability_size, sizeof(struct kk_query_report));
@@ -165,7 +267,7 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    uint32_t reports_per_query = kk_reports_per_query(pool);
    pool->query_stride = reports_per_query * sizeof(struct kk_query_report);
 
-   /* For occlusion queries, results come from the global visibility buffer */
+   /* Occlusion results live in the device's chunks (kk_oq_heap) */
    if (kk_pool_is_oq(pool)) {
       pool->query_start = 0;
    } else {
@@ -180,52 +282,36 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    }
 
    if (kk_pool_is_oq(pool)) {
-      uint16_t *remap_index = kk_pool_index_ptr(pool);
-
-      for (unsigned i = 0; i < pool->vk.query_count; ++i) {
-         uint64_t zero = 0;
-         unsigned index;
-
-         VkResult result =
-            kk_query_table_add(dev, &dev->occlusion_queries, zero, &index);
-
-         if (result != VK_SUCCESS) {
-            kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool),
-                                pAllocator);
-            return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         }
-
-         /* We increment as we go so we can clean up properly if we run out */
-         remap_index[pool->oq.queries++] = index;
+      result = kk_oq_heap_alloc(dev, &dev->occlusion_queries,
+                                pool->vk.query_count, kk_pool_index_ptr(pool));
+      if (result != VK_SUCCESS) {
+         kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool), pAllocator);
+         return result;
       }
+      pool->oq.queries = pool->vk.query_count;
    } else if (kk_pool_is_ts(pool)) {
-      /* Timestamps are sampled into Metal counter heaps (one entry per query,
-       * KK_TS_HEAP_MAX_ENTRIES per heap) and resolved into `bo` after the GPU
+      /* Timestamps are sampled into entries of the process' shared Metal
+       * counter heaps (kk_ts_slots) and resolved into `bo` after the GPU
        * writes them. vkd3d-proton creates pools of 8192.
        */
-      pool->ts.heap_count =
-         DIV_ROUND_UP(pool->vk.query_count, KK_TS_HEAP_MAX_ENTRIES);
-      pool->ts.heaps =
+      const uint32_t chunk_count =
+         DIV_ROUND_UP(pool->vk.query_count, KK_TS_CHUNK);
+      pool->ts.chunks =
          vk_zalloc2(&dev->vk.alloc, pAllocator,
-                    pool->ts.heap_count * sizeof(*pool->ts.heaps), 8,
+                    chunk_count * sizeof(*pool->ts.chunks), 8,
                     VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-      if (pool->ts.heaps == NULL) {
-         pool->ts.heap_count = 0;
+      if (pool->ts.chunks == NULL) {
          kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool), pAllocator);
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
-      for (uint32_t h = 0; h < pool->ts.heap_count; h++) {
-         const uint32_t entries =
-            MIN2(pool->vk.query_count - h * KK_TS_HEAP_MAX_ENTRIES,
-                 KK_TS_HEAP_MAX_ENTRIES);
-         pool->ts.heaps[h] =
-            mtl_new_timestamp_counter_heap(dev->mtl_handle, entries);
-         if (pool->ts.heaps[h] == NULL) {
-            kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool),
-                                pAllocator);
-            return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         }
+      result = kk_ts_alloc_chunks(dev, pool->ts.chunks, chunk_count);
+      if (result != VK_SUCCESS) {
+         vk_free2(&dev->vk.alloc, pAllocator, pool->ts.chunks);
+         pool->ts.chunks = NULL;
+         kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool), pAllocator);
+         return result;
       }
+      pool->ts.chunk_count = chunk_count;
    }
 
    if (pCreateInfo->flags & VK_QUERY_POOL_CREATE_RESET_BIT_KHR)
@@ -247,16 +333,11 @@ kk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
       return;
 
    if (kk_pool_is_oq(pool)) {
-      uint16_t *remap_index = kk_pool_index_ptr(pool);
-      for (unsigned i = 0; i < pool->oq.queries; ++i) {
-         kk_query_table_remove(dev, &dev->occlusion_queries, remap_index[i]);
-      }
-   } else if (kk_pool_is_ts(pool)) {
-      for (uint32_t h = 0; h < pool->ts.heap_count; h++) {
-         if (pool->ts.heaps[h])
-            mtl_release(pool->ts.heaps[h]);
-      }
-      vk_free2(&dev->vk.alloc, pAllocator, pool->ts.heaps);
+      kk_oq_heap_free(&dev->occlusion_queries, kk_pool_index_ptr(pool),
+                      pool->oq.queries);
+   } else if (kk_pool_is_ts(pool) && pool->ts.chunks) {
+      kk_ts_free_chunks(pool->ts.chunks, pool->ts.chunk_count);
+      vk_free2(&dev->vk.alloc, pAllocator, pool->ts.chunks);
    }
 
    kk_destroy_bo(dev, pool->bo);
@@ -280,13 +361,11 @@ emit_zero_queries(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
                   bool set_available)
 {
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
-   struct kk_bo *results_bo =
-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
-
    struct libkk_reset_query_args info = {
       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
-      .results = results_bo->gpu + pool->query_start,
+      .results = pool->bo->gpu + pool->query_start,
       .oq_index = kk_pool_is_oq(pool) ? pool->bo->gpu + pool->index_start : 0u,
+      .oq_chunks = dev->occlusion_queries.chunk_table->gpu,
 
       .first_query = first_index,
       .reports_per_query = kk_reports_per_query(pool),
@@ -383,14 +462,14 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
-   assert(kk_pool_is_ts(pool) && pool->ts.heaps);
+   assert(kk_pool_is_ts(pool) && pool->ts.chunks);
 
    uint32_t count = kk_mv_query_count(cmd);
    enum mtl_render_stages mtl_stage =
       kk_pipeline_stages_to_mtl_render_stage(stage);
 
-   mtl_counter_heap *heap = pool->ts.heaps[query / KK_TS_HEAP_MAX_ENTRIES];
-   uint32_t heap_index = query % KK_TS_HEAP_MAX_ENTRIES;
+   uint32_t heap_index;
+   mtl_counter_heap *heap = kk_ts_slot(pool, query, &heap_index);
 
    if (cmd->metal.render) {
       /* If we've already issued a timestamp write for a render stage, reuse it
@@ -460,8 +539,9 @@ kk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                                       ? MTL_VISIBILITY_RESULT_MODE_COUNTING
                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;
    cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
-   uint16_t *remap_index = kk_pool_index_ptr(pool);
-   cmd->state.gfx.occlusion.index = remap_index[query];
+   uint32_t oq_index = kk_pool_index_ptr(pool)[query];
+   cmd->state.gfx.occlusion.index = oq_index % KK_OQ_CHUNK_QUERIES;
+   cmd->state.gfx.occlusion.chunk = oq_index / KK_OQ_CHUNK_QUERIES;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -616,13 +696,11 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
     * for the compute job to copy results to the bo. */
    mtl_barrier_after_queue_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH);
 
-   struct kk_bo *results_bo =
-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
-
    struct libkk_copy_queries_args args = {
       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
-      .results = results_bo->gpu + pool->query_start,
+      .results = pool->bo->gpu + pool->query_start,
       .oq_index = kk_pool_is_oq(pool) ? pool->bo->gpu + pool->index_start : 0u,
+      .oq_chunks = dev->occlusion_queries.chunk_table->gpu,
       .dst_addr = pDstRange->address,
       .dst_stride = pDstRange->stride,
       .first_query = firstQuery,

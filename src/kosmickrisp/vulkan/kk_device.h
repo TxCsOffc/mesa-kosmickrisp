@@ -87,7 +87,7 @@ struct kk_device {
    struct vk_device_dispatch_table exposed_dispatch_table;
 
    struct kk_sampler_heap samplers;
-   struct kk_query_table occlusion_queries;
+   struct kk_oq_heap occlusion_queries;
 
    /* Track all heaps the user allocated so we can set them all as resident when
     * recording as required by Metal. */
