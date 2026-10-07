@@ -75,6 +75,9 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
             assert(view->planes[plane].sampled_gpu_resource_id);
             desc[plane].image_gpu_resource_id =
                view->planes[plane].sampled_gpu_resource_id;
+            desc[plane].residency_gpu_resource_id =
+               view->planes[plane].residency_sampled_gpu_resource_id;
+            desc[plane].residency_base_level = view->vk.base_mip_level;
          }
 
          float min_lod = MAX2(view->vk.min_lod - view->vk.base_mip_level, 0.0);
@@ -105,6 +108,12 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
          desc[plane].sampler_lod_max_fp16 = sampler->lod_max_fp16;
          desc[plane].sampler_filter_flags = sampler->filter_flags;
          desc[plane].clamp_0_sampler_index_or_negative = -1;
+         desc[plane].sampler_residency_index = sampler->residency_hw
+                                                  ? sampler->residency_hw->index
+                                                  : desc[plane].sampler_index;
+         desc[plane].sampler_gather_index = sampler->gather_hw
+                                               ? sampler->gather_hw->index
+                                               : desc[plane].sampler_index;
       }
 
       if (sampler->has_border) {
@@ -168,6 +177,8 @@ get_storage_image_view_desc(
 
       assert(view->planes[plane].storage_gpu_resource_id);
       desc.image_gpu_resource_id = view->planes[plane].storage_gpu_resource_id;
+      desc.residency_gpu_resource_id =
+         view->planes[plane].residency_storage_gpu_resource_id;
    }
 
    assert(sizeof(desc) <= dst_size);

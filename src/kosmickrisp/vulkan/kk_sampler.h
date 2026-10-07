@@ -33,6 +33,12 @@ struct kk_sampler {
    struct {
       struct kk_rc_sampler *hw;
    } planes[2];
+
+   /* For residency queries through views with baseMipLevel > 0 (struct
+    * kk_sampled_image_descriptor): plane 0 without LOD clamps, and that with
+    * LINEAR filters for gathers; NULL when plane 0 is that already. */
+   struct kk_rc_sampler *residency_hw;
+   struct kk_rc_sampler *gather_hw;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_sampler, vk.base, VkSampler,

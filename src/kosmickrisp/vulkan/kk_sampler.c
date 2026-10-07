@@ -179,6 +179,38 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
    }
    sampler->plane_count = 1;
 
+   /* Residency queries through views with baseMipLevel > 0 sample a view
+    * from level 0 at LOD + base, so the sampler's LOD clamps (relative to the
+    * view) must not apply there: the shader applies them. They can't matter
+    * when the clamp range includes [0, 14] (the levels of a 16384 texel
+    * image). Software min/max reduction samplers have none
+    * (create_sampler_descriptor). Gathers take theirs from a bilinear sample
+    * (LINEAR, weighted average) of the gathered level. */
+   if (dev->vk.enabled_features.sparseResidencyImage2D) {
+      const bool emulated_reduction =
+         kk_device_physical(dev)->info.gpu_apple_family < 10 &&
+         packed.reduction_mode != MTL_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
+      const bool clamps = packed.min_lod > 0.0f || packed.max_lod < 14.0f;
+      struct mtl_sampler_packed residency = packed;
+      residency.min_lod = 0.0f;
+      residency.max_lod = FLT_MAX;
+      struct mtl_sampler_packed gather = residency;
+      gather.min_filter = gather.mag_filter = MTL_SAMPLER_MIN_MAG_FILTER_LINEAR;
+      gather.reduction_mode = MTL_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
+
+      if (clamps && !emulated_reduction)
+         result = kk_sampler_heap_add(dev, residency, &sampler->residency_hw);
+      if (result == VK_SUCCESS &&
+          (clamps || emulated_reduction ||
+           packed.min_filter != MTL_SAMPLER_MIN_MAG_FILTER_LINEAR ||
+           packed.mag_filter != MTL_SAMPLER_MIN_MAG_FILTER_LINEAR))
+         result = kk_sampler_heap_add(dev, gather, &sampler->gather_hw);
+      if (result != VK_SUCCESS) {
+         kk_DestroySampler(device, kk_sampler_to_handle(sampler), pAllocator);
+         return result;
+      }
+   }
+
    /* In order to support CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT, we
     * need multiple sampler planes: at minimum we will need one for luminance
     * (the default), and one for chroma.  Each sampler plane needs its own
@@ -277,6 +309,10 @@ kk_DestroySampler(VkDevice device, VkSampler _sampler,
 
    for (uint8_t plane = 0; plane < sampler->plane_count; plane++)
       kk_sampler_heap_remove(dev, sampler->planes[plane].hw);
+   if (sampler->residency_hw)
+      kk_sampler_heap_remove(dev, sampler->residency_hw);
+   if (sampler->gather_hw)
+      kk_sampler_heap_remove(dev, sampler->gather_hw);
 
    vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);
 }

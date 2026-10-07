@@ -178,6 +178,17 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          view_layout.array_len = subres_layout.layers;
       }
 
+      /* Metal reports the residency of a view with baseMipLevel > 0 for the
+       * image's levels from 0: sparse operations query a view that also has
+       * the levels below (struct kk_sampled_image_descriptor). */
+      const bool residency_view =
+         (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
+         view_layout.base_level > 0;
+      struct kk_view_layout residency_layout = view_layout;
+      residency_layout.base_level = 0;
+      residency_layout.num_levels =
+         view_layout.base_level + view_layout.num_levels;
+
       if (view->vk.usage &
           (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) {
          view->planes[view_plane].mtl_handle_sampled =
@@ -185,19 +196,35 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          view->planes[view_plane].sampled_gpu_resource_id =
             mtl_texture_get_gpu_resource_id(
                view->planes[view_plane].mtl_handle_sampled);
+         if (residency_view) {
+            view->planes[view_plane].mtl_handle_residency_sampled =
+               mtl_new_texture_view_with(mtl_handle, &residency_layout);
+            view->planes[view_plane].residency_sampled_gpu_resource_id =
+               mtl_texture_get_gpu_resource_id(
+                  view->planes[view_plane].mtl_handle_residency_sampled);
+         }
       }
 
       if (view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
          /* For storage images, we can't have any cubes */
          if (view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
-             view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)
+             view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {
             view_layout.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+            residency_layout.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+         }
 
          view->planes[view_plane].mtl_handle_storage =
             mtl_new_texture_view_with(mtl_handle, &view_layout);
          view->planes[view_plane].storage_gpu_resource_id =
             mtl_texture_get_gpu_resource_id(
                view->planes[view_plane].mtl_handle_storage);
+         if (residency_view) {
+            view->planes[view_plane].mtl_handle_residency_storage =
+               mtl_new_texture_view_with(mtl_handle, &residency_layout);
+            view->planes[view_plane].residency_storage_gpu_resource_id =
+               mtl_texture_get_gpu_resource_id(
+                  view->planes[view_plane].mtl_handle_residency_storage);
+         }
       }
 
       if (view->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -256,6 +283,12 @@ kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
 
       if (view->planes[plane].mtl_handle_subres)
          mtl_release(view->planes[plane].mtl_handle_subres);
+
+      if (view->planes[plane].mtl_handle_residency_sampled)
+         mtl_release(view->planes[plane].mtl_handle_residency_sampled);
+
+      if (view->planes[plane].mtl_handle_residency_storage)
+         mtl_release(view->planes[plane].mtl_handle_residency_storage);
    }
 
    vk_image_view_finish(&view->vk);

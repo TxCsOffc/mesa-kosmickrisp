@@ -28,7 +28,24 @@ struct kk_sampled_image_descriptor {
 
    uint16_t sampler_filter_flags;
    uint32_t border[4];
-   uint64_t pad_to_power_2[3];
+
+   /* Views with baseMipLevel > 0 of sparse residency images: Metal reports
+    * the residency of such a view's level (or LOD) as that of the image's
+    * level (LOD), without the base (the data is right). Sparse operations
+    * take their residency from residency_gpu_resource_id, a view of the
+    * same levels and all levels below them, at level (LOD) + base
+    * (residency_base_level), sampling with sampler_residency_index, the
+    * sampler without LOD clamps (sampler_index if its clamps can't matter;
+    * the shader applies them), gathers as bilinear samples of level base
+    * with sampler_gather_index (LINEAR, no clamps).
+    * residency_gpu_resource_id is 0 for other views.
+    */
+   uint64_t residency_gpu_resource_id;
+   uint16_t residency_base_level;
+   uint16_t sampler_residency_index;
+   uint16_t sampler_gather_index;
+   uint16_t pad16;
+   uint64_t pad64;
 };
 
 static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,
@@ -42,11 +59,14 @@ static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,
 #define KK_SAMPLER_MIP_LINEAR (1 << 4)
 #define KK_SAMPLER_UNNORMALIZED (1 << 5)
 
+/* residency_gpu_resource_id: as in struct kk_sampled_image_descriptor, the
+ * base level is the difference of the two textures' level counts. */
 struct kk_storage_image_descriptor {
    uint64_t image_gpu_resource_id;
+   uint64_t residency_gpu_resource_id;
 };
 
-static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
+static_assert(sizeof(struct kk_storage_image_descriptor) == 16,
               "kk_storage_image_descriptor has no holes");
 
 /* Uniform and storage texel buffers. Metal needs buffer-backed textures at

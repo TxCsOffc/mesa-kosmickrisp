@@ -44,6 +44,14 @@ struct kk_image_view {
       /* Used if view has to create its own alias of a specific subresource */
       mtl_texture *mtl_handle_subres;
 
+      /* Views with baseMipLevel > 0 of sparse residency images: the sampled
+       * and storage views extended down to level 0, for residency queries
+       * (struct kk_sampled_image_descriptor::residency_gpu_resource_id) */
+      mtl_texture *mtl_handle_residency_sampled;
+      mtl_texture *mtl_handle_residency_storage;
+      uint64_t residency_sampled_gpu_resource_id;
+      uint64_t residency_storage_gpu_resource_id;
+
       uint64_t sampled_gpu_resource_id;
       uint64_t storage_gpu_resource_id;
       uint64_t input_gpu_resource_id;
