@@ -19,6 +19,8 @@
 #include "c11/threads.h"
 #include "util/simple_mtx.h"
 
+#define KK_QUEUE_PENDING_WAITS 8u
+
 struct kk_queue {
    struct vk_queue vk;
    struct mtl_command_queue *mtl_handle;
@@ -37,6 +39,18 @@ struct kk_queue {
     * the heap page it maps after unmaps of buffer pages, and the event that
     * separates texture mapping updates from earlier buffer mapping updates.
     * lock orders the queue's mapping updates. */
+   /* The last KK_QUEUE_PENDING_WAITS semaphore waits that were not signalled
+    * yet when submitted (wait before signal), retained, under `mutex`: a
+    * command queue error names the ones still unsignalled. Metal ends a queue
+    * wait that is never signalled after a few seconds, on some GPUs with
+    * MTL4CommandQueueErrorTimeout. */
+   struct {
+      mtl_shared_event *event;
+      uint64_t value;
+      int64_t submitted_ns;
+   } pending_waits[KK_QUEUE_PENDING_WAITS];
+   uint32_t pending_wait_next;
+
    struct {
       mtl_buffer *flush_buffer;
       struct kk_bo *flush_bo;

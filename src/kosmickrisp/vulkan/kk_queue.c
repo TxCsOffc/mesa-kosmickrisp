@@ -43,10 +43,40 @@ kk_queue_release_cmd_buffer_locked(struct kk_queue *queue,
    util_dynarray_append(&queue->free_cmd_buffers, &cmd->vk);
 }
 
+/* Names the semaphore waits submitted before their signal that are still
+ * unsignalled, and the GPU time of the failed command buffer: a never
+ * signalled wait shows up as a wait here and no GPU time. */
+static void
+kk_queue_log_pending_waits(struct kk_queue *queue,
+                           struct mtl_feedback_data *data)
+{
+   const int64_t now = os_time_get_nano();
+
+   mesa_loge("kk: command buffer failed after %.1f ms of GPU time",
+             (data->gpu_end - data->gpu_start) * 1000.0);
+
+   mtx_lock(&queue->mutex);
+   for (uint32_t i = 0; i < KK_QUEUE_PENDING_WAITS; i++) {
+      if (queue->pending_waits[i].event == NULL)
+         continue;
+      const uint64_t signalled =
+         mtl_shared_event_get_signaled_value(queue->pending_waits[i].event);
+      if (signalled < queue->pending_waits[i].value) {
+         mesa_loge("kk: semaphore wait for %" PRIu64 " submitted %.1f ms ago "
+                   "is still unsignalled (at %" PRIu64 ")",
+                   queue->pending_waits[i].value,
+                   (now - queue->pending_waits[i].submitted_ns) / 1e6,
+                   signalled);
+      }
+   }
+   mtx_unlock(&queue->mutex);
+}
+
 static void
 check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
 {
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+      kk_queue_log_pending_waits(&dev->queue, data);
       vk_device_set_lost(
          &dev->vk, "Command queue error %d (%s), with message \"%s\"",
          (int)data->error, mtl_command_queue_error_to_string(data->error),
@@ -209,6 +239,17 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
         wait != end; ++wait) {
       struct kk_sync_timeline *sync =
          container_of(wait->sync, struct kk_sync_timeline, base);
+      if (mtl_shared_event_get_signaled_value(sync->mtl_handle) <
+          wait->wait_value) {
+         mtx_lock(&queue->mutex);
+         uint32_t i = queue->pending_wait_next++ % KK_QUEUE_PENDING_WAITS;
+         if (queue->pending_waits[i].event)
+            mtl_release(queue->pending_waits[i].event);
+         queue->pending_waits[i].event = mtl_retain(sync->mtl_handle);
+         queue->pending_waits[i].value = wait->wait_value;
+         queue->pending_waits[i].submitted_ns = os_time_get_nano();
+         mtx_unlock(&queue->mutex);
+      }
       mtl_wait_for_event(queue->mtl_handle, sync->mtl_handle, wait->wait_value);
    }
 
@@ -313,6 +354,8 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
    queue->cmd_pool = kk_cmd_pool_from_handle(pool_handle);
 
    queue->free_cmd_buffers = UTIL_DYNARRAY_INIT;
+   memset(queue->pending_waits, 0, sizeof(queue->pending_waits));
+   queue->pending_wait_next = 0;
    queue->commits_in_flight = 0u;
    mtx_init(&queue->mutex, mtx_plain);
    cnd_init(&queue->cond);
@@ -341,6 +384,11 @@ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
    kk_queue_wait_for_commits(queue);
 
    kk_queue_sparse_finish(dev, queue);
+
+   for (uint32_t i = 0; i < KK_QUEUE_PENDING_WAITS; i++) {
+      if (queue->pending_waits[i].event)
+         mtl_release(queue->pending_waits[i].event);
+   }
 
    mtl_command_queue_remove_residency_set(queue->mtl_handle,
                                           dev->residency_set.handle);
