@@ -257,6 +257,19 @@ kk_encoder_update_debug(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
       mtl_encoder_push_debug_group(encoder, label->pLabelName);
 }
 
+/* vkQueueBindSparse updates mappings on the Metal queue (kk_queue_bind_sparse)
+ * and Metal leaves ordering later work after them to us: wait for the queue's
+ * resource state stage. Earlier encoders end with a barrier before all queue
+ * stages, so mapping updates already wait for the work before them. */
+static void
+kk_encoder_wait_for_sparse_binds(struct kk_cmd_buffer *cmd,
+                                 mtl_command_encoder *encoder)
+{
+   if (kk_cmd_buffer_device(cmd)->vk.enabled_features.sparseBinding)
+      mtl_barrier_after_queue_stages(encoder, MTL_STAGE_RESOURCE_STATE,
+                                     MTL_STAGE_ALL);
+}
+
 void
 cs_start_render(struct kk_cmd_buffer *cmd)
 {
@@ -271,6 +284,7 @@ cs_start_render(struct kk_cmd_buffer *cmd)
       cmd->metal.cmd_buf, state->render_pass_descriptor);
 
    kk_encoder_update_debug(cmd, cmd->metal.render);
+   kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.render);
    /* Starting a new render pass means we already flushed and no barrier is
     * needed. */
    state->render.write_available = false;
@@ -325,6 +339,7 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
       kk_encoder_update_debug(cmd, cmd->metal.compute);
+      kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.compute);
    }
 
    return cmd->metal.compute;

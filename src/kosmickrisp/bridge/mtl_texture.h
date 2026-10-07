@@ -30,4 +30,8 @@ void mtl_texture_get_bytes(mtl_texture *texture, void *host_ptr,
 void mtl_texture_replace_region(mtl_texture *texture, const void *host_ptr,
                                 struct mtl_texture_memory_copy *data);
 
+/* Placement sparse textures */
+uint32_t mtl_texture_get_first_mipmap_in_tail(mtl_texture *texture);
+uint64_t mtl_texture_get_tail_size_in_bytes(mtl_texture *texture);
+
 #endif /* MTL_TEXTURE_H */

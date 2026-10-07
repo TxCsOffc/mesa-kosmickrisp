@@ -12,6 +12,7 @@
 #include "kk_entrypoints.h"
 #include "kk_format.h"
 #include "kk_physical_device.h"
+#include "kk_sparse.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
@@ -286,8 +287,16 @@ kk_GetPhysicalDeviceImageFormatProperties2(
    if (ycbcr_info && pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-   /* Don't support sparse residency */
-   if ((pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT))
+   /* Sparse images are Metal placement sparse textures with standard block
+    * shapes (kk_sparse.c) */
+   const bool sparse =
+      pImageFormatInfo->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                                 VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                                 VK_IMAGE_CREATE_SPARSE_ALIASED_BIT);
+   if (sparse && !kk_sparse_image_supported(
+                    pdev, pImageFormatInfo->format, pImageFormatInfo->type,
+                    VK_SAMPLE_COUNT_1_BIT, pImageFormatInfo->tiling,
+                    pImageFormatInfo->flags, NULL))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    /* From the Vulkan 1.3.279 spec:
@@ -365,7 +374,7 @@ kk_GetPhysicalDeviceImageFormatProperties2(
        (features & (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
                     VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
        !(pImageFormatInfo->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
-       !(pImageFormatInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+       !(pImageFormatInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !sparse) {
       sampleCounts = pdev->info.supported_sample_counts;
    }
 
@@ -515,8 +524,42 @@ kk_GetPhysicalDeviceSparseImageFormatProperties2(
    const VkPhysicalDeviceSparseImageFormatInfo2 *pFormatInfo,
    uint32_t *pPropertyCount, VkSparseImageFormatProperties2 *pProperties)
 {
-   *pPropertyCount = 0;
-   return;
+   VK_FROM_HANDLE(kk_physical_device, pdev, physicalDevice);
+   VK_OUTARRAY_MAKE_TYPED(VkSparseImageFormatProperties2, out, pProperties,
+                          pPropertyCount);
+
+   /* Only formats, types and usages a sparse residency image can have */
+   const VkPhysicalDeviceImageFormatInfo2 format_info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+      .format = pFormatInfo->format,
+      .type = pFormatInfo->type,
+      .tiling = pFormatInfo->tiling,
+      .usage = pFormatInfo->usage,
+      .flags = VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+               VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT,
+   };
+   VkImageFormatProperties2 format_props = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+   };
+   VkExtent3D tile;
+   if (pFormatInfo->samples != VK_SAMPLE_COUNT_1_BIT ||
+       kk_GetPhysicalDeviceImageFormatProperties2(
+          physicalDevice, &format_info, &format_props) != VK_SUCCESS ||
+       !kk_sparse_image_supported(pdev, pFormatInfo->format, pFormatInfo->type,
+                                  pFormatInfo->samples, pFormatInfo->tiling, 0u,
+                                  &tile))
+      return;
+
+   vk_outarray_append_typed(VkSparseImageFormatProperties2, &out, props)
+   {
+      props->properties = (VkSparseImageFormatProperties){
+         .aspectMask = vk_format_aspects(pFormatInfo->format),
+         .imageGranularity = tile,
+         /* A mip tail per layer, standard block shapes, tail levels smaller
+          * than a tile */
+         .flags = 0u,
+      };
+   }
 }
 
 static VkResult
@@ -587,6 +630,9 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
       layout->level_offsets_B[1] = layout->layer_stride_B;
    }
 
+   if (pCreateInfo->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+      return kk_image_sparse_init(dev, image);
+
    return VK_SUCCESS;
 }
 
@@ -642,9 +688,15 @@ kk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
 
    result = kk_image_init(dev, image, pCreateInfo);
    if (result != VK_SUCCESS) {
+      kk_image_finish(dev, image, pAllocator);
       vk_free2(&dev->vk.alloc, pAllocator, image);
       return result;
    }
+
+   /* Sparse textures map heap pages, the texture itself must be resident */
+   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+      kk_device_add_allocation_to_residency_set(dev,
+                                                image->planes[0].mtl_handle);
 
    *pImage = kk_image_to_handle(image);
 
@@ -660,6 +712,10 @@ kk_DestroyImage(VkDevice device, VkImage _image,
 
    if (!image)
       return;
+
+   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+      kk_device_remove_allocation_from_residency_set(
+         dev, image->planes[0].mtl_handle);
 
    kk_image_finish(dev, image, pAllocator);
    vk_free2(&dev->vk.alloc, pAllocator, image);
@@ -712,6 +768,13 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
          kk_image_plane_add_req(dev, image, &image->planes[plane], &size_B,
                                 &align_B);
       }
+   }
+
+   /* Pages of the opaque layout, mapped from heaps that take 64 KiB pages */
+   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
+      memory_types = pdev->sparse_mem_types;
+      align_B = KK_SPARSE_PAGE_SIZE_B;
+      size_B = kk_image_sparse_size_B(image);
    }
 
    pMemoryRequirements->memoryRequirements.memoryTypeBits = memory_types;
@@ -777,7 +840,10 @@ kk_GetImageSparseMemoryRequirements2(
    uint32_t *pSparseMemoryRequirementCount,
    VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
 {
-   *pSparseMemoryRequirementCount = 0u;
+   VK_FROM_HANDLE(kk_image, image, pInfo->image);
+
+   kk_image_get_sparse_memory_requirements(
+      image, pSparseMemoryRequirementCount, pSparseMemoryRequirements);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -786,7 +852,17 @@ kk_GetDeviceImageSparseMemoryRequirements(
    uint32_t *pSparseMemoryRequirementCount,
    VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
 {
-   *pSparseMemoryRequirementCount = 0u;
+   VK_FROM_HANDLE(kk_device, dev, device);
+   ASSERTED VkResult result;
+   struct kk_image image = {0};
+
+   result = kk_image_init(dev, &image, pInfo->pCreateInfo);
+   assert(result == VK_SUCCESS);
+
+   kk_image_get_sparse_memory_requirements(
+      &image, pSparseMemoryRequirementCount, pSparseMemoryRequirements);
+
+   kk_image_finish(dev, &image, NULL);
 }
 
 static void
@@ -903,7 +979,8 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
     * pages. Binds may race, so only one heap is kept. */
    if (!plane->layout.linear && !mem->bo->mtl_handle) {
       mtl_heap *heap =
-         mtl_new_heap(dev->mtl_handle, mem->bo->size_B, KK_MTL_RESOURCE_OPTIONS);
+         mtl_new_heap(dev->mtl_handle, mem->bo->size_B, KK_MTL_RESOURCE_OPTIONS,
+                      false);
       if (!heap)
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       if (p_atomic_cmpxchg_ptr(&mem->bo->mtl_handle, NULL, heap) == NULL)

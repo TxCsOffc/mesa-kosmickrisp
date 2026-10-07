@@ -63,6 +63,15 @@ struct mtl_size mtl_sparse_tile_count(mtl_device *device,
                                       struct kk_image_layout *layout,
                                       struct mtl_size tile_size);
 
+/* Placement sparse resources with 64 KiB pages (Vulkan sparse binding) */
+bool mtl_device_supports_placement_sparse(mtl_device *device);
+struct mtl_size mtl_placement_sparse_tile_size(mtl_device *device,
+                                               struct kk_image_layout *layout);
+mtl_texture *mtl_new_placement_sparse_texture(mtl_device *device,
+                                              struct kk_image_layout *layout);
+mtl_buffer *mtl_new_placement_sparse_buffer(mtl_device *device,
+                                            uint64_t size_B);
+
 /* Resource creation */
 mtl_buffer *mtl_new_buffer_with_bytes_no_copy(mtl_device *device, void *ptr,
                                               uint64_t size_B);

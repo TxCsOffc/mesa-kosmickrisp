@@ -32,6 +32,16 @@ void mtl_signal_event(mtl_command_queue *queue, mtl_event *event,
 void mtl_wait_for_event(mtl_command_queue *queue, mtl_event *event,
                         uint64_t value);
 
+/* Placement sparse mapping updates, ordered with the queue's other work.
+ * Consumers must barrier against MTL_STAGE_RESOURCE_STATE. heap may be NULL
+ * when every operation unmaps. */
+void mtl_command_queue_update_texture_mappings(
+   mtl_command_queue *queue, mtl_texture *texture, mtl_heap *heap,
+   const struct mtl_sparse_texture_mapping *mappings, uint32_t count);
+void mtl_command_queue_update_buffer_mappings(
+   mtl_command_queue *queue, mtl_buffer *buffer, mtl_heap *heap,
+   const struct mtl_sparse_buffer_mapping *mappings, uint32_t count);
+
 void mtl_command_queue_commit(mtl_command_queue *queue,
                               mtl_command_buffer **command_buffers,
                               uint32_t count, mtl_commit_options *options);

@@ -141,6 +141,13 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
 
       mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
       mem->bo->cpu = mtl_get_contents(mem->bo->map);
+   } else if (BITFIELD_BIT(pAllocateInfo->memoryTypeIndex) &
+              kk_device_physical(dev)->sparse_mem_types) {
+      /* Sparse resources only accept these types (never imported from a host
+       * pointer, so always a heap): their heaps must take 64 KiB pages. */
+      result = kk_alloc_sparse_bo(dev, &dev->vk.base, aligned_size, &mem->bo);
+      if (result != VK_SUCCESS)
+         goto fail_alloc;
    } else {
       result =
          kk_alloc_bo(dev, &dev->vk.base, aligned_size, alignment, &mem->bo);

@@ -116,6 +116,12 @@ kk_image_layout_can_optimize(const struct kk_physical_device *pdev,
    if (flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT)
       return false;
 
+   /* Sparse images alias tiles (sparseResidencyAliased), but a Metal sparse
+    * texture keeps its own compression metadata: aliases of compressed tiles
+    * would read garbage. */
+   if (flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+      return false;
+
    return true;
 }
 

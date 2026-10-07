@@ -252,6 +252,12 @@ kk_get_device_features(
       .shaderInt16 = true,
       .shaderInt64 = true,
       .shaderResourceMinLod = true,
+      /* Metal 4 placement sparse textures/buffers with 64 KiB pages */
+      .shaderResourceResidency = pdev->info.placement_sparse,
+      .sparseBinding = pdev->info.placement_sparse,
+      .sparseResidencyBuffer = pdev->info.placement_sparse,
+      .sparseResidencyImage2D = pdev->info.placement_sparse,
+      .sparseResidencyAliased = pdev->info.placement_sparse,
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
@@ -674,9 +680,13 @@ kk_get_device_properties(
       .nonCoherentAtomSize = 64,
 
       /* Vulkan 1.0 sparse properties */
-      .sparseResidencyNonResidentStrict = false,
+      /* Unmapped tiles read zero (alpha one without alpha, as for a zeroed
+       * image), writes to them are dropped; 64 KiB tiles have Vulkan's
+       * standard 2D shapes. The Vulkan mip tail starts at the first level
+       * smaller than a tile (kk_image_sparse_init). */
+      .sparseResidencyNonResidentStrict = pdev->info.placement_sparse,
       .sparseResidencyAlignedMipSize = false,
-      .sparseResidencyStandard2DBlockShape = false,
+      .sparseResidencyStandard2DBlockShape = pdev->info.placement_sparse,
       .sparseResidencyStandard2DMultisampleBlockShape = false,
       .sparseResidencyStandard3DBlockShape = false,
 
@@ -1066,6 +1076,8 @@ get_metal_limits(struct kk_physical_device *pdev)
       mtl_device_max_argument_buffer_sampler_count(pdev->mtl_dev_handle);
    pdev->info.gpu_apple_family =
       mtl_device_get_gpu_apple_family(pdev->mtl_dev_handle);
+   pdev->info.placement_sparse =
+      mtl_device_supports_placement_sparse(pdev->mtl_dev_handle);
 
    /* Determine the supported MSL version based on the OS. The version used to
     * compile determines what features are available. */
@@ -1216,12 +1228,19 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    };
    pdev->host_visible_mem_types = BITFIELD_BIT(host_visible_idx);
 
+   /* Sparse resources map 64 KiB pages of placement heaps. Host-visible
+    * memory may be a host pointer import (virglrenderer imports all of it),
+    * which has no heap, so sparse resources only bind the device-local type. */
+   if (pdev->info.placement_sparse)
+      pdev->sparse_mem_types = BITFIELD_BIT(0);
+
    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
 
    pdev->queue_families[pdev->queue_family_count++] = (struct kk_queue_family){
       .queue_flags =
-         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
+         (pdev->info.placement_sparse ? VK_QUEUE_SPARSE_BINDING_BIT : 0),
       .queue_count = 1,
    };
    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));

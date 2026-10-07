@@ -18,9 +18,12 @@
 #include <mach/mach_vm.h>
 #endif /* DETECT_OS_APPLE */
 
-VkResult
-kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
-            uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out)
+/* sparse: the heap can back 64 KiB pages of placement sparse resources
+ * (Vulkan sparse binding), which rounds its size to 64 KiB. */
+static VkResult
+kk_alloc_bo_heap(struct kk_device *dev, struct vk_object_base *log_obj,
+                 uint64_t size_B, uint64_t align_B, bool sparse,
+                 struct kk_bo **bo_out)
 {
    VkResult result = VK_SUCCESS;
 
@@ -40,7 +43,7 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
 
    size_B = align64(size_B, minimum_alignment);
    mtl_heap *handle =
-      mtl_new_heap(dev->mtl_handle, size_B, KK_MTL_RESOURCE_OPTIONS);
+      mtl_new_heap(dev->mtl_handle, size_B, KK_MTL_RESOURCE_OPTIONS, sparse);
    if (handle == NULL) {
       result = vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%m");
       goto fail_heap;
@@ -76,6 +79,21 @@ fail_map:
    mtl_release(handle);
 fail_heap:
    return result;
+}
+
+VkResult
+kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+            uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out)
+{
+   return kk_alloc_bo_heap(dev, log_obj, size_B, align_B, false, bo_out);
+}
+
+VkResult
+kk_alloc_sparse_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+                   uint64_t size_B, struct kk_bo **bo_out)
+{
+   return kk_alloc_bo_heap(dev, log_obj, size_B, KK_SPARSE_PAGE_SIZE_B, true,
+                           bo_out);
 }
 
 void

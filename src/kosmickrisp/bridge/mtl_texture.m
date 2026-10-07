@@ -125,3 +125,21 @@ mtl_texture_replace_region(mtl_texture *texture, const void *host_ptr,
                   bytesPerImage:data->buffer_2d_image_size_B];
    }
 }
+
+uint32_t
+mtl_texture_get_first_mipmap_in_tail(mtl_texture *texture)
+{
+   @autoreleasepool {
+      id<MTLTexture> tex = (id<MTLTexture>)texture;
+      return tex.firstMipmapInTail;
+   }
+}
+
+uint64_t
+mtl_texture_get_tail_size_in_bytes(mtl_texture *texture)
+{
+   @autoreleasepool {
+      id<MTLTexture> tex = (id<MTLTexture>)texture;
+      return tex.tailSizeInBytes;
+   }
+}

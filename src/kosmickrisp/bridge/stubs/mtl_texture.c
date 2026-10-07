@@ -39,3 +39,15 @@ mtl_texture_replace_region(mtl_texture *texture, const void *host_ptr,
                            struct mtl_texture_memory_copy *data)
 {
 }
+
+uint32_t
+mtl_texture_get_first_mipmap_in_tail(mtl_texture *texture)
+{
+   return 0u;
+}
+
+uint64_t
+mtl_texture_get_tail_size_in_bytes(mtl_texture *texture)
+{
+   return 0u;
+}

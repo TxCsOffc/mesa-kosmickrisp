@@ -46,6 +46,8 @@ struct kk_device_info {
    uint32_t rendering_tile_width;
    uint32_t rendering_tile_height;
    VkSampleCountFlags supported_sample_counts;
+   /* MTLDevice.supportsPlacementSparse: Vulkan sparse binding/residency */
+   bool placement_sparse;
 };
 
 struct kk_env_settings {
@@ -69,6 +71,8 @@ struct kk_physical_device {
    struct kk_memory_heap mem_heaps[3];
    VkMemoryType mem_types[3];
    uint32_t host_visible_mem_types;
+   /* Types sparse resources can bind (heaps that take 64 KiB pages) */
+   uint32_t sparse_mem_types;
    uint8_t mem_heap_count;
    uint8_t mem_type_count;
 

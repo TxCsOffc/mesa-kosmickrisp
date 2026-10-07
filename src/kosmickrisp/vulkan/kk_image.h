@@ -42,6 +42,29 @@ struct kk_image_plane {
    uint64_t addr;
 };
 
+/* Sparse images (VK_IMAGE_CREATE_SPARSE_BINDING_BIT) are Metal placement
+ * sparse textures created with the image; memory is mapped per 64 KiB page
+ * (tile) by vkQueueBindSparse (kk_queue_bind_sparse).
+ *
+ * Opaque binds address the image as layers of layer_pages pages each: the
+ * tiles of every level below Metal's tail (x, then y, then z), then Metal's
+ * tail. The Vulkan mip tail starts at vk_tail_level, the first level smaller
+ * than a tile in some dimension, which may be below Metal's tail (Metal maps
+ * levels of at least half a tile individually): those levels are part of the
+ * Vulkan mip tail region and only bound opaquely. */
+struct kk_image_sparse {
+   /* Tile (sparse image block) size in texels */
+   VkExtent3D tile;
+   uint32_t vk_tail_level;
+   uint32_t mtl_tail_level;
+   /* Page offset of each level within a layer, up to and including
+    * mtl_tail_level (where Metal's tail starts) */
+   uint64_t level_page[KK_MAX_MIP_LEVELS + 1];
+   /* Tiles of each level below mtl_tail_level */
+   VkExtent3D level_tiles[KK_MAX_MIP_LEVELS];
+   uint64_t layer_pages;
+};
+
 struct kk_image {
    struct vk_image vk;
 
@@ -55,6 +78,9 @@ struct kk_image {
 
    uint8_t plane_count;
    struct kk_image_plane planes[3];
+
+   /* VK_IMAGE_CREATE_SPARSE_BINDING_BIT (single plane) */
+   struct kk_image_sparse sparse;
 };
 
 #define kk_foreach_slice(ndx, image, subresource_member)                       \

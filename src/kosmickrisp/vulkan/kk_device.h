@@ -124,6 +124,11 @@ void kk_device_add_buffer_to_residency_set(struct kk_device *dev,
                                            mtl_buffer *buffer);
 void kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
                                                 mtl_buffer *buffer);
+/* Placement sparse textures and buffers */
+void kk_device_add_allocation_to_residency_set(struct kk_device *dev,
+                                               mtl_allocation *allocation);
+void kk_device_remove_allocation_from_residency_set(
+   struct kk_device *dev, mtl_allocation *allocation);
 void kk_device_make_resources_resident(struct kk_device *dev);
 
 /* Required to create a sampler */

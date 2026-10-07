@@ -10,7 +10,9 @@
 #ifndef KK_MTL_TYPES_H
 #define KK_MTL_TYPES_H 1
 
+#include <stdbool.h>
 #include <stddef.h> /* For size_t definition */
+#include <stdint.h>
 
 /** HANDLES */
 typedef void mtl_device;
@@ -391,6 +393,24 @@ struct mtl_texture_memory_copy {
    size_t buffer_2d_image_size_B;
    size_t image_slice;
    size_t image_level;
+};
+
+/* MTL4UpdateSparseTextureMappingOperation, in tiles */
+struct mtl_sparse_texture_mapping {
+   bool unmap;
+   struct mtl_origin origin;
+   struct mtl_size size;
+   uint32_t level;
+   uint32_t slice;
+   uint64_t heap_offset;
+};
+
+/* MTL4UpdateSparseBufferMappingOperation, in tiles */
+struct mtl_sparse_buffer_mapping {
+   bool unmap;
+   uint64_t offset;
+   uint64_t length;
+   uint64_t heap_offset;
 };
 
 struct mtl_feedback_data {

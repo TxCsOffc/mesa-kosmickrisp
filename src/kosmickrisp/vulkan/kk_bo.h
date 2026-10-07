@@ -39,6 +39,10 @@ struct kk_ptr {
 
 VkResult kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
                      uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out);
+/* A BO whose heap can back placement sparse resources (64 KiB pages) */
+VkResult kk_alloc_sparse_bo(struct kk_device *dev,
+                            struct vk_object_base *log_obj, uint64_t size_B,
+                            struct kk_bo **bo_out);
 
 void kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo);
 

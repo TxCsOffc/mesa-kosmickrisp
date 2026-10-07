@@ -46,6 +46,22 @@ kk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
    if (!buffer)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   /* Sparse buffers are Metal placement sparse buffers whose 64 KiB pages
+    * vkQueueBindSparse maps (kk_sparse.c); unmapped pages read 0 and drop
+    * writes (MTLBufferSparseTier1). */
+   if (pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
+      buffer->metal.handle = mtl_new_placement_sparse_buffer(
+         dev->mtl_handle, align64(pCreateInfo->size, KK_SPARSE_PAGE_SIZE_B));
+      if (buffer->metal.handle == NULL) {
+         vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      buffer->metal.offset = 0u;
+      buffer->vk.device_address =
+         mtl_buffer_get_gpu_address(buffer->metal.handle);
+      kk_device_add_allocation_to_residency_set(dev, buffer->metal.handle);
+   }
+
    *pBuffer = kk_buffer_to_handle(buffer);
 
    return VK_SUCCESS;
@@ -60,6 +76,9 @@ kk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
 
    if (!buffer)
       return;
+
+   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
+      kk_device_remove_allocation_from_residency_set(dev, buffer->metal.handle);
 
    if (buffer->metal.handle)
       mtl_release(buffer->metal.handle);
@@ -84,6 +103,15 @@ kk_GetDeviceBufferMemoryRequirements(
       .alignment = alignment,
       .memoryTypeBits = BITFIELD_MASK(pdev->mem_type_count),
    };
+
+   /* Sparse buffers map 64 KiB pages of heaps that take them */
+   if (pInfo->pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
+      pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){
+         .size = align64(pInfo->pCreateInfo->size, KK_SPARSE_PAGE_SIZE_B),
+         .alignment = KK_SPARSE_PAGE_SIZE_B,
+         .memoryTypeBits = pdev->sparse_mem_types,
+      };
+   }
 
    vk_foreach_struct(sType, ext, pMemoryRequirements->pNext) {
       switch (sType) {

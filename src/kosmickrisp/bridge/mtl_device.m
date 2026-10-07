@@ -330,6 +330,59 @@ mtl_sparse_tile_count(mtl_device *device, struct kk_image_layout *layout,
    }
 }
 
+bool
+mtl_device_supports_placement_sparse(mtl_device *device)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      if (@available(macOS 26.4, *))
+         return dev.supportsPlacementSparse;
+      return false;
+   }
+}
+
+struct mtl_size
+mtl_placement_sparse_tile_size(mtl_device *device,
+                               struct kk_image_layout *layout)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      MTLSize tile_size = [dev sparseTileSizeWithTextureType:(MTLTextureType)layout->type
+                                                 pixelFormat:layout->format.mtl
+                                                 sampleCount:layout->sample_count_sa
+                                              sparsePageSize:MTLSparsePageSize64];
+      return (struct mtl_size){tile_size.width, tile_size.height, tile_size.depth};
+   }
+}
+
+/* Placement sparse resources must be private; their pages come from
+ * placement heaps (any storage mode) through MTL4CommandQueue mapping updates. */
+mtl_texture *
+mtl_new_placement_sparse_texture(mtl_device *device,
+                                 struct kk_image_layout *layout)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      MTLTextureDescriptor *descriptor = [mtl_new_texture_descriptor(layout) autorelease];
+      descriptor.resourceOptions = MTLResourceStorageModePrivate |
+                                   MTLResourceHazardTrackingModeUntracked;
+      descriptor.placementSparsePageSize = MTLSparsePageSize64;
+      return [dev newTextureWithDescriptor:descriptor];
+   }
+}
+
+mtl_buffer *
+mtl_new_placement_sparse_buffer(mtl_device *device, uint64_t size_B)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      return [dev newBufferWithLength:size_B
+                              options:MTLResourceStorageModePrivate |
+                                      MTLResourceHazardTrackingModeUntracked
+              placementSparsePageSize:MTLSparsePageSize64];
+   }
+}
+
 /* Resource creation */
 mtl_buffer *
 mtl_new_buffer_with_bytes_no_copy(mtl_device *device, void* ptr,

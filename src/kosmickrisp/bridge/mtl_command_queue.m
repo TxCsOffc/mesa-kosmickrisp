@@ -96,6 +96,65 @@ mtl_wait_for_event(mtl_command_queue *queue, mtl_event *event, uint64_t value)
    }
 }
 
+#define MTL_SPARSE_MAPPING_BATCH 64u
+
+void
+mtl_command_queue_update_texture_mappings(
+   mtl_command_queue *queue, mtl_texture *texture, mtl_heap *heap,
+   const struct mtl_sparse_texture_mapping *mappings, uint32_t count)
+{
+   @autoreleasepool {
+      id<MTL4CommandQueue> q = (id<MTL4CommandQueue>)queue;
+      MTL4UpdateSparseTextureMappingOperation ops[MTL_SPARSE_MAPPING_BATCH];
+      for (uint32_t base = 0; base < count; base += MTL_SPARSE_MAPPING_BATCH) {
+         uint32_t n = count - base < MTL_SPARSE_MAPPING_BATCH ? count - base : MTL_SPARSE_MAPPING_BATCH;
+         for (uint32_t i = 0; i < n; i++) {
+            const struct mtl_sparse_texture_mapping *m = &mappings[base + i];
+            ops[i] = (MTL4UpdateSparseTextureMappingOperation){
+               .mode = m->unmap ? MTLSparseTextureMappingModeUnmap
+                                : MTLSparseTextureMappingModeMap,
+               .textureRegion = MTLRegionMake3D(m->origin.x, m->origin.y, m->origin.z,
+                                                m->size.x, m->size.y, m->size.z),
+               .textureLevel = m->level,
+               .textureSlice = m->slice,
+               .heapOffset = m->heap_offset,
+            };
+         }
+         [q updateTextureMappings:(id<MTLTexture>)texture
+                             heap:(id<MTLHeap>)heap
+                       operations:ops
+                            count:n];
+      }
+   }
+}
+
+void
+mtl_command_queue_update_buffer_mappings(
+   mtl_command_queue *queue, mtl_buffer *buffer, mtl_heap *heap,
+   const struct mtl_sparse_buffer_mapping *mappings, uint32_t count)
+{
+   @autoreleasepool {
+      id<MTL4CommandQueue> q = (id<MTL4CommandQueue>)queue;
+      MTL4UpdateSparseBufferMappingOperation ops[MTL_SPARSE_MAPPING_BATCH];
+      for (uint32_t base = 0; base < count; base += MTL_SPARSE_MAPPING_BATCH) {
+         uint32_t n = count - base < MTL_SPARSE_MAPPING_BATCH ? count - base : MTL_SPARSE_MAPPING_BATCH;
+         for (uint32_t i = 0; i < n; i++) {
+            const struct mtl_sparse_buffer_mapping *m = &mappings[base + i];
+            ops[i] = (MTL4UpdateSparseBufferMappingOperation){
+               .mode = m->unmap ? MTLSparseTextureMappingModeUnmap
+                                : MTLSparseTextureMappingModeMap,
+               .bufferRange = NSMakeRange(m->offset, m->length),
+               .heapOffset = m->heap_offset,
+            };
+         }
+         [q updateBufferMappings:(id<MTLBuffer>)buffer
+                            heap:(id<MTLHeap>)heap
+                      operations:ops
+                           count:n];
+      }
+   }
+}
+
 void
 mtl_command_queue_commit(mtl_command_queue *queue,
                          mtl_command_buffer **command_buffers, uint32_t count,

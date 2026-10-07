@@ -39,6 +39,9 @@
 #define KK_MAX_SAMPLE_LOCATION         (0.9375f)
 
 #define KK_SPARSE_ADDR_SPACE_SIZE (1ull << 39)
+/* Sparse binding page: Metal's MTLSparsePageSize64, the size of Vulkan's
+ * standard sparse image blocks */
+#define KK_SPARSE_PAGE_SIZE_B (64u * 1024u)
 
 /* Max size of a bound cbuf */
 #define KK_MAX_CBUF_SIZE (1u << 16)

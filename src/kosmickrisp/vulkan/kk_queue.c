@@ -11,6 +11,7 @@
 #include "kk_device.h"
 #include "kk_entrypoints.h"
 #include "kk_physical_device.h"
+#include "kk_sparse.h"
 #include "kk_sync.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
@@ -194,6 +195,12 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * work. All resources should have been allocated before submission.
     * Otherwise, users are playing with fire. */
    kk_device_make_resources_resident(dev);
+
+   /* Mapping updates go on the Metal queue after the waits; signals below
+    * follow them, command buffers barrier against them
+    * (kk_encoder_wait_for_sparse_binds). */
+   if (vk_queue_submit_has_bind(submit))
+      kk_queue_bind_sparse(queue, submit);
 
    for (uint32_t i = 0; i < submit->command_buffer_count; ++i) {
       struct kk_cmd_buffer *cmd_buffer =
