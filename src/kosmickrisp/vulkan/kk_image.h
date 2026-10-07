@@ -17,6 +17,7 @@
 
 #include "vk_image.h"
 
+struct kk_device;
 struct kk_device_memory;
 struct kk_physical_device;
 struct kk_queue;
@@ -40,6 +41,11 @@ struct kk_image_plane {
    /* Metal handle with 2D array type for 3D images */
    mtl_texture *mtl_handle_array;
    uint64_t addr;
+   /* The base textures of mtl_handle and mtl_handle_array were added to the
+    * device's residency set by this plane (bound to memory, or sparse) and
+    * are removed when it is finished. Not set for planes that alias a
+    * swapchain image's or a drawable's textures. */
+   bool resident;
 };
 
 /* Sparse images (VK_IMAGE_CREATE_SPARSE_BINDING_BIT) are Metal placement
@@ -160,9 +166,14 @@ kk_image_memory_aspects_to_plane(ASSERTED const struct kk_image *image,
    }
 }
 
+/* A new texture of the plane's memory (not a view of mtl_handle): the caller
+ * owns it and its residency (kk_device_add_texture_to_residency_set). */
 mtl_texture *kk_image_plane_create_texture(struct kk_image_plane *plane,
                                            struct kk_image_layout *layout,
                                            uint64_t offset_B);
+
+void kk_image_plane_remove_from_residency_set(struct kk_device *dev,
+                                              struct kk_image_plane *plane);
 
 void kk_image_set_label(struct kk_image *image, const char *label);
 

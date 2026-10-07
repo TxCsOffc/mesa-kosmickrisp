@@ -141,6 +141,15 @@ void kk_device_add_allocation_to_residency_set(struct kk_device *dev,
                                                mtl_allocation *allocation);
 void kk_device_remove_allocation_from_residency_set(
    struct kk_device *dev, mtl_allocation *allocation);
+/* Textures made from a heap or a buffer (and the base of views made from such
+ * a texture): Metal 4 takes an attachment as resident only when its base
+ * texture object is in a residency set, its heap or buffer does not count.
+ * Every texture the driver makes this way is added once by its owner and
+ * removed before its release. */
+void kk_device_add_texture_to_residency_set(struct kk_device *dev,
+                                            mtl_texture *texture);
+void kk_device_remove_texture_from_residency_set(struct kk_device *dev,
+                                                 mtl_texture *texture);
 void kk_device_make_resources_resident(struct kk_device *dev);
 
 /* The guest application of a device ("gamescope", "steamwebhelper (mesa

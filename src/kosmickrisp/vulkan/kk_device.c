@@ -565,6 +565,22 @@ kk_device_remove_allocation_from_residency_set(struct kk_device *dev,
 }
 
 void
+kk_device_add_texture_to_residency_set(struct kk_device *dev,
+                                       mtl_texture *texture)
+{
+   kk_device_add_allocation_to_residency_set(dev,
+                                             mtl_texture_get_base(texture));
+}
+
+void
+kk_device_remove_texture_from_residency_set(struct kk_device *dev,
+                                            mtl_texture *texture)
+{
+   kk_device_remove_allocation_from_residency_set(
+      dev, mtl_texture_get_base(texture));
+}
+
+void
 kk_device_make_resources_resident(struct kk_device *dev)
 {
    simple_mtx_lock(&dev->residency_set.mutex);

@@ -23,6 +23,15 @@ mtl_texture_get_gpu_resource_id(mtl_texture *texture)
    }
 }
 
+mtl_texture *
+mtl_texture_get_base(mtl_texture *texture)
+{
+   id<MTLTexture> tex = (id<MTLTexture>)texture;
+   while (tex.parentTexture)
+      tex = tex.parentTexture;
+   return tex;
+}
+
 /* TODO_KOSMICKRISP This should be part of the mapping */
 static uint32_t
 mtl_texture_view_type(uint32_t type, uint8_t sample_count)

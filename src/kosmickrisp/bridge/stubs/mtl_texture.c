@@ -13,6 +13,12 @@ mtl_texture_get_gpu_resource_id(mtl_texture *texture)
    return 0u;
 }
 
+mtl_texture *
+mtl_texture_get_base(mtl_texture *texture)
+{
+   return texture;
+}
+
 /* Texture view creation */
 mtl_texture *
 mtl_new_texture_view_with(mtl_texture *texture,

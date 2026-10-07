@@ -137,6 +137,7 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
          vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
+      kk_device_add_texture_to_residency_set(dev, view->mtl_texel_buffer_handle);
    }
    view->texel_buffer_gpu_id =
       mtl_texture_get_gpu_resource_id(view->mtl_texel_buffer_handle);
@@ -158,6 +159,9 @@ kk_DestroyBufferView(VkDevice _device, VkBufferView bufferView,
 
    if (view->sparse)
       kk_buffer_view_sparse_finish(dev, view);
+   else
+      kk_device_remove_texture_from_residency_set(
+         dev, view->mtl_texel_buffer_handle);
    mtl_release(view->mtl_texel_buffer_handle);
    vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
 }

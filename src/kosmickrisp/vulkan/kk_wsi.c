@@ -57,6 +57,10 @@ kk_bind_drawable_to_vkimage(VkImage vk_image, void *drawable)
    /* This should only be called for swapchain binding. */
    assert(image->plane_count == 1);
    struct kk_image_plane *plane = &image->planes[0];
+   /* Drawable textures are resident through the layer's residency set */
+   if (plane->resident)
+      kk_image_plane_remove_from_residency_set(
+         container_of(image->vk.base.device, struct kk_device, vk), plane);
    if (plane->mtl_handle)
       mtl_release(plane->mtl_handle);
    if (plane->mtl_handle_array)

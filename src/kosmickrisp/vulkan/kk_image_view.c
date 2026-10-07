@@ -170,6 +170,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          mtl_handle = kk_image_plane_create_texture(plane, &subres_layout,
                                                     subres_offset_B);
          view->planes[view_plane].mtl_handle_subres = mtl_handle;
+         if (mtl_handle)
+            kk_device_add_texture_to_residency_set(dev, mtl_handle);
 
          /* Adjust for new base texture pointing to subresource */
          view_layout.base_level = 0u;
@@ -281,8 +283,11 @@ kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
       if (view->planes[plane].mtl_handle_render)
          mtl_release(view->planes[plane].mtl_handle_render);
 
-      if (view->planes[plane].mtl_handle_subres)
+      if (view->planes[plane].mtl_handle_subres) {
+         kk_device_remove_texture_from_residency_set(
+            dev, view->planes[plane].mtl_handle_subres);
          mtl_release(view->planes[plane].mtl_handle_subres);
+      }
 
       if (view->planes[plane].mtl_handle_residency_sampled)
          mtl_release(view->planes[plane].mtl_handle_residency_sampled);

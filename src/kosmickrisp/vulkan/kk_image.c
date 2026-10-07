@@ -652,10 +652,34 @@ kk_image_plane_size_align_B(struct kk_device *dev, const struct kk_image *image,
 }
 
 static void
+kk_image_plane_add_to_residency_set(struct kk_device *dev,
+                                    struct kk_image_plane *plane)
+{
+   if (plane->mtl_handle)
+      kk_device_add_texture_to_residency_set(dev, plane->mtl_handle);
+   if (plane->mtl_handle_array)
+      kk_device_add_texture_to_residency_set(dev, plane->mtl_handle_array);
+   plane->resident = true;
+}
+
+void
+kk_image_plane_remove_from_residency_set(struct kk_device *dev,
+                                         struct kk_image_plane *plane)
+{
+   if (plane->mtl_handle)
+      kk_device_remove_texture_from_residency_set(dev, plane->mtl_handle);
+   if (plane->mtl_handle_array)
+      kk_device_remove_texture_from_residency_set(dev, plane->mtl_handle_array);
+   plane->resident = false;
+}
+
+static void
 kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
                       VkImageCreateFlags create_flags,
                       const VkAllocationCallbacks *pAllocator)
 {
+   if (plane->resident)
+      kk_image_plane_remove_from_residency_set(dev, plane);
    if (plane->mtl_handle != NULL)
       mtl_release(plane->mtl_handle);
    if (plane->mtl_handle_array != NULL)
@@ -701,8 +725,7 @@ kk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
 
    /* Sparse textures map heap pages, the texture itself must be resident */
    if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
-      kk_device_add_allocation_to_residency_set(dev,
-                                                image->planes[0].mtl_handle);
+      kk_image_plane_add_to_residency_set(dev, &image->planes[0]);
 
    *pImage = kk_image_to_handle(image);
 
@@ -718,10 +741,6 @@ kk_DestroyImage(VkDevice device, VkImage _image,
 
    if (!image)
       return;
-
-   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
-      kk_device_remove_allocation_from_residency_set(
-         dev, image->planes[0].mtl_handle);
 
    kk_image_finish(dev, image, pAllocator);
    vk_free2(&dev->vk.alloc, pAllocator, image);
@@ -1020,6 +1039,8 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
          mtl_resource_set_label(plane->mtl_handle_array,
                                 image->vk.base.object_name);
    }
+
+   kk_image_plane_add_to_residency_set(dev, plane);
 
    *offset_B += plane_size_B;
 

@@ -16,6 +16,11 @@ struct kk_view_layout;
 
 /* Utils*/
 uint64_t mtl_texture_get_gpu_resource_id(mtl_texture *texture);
+/* The texture a view was made from (parentTexture, recursively), else the
+ * texture itself. Not retained. Metal 4 validation accepts an attachment only
+ * when this base texture is in a residency set; the heap it was placed in or
+ * the buffer it was made from do not count. */
+mtl_texture *mtl_texture_get_base(mtl_texture *texture);
 
 /* Texture view creation */
 mtl_texture *mtl_new_texture_view_with(mtl_texture *texture,
