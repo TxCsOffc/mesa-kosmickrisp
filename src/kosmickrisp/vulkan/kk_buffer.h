@@ -24,6 +24,9 @@ struct kk_buffer {
        * offset calculations through kk_buffer_mtl_offset */
       uint64_t offset;
    } metal;
+
+   /* Sparse buffers: page mappings for texel buffer views (kk_sparse.c) */
+   struct kk_sparse_buffer *sparse;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer, vk.base, VkBuffer,

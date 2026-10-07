@@ -7,6 +7,7 @@
 
 #include "kk_bo.h"
 #include "kk_buffer.h"
+#include "kk_buffer_view.h"
 #include "kk_device.h"
 #include "kk_device_memory.h"
 #include "kk_format.h"
@@ -17,6 +18,9 @@
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
 #include "util/format/u_format.h"
+#include "util/list.h"
+#include "util/simple_mtx.h"
+#include "util/u_atomic.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
 #include "vk_format.h"
@@ -224,29 +228,205 @@ kk_sparse_memory_heap(const struct kk_device_memory *mem)
    return mem ? mem->bo->mtl_handle : NULL;
 }
 
+/* What vkQueueBindSparse mapped to each page of a sparse buffer, so its texel
+ * buffer views (placement sparse texture buffers: Metal makes no texture from
+ * a placement sparse buffer, newTextureWithDescriptor returns nil) can be
+ * mapped alike when they are created and on every later bind. Their 1D tiles
+ * are the buffer's 64 KiB pages, linearly. Mapped heaps are retained: memory
+ * may be freed while pages still map it (vkd3d-proton does), and a later view
+ * maps those pages too. Shared by the buffer and its views, any of which may
+ * be destroyed last. */
+struct kk_sparse_buffer_page {
+   mtl_heap *heap; /* NULL: unmapped */
+   uint64_t heap_page;
+};
+
+struct kk_sparse_buffer {
+   uint32_t refcount;
+   /* Orders page updates and the views' Metal mapping updates */
+   simple_mtx_t lock;
+   struct list_head views;
+   uint64_t page_count;
+   struct kk_sparse_buffer_page pages[];
+};
+
+VkResult
+kk_buffer_sparse_init(struct kk_device *dev, struct kk_buffer *buffer)
+{
+   const uint64_t page_count =
+      DIV_ROUND_UP(buffer->vk.size, KK_SPARSE_PAGE_SIZE_B);
+   struct kk_sparse_buffer *sparse = vk_zalloc(
+      &dev->vk.alloc,
+      sizeof(*sparse) + page_count * sizeof(struct kk_sparse_buffer_page), 8,
+      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (sparse == NULL)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   sparse->refcount = 1u;
+   simple_mtx_init(&sparse->lock, mtx_plain);
+   list_inithead(&sparse->views);
+   sparse->page_count = page_count;
+   buffer->sparse = sparse;
+   return VK_SUCCESS;
+}
+
+static void
+kk_sparse_buffer_unref(struct kk_device *dev, struct kk_sparse_buffer *sparse)
+{
+   if (!p_atomic_dec_zero(&sparse->refcount))
+      return;
+
+   assert(list_is_empty(&sparse->views));
+   for (uint64_t p = 0; p < sparse->page_count; ++p) {
+      if (sparse->pages[p].heap)
+         mtl_release(sparse->pages[p].heap);
+   }
+   simple_mtx_destroy(&sparse->lock);
+   vk_free(&dev->vk.alloc, sparse);
+}
+
+void
+kk_buffer_sparse_finish(struct kk_device *dev, struct kk_buffer *buffer)
+{
+   if (buffer->sparse)
+      kk_sparse_buffer_unref(dev, buffer->sparse);
+}
+
+VkResult
+kk_buffer_view_sparse_init(struct kk_device *dev, struct kk_buffer_view *view,
+                           struct kk_buffer *buffer, uint64_t first_page,
+                           struct kk_image_layout *layout)
+{
+   struct kk_sparse_buffer *sparse = buffer->sparse;
+   const uint64_t texel_B = util_format_get_blocksize(layout->format.pipe);
+
+   view->mtl_texel_buffer_handle =
+      mtl_new_placement_sparse_texture(dev->mtl_handle, layout);
+   if (view->mtl_texel_buffer_handle == NULL)
+      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "Metal failed to create a placement sparse texture "
+                       "buffer of %u texels",
+                       layout->width_px);
+   kk_device_add_allocation_to_residency_set(dev,
+                                             view->mtl_texel_buffer_handle);
+
+   view->sparse_first_page = first_page;
+   view->sparse_page_count =
+      MIN2(DIV_ROUND_UP(layout->width_px * texel_B, KK_SPARSE_PAGE_SIZE_B),
+           sparse->page_count - first_page);
+
+   simple_mtx_lock(&sparse->lock);
+   /* Map what the buffer maps, after its earlier mapping updates (the same
+    * queue); later binds update the view too. */
+   if (dev->has_queue) {
+      const struct kk_sparse_buffer_page *pages = &sparse->pages[first_page];
+      for (uint64_t p = 0; p < view->sparse_page_count;) {
+         uint64_t n = 1u;
+         if (pages[p].heap == NULL) {
+            p++;
+            continue;
+         }
+         while (p + n < view->sparse_page_count &&
+                pages[p + n].heap == pages[p].heap &&
+                pages[p + n].heap_page == pages[p].heap_page + n)
+            n++;
+         const struct mtl_sparse_texture_mapping mapping = {
+            .origin = {p, 0, 0},
+            .size = {n, 1, 1},
+            .heap_offset = pages[p].heap_page,
+         };
+         mtl_command_queue_update_texture_mappings(
+            dev->queue.mtl_handle, view->mtl_texel_buffer_handle,
+            pages[p].heap, &mapping, 1u);
+         p += n;
+      }
+   }
+   list_addtail(&view->sparse_link, &sparse->views);
+   p_atomic_inc(&sparse->refcount);
+   view->sparse = sparse;
+   simple_mtx_unlock(&sparse->lock);
+
+   return VK_SUCCESS;
+}
+
+void
+kk_buffer_view_sparse_finish(struct kk_device *dev, struct kk_buffer_view *view)
+{
+   struct kk_sparse_buffer *sparse = view->sparse;
+
+   simple_mtx_lock(&sparse->lock);
+   list_del(&view->sparse_link);
+   simple_mtx_unlock(&sparse->lock);
+
+   kk_device_remove_allocation_from_residency_set(
+      dev, view->mtl_texel_buffer_handle);
+   kk_sparse_buffer_unref(dev, sparse);
+}
+
 /* Returns whether a page was unmapped */
 static bool
 kk_sparse_bind_buffer(struct kk_queue *queue,
                       const VkSparseBufferMemoryBindInfo *info)
 {
    VK_FROM_HANDLE(kk_buffer, buffer, info->buffer);
+   struct kk_sparse_buffer *sparse = buffer->sparse;
    bool unmapped = false;
 
    for (uint32_t i = 0; i < info->bindCount; ++i) {
       const VkSparseMemoryBind *bind = &info->pBinds[i];
       VK_FROM_HANDLE(kk_device_memory, mem, bind->memory);
+      mtl_heap *heap = kk_sparse_memory_heap(mem);
+
+      const uint64_t first = bind->resourceOffset / KK_SPARSE_PAGE_SIZE_B;
+      const uint64_t count = DIV_ROUND_UP(bind->size, KK_SPARSE_PAGE_SIZE_B);
+      const uint64_t heap_first =
+         mem ? bind->memoryOffset / KK_SPARSE_PAGE_SIZE_B : 0u;
+      assert(first + count <= sparse->page_count);
+
+      simple_mtx_lock(&sparse->lock);
+      for (uint64_t p = 0; p < count; ++p) {
+         struct kk_sparse_buffer_page *page = &sparse->pages[first + p];
+         if (heap)
+            mtl_retain(heap);
+         if (page->heap)
+            mtl_release(page->heap);
+         *page = (struct kk_sparse_buffer_page){
+            .heap = heap,
+            .heap_page = heap ? heap_first + p : 0u,
+         };
+      }
 
       const struct mtl_sparse_buffer_mapping mapping = {
-         .unmap = mem == NULL,
-         .offset = bind->resourceOffset / KK_SPARSE_PAGE_SIZE_B,
-         .length = DIV_ROUND_UP(bind->size, KK_SPARSE_PAGE_SIZE_B),
-         .heap_offset = mem ? bind->memoryOffset / KK_SPARSE_PAGE_SIZE_B : 0u,
+         .unmap = heap == NULL,
+         .offset = first,
+         .length = count,
+         .heap_offset = heap_first,
       };
-      mtl_command_queue_update_buffer_mappings(queue->mtl_handle,
-                                               buffer->metal.handle,
-                                               kk_sparse_memory_heap(mem),
-                                               &mapping, 1u);
-      unmapped |= mem == NULL;
+      mtl_command_queue_update_buffer_mappings(
+         queue->mtl_handle, buffer->metal.handle, heap, &mapping, 1u);
+
+      list_for_each_entry(struct kk_buffer_view, view, &sparse->views,
+                          sparse_link) {
+         const uint64_t start = MAX2(first, view->sparse_first_page);
+         const uint64_t end =
+            MIN2(first + count,
+                 view->sparse_first_page + view->sparse_page_count);
+         if (start >= end)
+            continue;
+
+         const struct mtl_sparse_texture_mapping view_mapping = {
+            .unmap = heap == NULL,
+            .origin = {start - view->sparse_first_page, 0, 0},
+            .size = {end - start, 1, 1},
+            .heap_offset = heap ? heap_first + (start - first) : 0u,
+         };
+         mtl_command_queue_update_texture_mappings(
+            queue->mtl_handle, view->mtl_texel_buffer_handle, heap,
+            &view_mapping, 1u);
+      }
+      simple_mtx_unlock(&sparse->lock);
+
+      unmapped |= heap == NULL;
    }
 
    return unmapped;

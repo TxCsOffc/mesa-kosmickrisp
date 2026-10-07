@@ -10,6 +10,7 @@
 #include "kk_device.h"
 #include "kk_entrypoints.h"
 #include "kk_physical_device.h"
+#include "kk_sparse.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
@@ -59,6 +60,13 @@ kk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       buffer->metal.offset = 0u;
       buffer->vk.device_address =
          mtl_buffer_get_gpu_address(buffer->metal.handle);
+
+      VkResult result = kk_buffer_sparse_init(dev, buffer);
+      if (result != VK_SUCCESS) {
+         mtl_release(buffer->metal.handle);
+         vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+         return result;
+      }
       kk_device_add_allocation_to_residency_set(dev, buffer->metal.handle);
    }
 
@@ -77,8 +85,10 @@ kk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
    if (!buffer)
       return;
 
-   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
+   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
       kk_device_remove_allocation_from_residency_set(dev, buffer->metal.handle);
+      kk_buffer_sparse_finish(dev, buffer);
+   }
 
    if (buffer->metal.handle)
       mtl_release(buffer->metal.handle);

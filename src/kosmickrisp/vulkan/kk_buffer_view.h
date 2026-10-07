@@ -14,6 +14,8 @@
 
 #include "vk_buffer_view.h"
 
+#include "util/list.h"
+
 struct kk_physical_device;
 
 VkFormatFeatureFlags2
@@ -26,6 +28,14 @@ struct kk_buffer_view {
    /* Texels from the start of the Metal texture (aligned down) to the view
     * (struct kk_texel_buffer_descriptor). */
    uint32_t texel_offset;
+
+   /* Views of sparse buffers are placement sparse texture buffers whose pages
+    * follow the buffer's sparse_page_count pages from sparse_first_page
+    * (kk_sparse.c): Metal makes no texture from a placement sparse buffer. */
+   struct kk_sparse_buffer *sparse;
+   struct list_head sparse_link;
+   uint64_t sparse_first_page;
+   uint64_t sparse_page_count;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer_view, vk.base, VkBufferView,

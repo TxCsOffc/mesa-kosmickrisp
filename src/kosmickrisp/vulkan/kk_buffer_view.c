@@ -14,6 +14,7 @@
 #include "kk_image_layout.h"
 #include "kk_nir_lower_vbo.h"
 #include "kk_physical_device.h"
+#include "kk_sparse.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/mtl_format.h"
@@ -86,8 +87,17 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    uint64_t texture_offset =
       mtl_offset & ~(uint64_t)(KK_MIN_TEXEL_BUFFER_ALIGNMENT - 1);
    const uint32_t texel_B = util_format_get_blocksize(p_format);
-   if ((mtl_offset - texture_offset) % texel_B != 0)
+   /* Views of sparse buffers start at the page below the view (kk_sparse.c) */
+   if (buffer->sparse)
+      texture_offset = mtl_offset & ~(uint64_t)(KK_SPARSE_PAGE_SIZE_B - 1);
+   if ((mtl_offset - texture_offset) % texel_B != 0) {
+      if (buffer->sparse) {
+         vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+         return vk_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
+                          "%u-byte texels across sparse pages", texel_B);
+      }
       texture_offset = mtl_offset;
+   }
    view->texel_offset = (mtl_offset - texture_offset) / texel_B;
 
    struct kk_image_layout layout = {
@@ -111,11 +121,22 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
          },
       .linear_stride_B = view->vk.range + (mtl_offset - texture_offset),
    };
-   view->mtl_texel_buffer_handle = mtl_new_texture_with_descriptor_linear(
-      buffer->metal.handle, &layout, texture_offset);
-   if (!view->mtl_texel_buffer_handle) {
-      vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
-      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   if (buffer->sparse) {
+      VkResult result = kk_buffer_view_sparse_init(
+         dev, view, buffer, texture_offset / KK_SPARSE_PAGE_SIZE_B, &layout);
+      if (result != VK_SUCCESS) {
+         if (view->mtl_texel_buffer_handle)
+            mtl_release(view->mtl_texel_buffer_handle);
+         vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+         return result;
+      }
+   } else {
+      view->mtl_texel_buffer_handle = mtl_new_texture_with_descriptor_linear(
+         buffer->metal.handle, &layout, texture_offset);
+      if (!view->mtl_texel_buffer_handle) {
+         vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
    }
    view->texel_buffer_gpu_id =
       mtl_texture_get_gpu_resource_id(view->mtl_texel_buffer_handle);
@@ -135,6 +156,8 @@ kk_DestroyBufferView(VkDevice _device, VkBufferView bufferView,
    if (!view)
       return;
 
+   if (view->sparse)
+      kk_buffer_view_sparse_finish(dev, view);
    mtl_release(view->mtl_texel_buffer_handle);
    vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
 }
