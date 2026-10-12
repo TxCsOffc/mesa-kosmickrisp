@@ -18,6 +18,9 @@ enum kk_debug {
    /* Log command buffers that started late, ran long on the GPU or completed
     * late, and device creations/destructions with their application */
    KK_DEBUG_COMMITS = 1ull << 4,
+   /* Log every command buffer's record (encoders, draws, dispatches,
+    * operations, kernels and program MSL hashes) when its feedback comes */
+   KK_DEBUG_CBS = 1ull << 5,
 };
 
 extern enum kk_debug kk_mesa_debug_flags;

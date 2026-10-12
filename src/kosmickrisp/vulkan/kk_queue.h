@@ -10,6 +10,7 @@
 
 #include "kk_private.h"
 
+#include "kk_cb_record.h"
 #include "kk_cmd_pool.h"
 
 #include "kosmickrisp/bridge/mtl_types.h"
@@ -20,6 +21,20 @@
 #include "util/simple_mtx.h"
 
 #define KK_QUEUE_PENDING_WAITS 8u
+#define KK_QUEUE_RECORDS       16u
+
+/* A commit's command buffer record and, once its feedback handler ran, its
+ * outcome */
+struct kk_queue_record {
+   uint64_t seq; /* 0: unused */
+   int64_t commit_ns;
+   bool done;
+   /* The IOGPU reason of its command queue error ("Hang", "InnocentVictim",
+    * ...), "ok" when it completed */
+   char outcome[32];
+   double gpu_start, gpu_end;
+   struct kk_cb_record cb;
+};
 
 struct kk_queue {
    struct vk_queue vk;
@@ -43,6 +58,12 @@ struct kk_queue {
    uint32_t feedbacks_pending;
    uint64_t commit_seq;
    double last_gpu_end;
+
+   /* Under `mutex`: the records of the last KK_QUEUE_RECORDS commits, at
+    * seq % KK_QUEUE_RECORDS. A command queue error prints the failed command
+    * buffer's and those of every command buffer of the process in flight
+    * (kk_queue_log_failure). */
+   struct kk_queue_record records[KK_QUEUE_RECORDS];
 
    /* The last KK_QUEUE_PENDING_WAITS semaphore waits that were not signalled
     * yet when submitted (wait before signal), retained, under `mutex`: a

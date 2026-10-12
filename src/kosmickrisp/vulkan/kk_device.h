@@ -115,6 +115,8 @@ struct kk_device {
 
    /* os_time_get_nano() at creation (command queue error diagnostics) */
    int64_t created_ns;
+   /* In the process' list of devices alive (kk_device_foreach) */
+   struct list_head lifecycle_link;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
@@ -158,6 +160,11 @@ void kk_device_app_name(const struct kk_device *dev, char *name, size_t size);
 /* Logs the devices alive in the process (every guest device under
  * virglrenderer) and the last ones created and destroyed. */
 void kk_device_log_lifecycle(void);
+/* Calls cb for every device alive in the process (they stay alive until it
+ * returns): cb must not wait for anything a device's creation or destruction
+ * could hold. */
+void kk_device_foreach(void (*cb)(struct kk_device *dev, void *data),
+                       void *data);
 
 /* Required to create a sampler */
 mtl_sampler *kk_sampler_create(struct kk_device *dev,

@@ -34,10 +34,11 @@ kk_flush_compute_state(struct kk_cmd_buffer *cmd)
       kk_cmd_bind_root_to_argument_table(cmd, desc->root.addr);
 
    /* The CS's program with or without sampler min/max emulation */
-   mtl_compute_set_pipeline_state(
-      encoder,
-      kk_cmd_shader_pipeline(cmd, cmd->state.shaders[MESA_SHADER_COMPUTE], desc)
-         ->cs);
+   const struct kk_pipeline_handles *pipe =
+      kk_cmd_shader_pipeline(cmd, cmd->state.shaders[MESA_SHADER_COMPUTE], desc);
+   mtl_compute_set_pipeline_state(encoder, pipe->cs);
+   kk_cb_record_program(&cmd->record, &pipe->record);
+   kk_cb_record_count(&cmd->record.dispatches);
 }
 
 static void
@@ -132,6 +133,7 @@ kk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
    struct kk_shader *cs = cmd->state.shaders[MESA_SHADER_COMPUTE];
    struct mtl_size local_size = cs->info.cs.local_size;
 
+   kk_cb_record_count(&cmd->record.indirect_dispatches);
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
    if (cmd->state.cond_render.enabled) {
       struct kk_ptr patched =

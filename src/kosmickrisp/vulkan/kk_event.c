@@ -95,6 +95,7 @@ kk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(kk_event, event, _event);
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_EVENT);
    kk_cmd_write(cmd, (struct libkk_imm_write){event->addr, VK_EVENT_SET});
 }
 
@@ -104,6 +105,7 @@ kk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(kk_event, event, _event);
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_EVENT);
    kk_cmd_write(cmd, (struct libkk_imm_write){event->addr, VK_EVENT_RESET});
 }
 

@@ -13,6 +13,7 @@ const struct debug_named_value debug_flags[] = {
    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
    {"minmax", KK_DEBUG_MINMAX},
    {"commits", KK_DEBUG_COMMITS},
+   {"cbs", KK_DEBUG_CBS},
    {NULL, 0},
 };
 

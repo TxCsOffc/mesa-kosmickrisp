@@ -218,6 +218,7 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->one_time_submit =
       pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
    cmd->replay = false;
+   memset(&cmd->record, 0, sizeof(cmd->record));
 
    /* vk_command_buffer_begin will reset the command buffer meaning the
     * allocator may be returned to the pool. Request a new one. */
@@ -289,6 +290,12 @@ cs_start_render(struct kk_cmd_buffer *cmd)
 
    kk_encoder_update_debug(cmd, cmd->metal.render);
    kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.render);
+   kk_cb_record_count(&cmd->record.render_passes);
+   if (state->render.samples > 1u) {
+      kk_cb_record_count(&cmd->record.msaa_render_passes);
+      cmd->record.max_samples =
+         MAX2(cmd->record.max_samples, state->render.samples);
+   }
    /* Starting a new render pass means we already flushed and no barrier is
     * needed. */
    state->render.write_available = false;
@@ -344,6 +351,7 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
       kk_encoder_update_debug(cmd, cmd->metal.compute);
       kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.compute);
+      kk_cb_record_count(&cmd->record.compute_encoders);
    }
 
    return cmd->metal.compute;
@@ -824,6 +832,7 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
 {
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    struct kk_precompiled_shader *prog = &dev->precompiled_cache.shaders[idx];
+   cmd->record.precomp |= BITFIELD_BIT(idx);
 
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
    mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
@@ -895,6 +904,7 @@ kk_CmdBeginConditionalRendering2EXT(
    const VkConditionalRenderingBeginInfo2EXT *pConditionalRenderingBegin)
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_CONDITIONAL);
 
    cmd->state.cond_render.address =
       pConditionalRenderingBegin->addressRange.address;

@@ -22,6 +22,7 @@
 #include "kosmickrisp/libkk/kk_tessellator.h"
 
 #include "poly/geometry.h"
+#include "poly/prim.h"
 #include "poly/tessellator.h"
 
 #include "vulkan/runtime/vk_render_pass.h"
@@ -643,6 +644,7 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    memset(render, 0, sizeof(*render));
 
    if (need_meta_resolve) {
+      kk_cb_record_op(&cmd->record, KK_CB_OP_RESOLVE_RENDERING);
       kk_meta_resolve_rendering(cmd, &vk_render);
    }
 }
@@ -1613,6 +1615,7 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
    if (pipe != gfx->pipe) {
       gfx->pipe = pipe;
       cmd->state.dirty_shaders |= BITFIELD_BIT(MESA_SHADER_VERTEX);
+      kk_cb_record_program(&cmd->record, &pipe->record);
    }
 
    kk_flush_render_pass(cmd);
@@ -1716,13 +1719,14 @@ kk_predicate_draws(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    return true;
 }
 
-/* Points the draw at the 32-bit heap indices an unroll kernel wrote */
+/* Points the draw at the 32-bit indices and indexed indirect draws an unroll
+ * wrote */
 static void
-kk_set_unrolled_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
-                     enum mesa_prim prim, uint64_t out_draws)
+kk_set_unrolled_draw(struct kk_draw_command *data, enum mesa_prim prim,
+                     struct kk_addr_range indices, uint64_t out_draws)
 {
    data->prim = prim;
-   data->index_buffer = kk_heap_indices(cmd);
+   data->index_buffer = indices;
    data->restart_index = UINT32_MAX;
    data->index_buffer_el_size_B = 4u;
    data->indirect = true;
@@ -1733,11 +1737,84 @@ kk_set_unrolled_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
    data->indirect_command.stride = sizeof(VkDrawIndexedIndirectCommand);
 }
 
+/* Indices of a direct draw without an index buffer the CPU writes: the
+ * unroll kernel ends the render pass (its attachments are stored, loaded
+ * again after it), which here costs more than the draw. */
+#define KK_CPU_UNROLL_MAX_INDICES (1u << 20)
+
+/* Direct draws without an index buffer unroll to indices known at recording,
+ * the same the unroll kernel writes: the decomposed primitives' vertex IDs,
+ * the last vertex rotated first when it is provoking. STEAMAC-G: zink keeps
+ * GL's last provoking vertex, so a flat varying unrolled every such draw, and
+ * the first compositor frame of Steam's web helper ran 12 render passes over
+ * its whole window for 12 rectangles. Returns false to leave the draw to the
+ * kernel. */
+static bool
+kk_unroll_geometry_cpu(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+{
+   if (data->indirect || data->indexed)
+      return false;
+
+   const enum mesa_prim prim = u_decomposed_prim(data->prim);
+   const uint32_t per_prim = mesa_vertices_per_prim(prim);
+   uint32_t total = 0u;
+   for (uint32_t i = 0u; i < data->draw_count; i++) {
+      total += u_decomposed_prims_for_vertices(data->prim,
+                                               data->draws[i].vertexCount) *
+               per_prim;
+      if (total > KK_CPU_UNROLL_MAX_INDICES)
+         return false;
+   }
+
+   struct kk_ptr out_draws = kk_pool_alloc(
+      cmd, data->draw_count * sizeof(VkDrawIndexedIndirectCommand), 4u);
+   struct kk_ptr indices =
+      kk_pool_alloc(cmd, MAX2(total, 1u) * sizeof(uint32_t), 4u);
+   if (unlikely(!out_draws.gpu || !indices.gpu))
+      return false;
+
+   VkDrawIndexedIndirectCommand *draws = out_draws.cpu;
+   uint32_t *out = indices.cpu;
+   uint32_t first = 0u;
+   for (uint32_t i = 0u; i < data->draw_count; i++) {
+      const VkDrawIndirectCommand *in = &data->draws[i];
+      const uint32_t prims =
+         u_decomposed_prims_for_vertices(data->prim, in->vertexCount);
+      for (uint32_t p = 0u; p < prims; p++) {
+         for (uint32_t v = 0u; v < per_prim; v++) {
+            const uint32_t x = poly_output_vertex_id_for_topology(
+               data->prim, data->flatshade_first, true, v);
+            out[first + p * per_prim + x] = poly_vertex_id_for_topology(
+               data->prim, data->flatshade_first, p, v, prims);
+         }
+      }
+      draws[i] = (VkDrawIndexedIndirectCommand){
+         .indexCount = prims * per_prim,
+         .instanceCount = in->instanceCount,
+         .firstIndex = first,
+         .vertexOffset = (int32_t)in->firstVertex,
+         .firstInstance = in->firstInstance,
+      };
+      first += prims * per_prim;
+   }
+
+   kk_set_unrolled_draw(data, prim,
+                        (struct kk_addr_range){
+                           .addr = indices.gpu,
+                           .range = MAX2(total, 1u) * sizeof(uint32_t),
+                        },
+                        out_draws.gpu);
+   return true;
+}
+
 /* Unrolling will always be done through indirect rendering, so if this is
  * called from non-indirect calls, we will fake it. */
 static bool
 kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
+   if (kk_unroll_geometry_cpu(cmd, data))
+      return true;
+
    if (unlikely(!kk_convert_to_indirect_draw(cmd, data)))
       return false;
 
@@ -1769,8 +1846,8 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    libkk_unroll_geometry_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
                                 info);
 
-   kk_set_unrolled_draw(cmd, data, u_decomposed_prim(data->prim),
-                        out_draws.gpu);
+   kk_set_unrolled_draw(data, u_decomposed_prim(data->prim),
+                        kk_heap_indices(cmd), out_draws.gpu);
 
    return true;
 }
@@ -1805,7 +1882,8 @@ kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    libkk_unroll_adjacency_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
                                  info);
 
-   kk_set_unrolled_draw(cmd, data, u_reduced_prim(data->prim), out_draws.gpu);
+   kk_set_unrolled_draw(data, u_reduced_prim(data->prim), kk_heap_indices(cmd),
+                        out_draws.gpu);
 
    return true;
 }
@@ -1890,7 +1968,9 @@ kk_dispatch_draw(struct kk_cmd_buffer *cmd, struct kk_draw_data data)
 {
    mtl_render_encoder *enc = cs_get_render(cmd);
 
+   kk_cb_record_count(&cmd->record.draws);
    if (kk_grid_is_indirect(data.grid)) {
+      kk_cb_record_count(&cmd->record.indirect_draws);
       if (data.index.el_size_B) {
          struct kk_addr_range index_range =
             kk_sanitize_index_range(cmd, data.index.gpu);
@@ -2218,6 +2298,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
    /* First launch the VS and TCS */
 
    mtl_compute_encoder *enc = cs_get_compute(cmd);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_GS_TESS);
    {
       mtl_compute_pipeline_state *pipeline = gfx->pipe->gfx.pre_render[0];
       struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
@@ -2351,6 +2432,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
    uint32_t pre_render_count = pipe->gfx.pre_render_count;
    struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
    mtl_compute_encoder *enc = cs_get_compute(cmd);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_GS_TESS);
 
    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
                                     MTL_STAGE_DISPATCH);

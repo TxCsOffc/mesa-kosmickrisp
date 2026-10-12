@@ -25,6 +25,7 @@ kk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_buffer, src, pCopyBufferInfo->srcBuffer);
    VK_FROM_HANDLE(kk_buffer, dst, pCopyBufferInfo->dstBuffer);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_COPY);
 
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
    for (uint32_t i = 0; i < pCopyBufferInfo->regionCount; i++) {
@@ -90,6 +91,7 @@ kk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_buffer, buffer, pCopyBufferToImageInfo->srcBuffer);
    VK_FROM_HANDLE(kk_image, image, pCopyBufferToImageInfo->dstImage);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_COPY);
 
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
    for (int r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
@@ -120,6 +122,7 @@ kk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_image, image, pCopyImageToBufferInfo->srcImage);
    VK_FROM_HANDLE(kk_buffer, buffer, pCopyImageToBufferInfo->dstBuffer);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_COPY);
 
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
    for (unsigned r = 0; r < pCopyImageToBufferInfo->regionCount; r++) {
@@ -355,6 +358,7 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_image, src, pCopyImageInfo->srcImage);
    VK_FROM_HANDLE(kk_image, dst, pCopyImageInfo->dstImage);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_COPY);
 
    size_t buffer_size = 0u;
 

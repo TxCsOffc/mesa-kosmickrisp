@@ -310,6 +310,9 @@ struct kk_cmd_buffer {
     * one of them holds a reduction sampler at submission, the command buffer
     * is re-recorded. */
    struct util_dynarray minmax_uab_sets;
+
+   /* What the command buffer encoded, for command queue errors (kk_queue) */
+   struct kk_cb_record record;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_cmd_buffer, vk.base, VkCommandBuffer,

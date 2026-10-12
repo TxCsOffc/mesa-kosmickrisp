@@ -209,6 +209,7 @@ kk_CmdFillMemoryKHR(VkCommandBuffer commandBuffer,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    struct kk_meta_save save;
+   kk_cb_record_op(&cmd->record, KK_CB_OP_FILL_UPDATE);
    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE,
                  "meta:vkCmdFillMemoryKHR");
    vk_meta_fill_memory(&cmd->vk, &dev->meta, dstRange, dstFlags, data);
@@ -225,6 +226,7 @@ kk_CmdUpdateMemoryKHR(VkCommandBuffer commandBuffer,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    struct kk_meta_save save;
+   kk_cb_record_op(&cmd->record, KK_CB_OP_FILL_UPDATE);
    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE,
                  "meta:vkCmdUpdateMemoryKHR");
    vk_meta_update_memory(&cmd->vk, &dev->meta, pDstRange, dstFlags, dataSize,
@@ -240,6 +242,7 @@ kk_CmdBlitImage2(VkCommandBuffer commandBuffer,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    struct kk_meta_save save;
+   kk_cb_record_op(&cmd->record, KK_CB_OP_BLIT_IMAGE);
    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS,
                  "meta:vkCmdBlitImage2");
    vk_meta_blit_image2(&cmd->vk, &dev->meta, pBlitImageInfo);
@@ -254,6 +257,7 @@ kk_CmdResolveImage2(VkCommandBuffer commandBuffer,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    struct kk_meta_save save;
+   kk_cb_record_op(&cmd->record, KK_CB_OP_RESOLVE_IMAGE);
    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS,
                  "meta:vkCmdResolveImage2");
    vk_meta_resolve_image2(&cmd->vk, &dev->meta, pResolveImageInfo);
@@ -288,6 +292,7 @@ kk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_CLEAR_ATTACHMENTS);
 
    struct vk_meta_rendering_info render_info;
    kk_meta_init_render(cmd, &render_info);

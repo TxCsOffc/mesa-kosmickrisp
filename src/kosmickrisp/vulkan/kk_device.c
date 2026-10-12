@@ -259,13 +259,18 @@ kk_device_app_name(const struct kk_device *dev, char *name, size_t size)
 
 /* Device creations and destructions in the process: a command queue error
  * logs how long ago the last ones were, which tells whether another guest
- * device came or went right before. */
+ * device came or went right before, and the command buffers of every device
+ * in flight. */
 static struct {
    simple_mtx_t lock;
    uint32_t alive;
    int64_t created_ns, destroyed_ns;
    char created_app[64], destroyed_app[64];
-} kk_device_lifecycle = {.lock = SIMPLE_MTX_INITIALIZER};
+   struct list_head devices;
+} kk_device_lifecycle = {
+   .lock = SIMPLE_MTX_INITIALIZER,
+   .devices = {&kk_device_lifecycle.devices, &kk_device_lifecycle.devices},
+};
 
 static void
 kk_device_note_lifecycle(struct kk_device *dev, bool created)
@@ -279,10 +284,12 @@ kk_device_note_lifecycle(struct kk_device *dev, bool created)
       kk_device_lifecycle.alive++;
       kk_device_lifecycle.created_ns = now;
       memcpy(kk_device_lifecycle.created_app, app, sizeof(app));
+      list_addtail(&dev->lifecycle_link, &kk_device_lifecycle.devices);
    } else {
       kk_device_lifecycle.alive--;
       kk_device_lifecycle.destroyed_ns = now;
       memcpy(kk_device_lifecycle.destroyed_app, app, sizeof(app));
+      list_del(&dev->lifecycle_link);
    }
    const uint32_t alive = kk_device_lifecycle.alive;
    simple_mtx_unlock(&kk_device_lifecycle.lock);
@@ -317,6 +324,16 @@ kk_device_log_lifecycle(void)
                 (now - kk_device_lifecycle.created_ns) / 1e6,
                 kk_device_lifecycle.created_app);
    }
+   simple_mtx_unlock(&kk_device_lifecycle.lock);
+}
+
+void
+kk_device_foreach(void (*cb)(struct kk_device *dev, void *data), void *data)
+{
+   simple_mtx_lock(&kk_device_lifecycle.lock);
+   list_for_each_entry(struct kk_device, dev, &kk_device_lifecycle.devices,
+                       lifecycle_link)
+      cb(dev, data);
    simple_mtx_unlock(&kk_device_lifecycle.lock);
 }
 

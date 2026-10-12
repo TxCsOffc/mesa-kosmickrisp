@@ -8,6 +8,7 @@
 #ifndef KK_SHADER_H
 #define KK_SHADER_H 1
 
+#include "kk_cb_record.h"
 #include "kk_device_memory.h"
 #include "kk_private.h"
 
@@ -143,6 +144,8 @@ struct kk_pipeline_handles {
       } gfx;
       mtl_compute_pipeline_state *cs;
    };
+   /* MSL hashes and features command buffer records name it by */
+   struct kk_cb_program record;
 };
 
 struct msl_compile_data {

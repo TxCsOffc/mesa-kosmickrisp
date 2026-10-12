@@ -20,14 +20,6 @@ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
 {
 }
 
-void
-mtl_log_recent_gpu_errors(double seconds, unsigned max_lines,
-                          void (*cb)(const char *sender, const char *message,
-                                     void *data),
-                          void *data)
-{
-}
-
 /* MTL4CommandQueue */
 mtl_command_queue *
 mtl_new_command_queue(mtl_device *device)

@@ -43,6 +43,8 @@ clear_image(struct kk_cmd_buffer *cmd, struct kk_image *image,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    ASSERTED VkResult result;
 
+   kk_cb_record_op(&cmd->record, KK_CB_OP_CLEAR_IMAGE);
+
    for (uint32_t r = 0; r < range_count; r++) {
       const uint32_t level_count =
          vk_image_subresource_level_count(&image->vk, &ranges[r]);

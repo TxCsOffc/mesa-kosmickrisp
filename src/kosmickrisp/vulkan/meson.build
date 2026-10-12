@@ -56,6 +56,8 @@ kk_files = files(
   'kk_buffer_view.c',
   'kk_buffer.h',
   'kk_buffer.c',
+  'kk_cb_record.h',
+  'kk_cb_record.c',
   'kk_cmd_buffer.h',
   'kk_cmd_buffer.c',
   'kk_cmd_clear.c',

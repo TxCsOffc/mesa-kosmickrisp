@@ -54,7 +54,7 @@ mtl_bridge_dependencies = [
 if host_machine.system() == 'darwin'
   mtl_bridge_dependencies += dependency(
     'appleframeworks',
-    modules : ['Foundation', 'OSLog']
+    modules : ['Foundation']
   )
 endif
 

@@ -8,7 +8,6 @@
 
 #include <Metal/MTLDevice.h>
 #include <Metal/MTLCommandQueue.h>
-#include <OSLog/OSLog.h>
 
 #include <mach/mach_time.h>
 
@@ -65,43 +64,6 @@ mtl_commit_options_add_feedback_handler(mtl_commit_options *options,
             callback(&feedback_data);
          }
       }];
-   }
-}
-
-void
-mtl_log_recent_gpu_errors(double seconds, unsigned max_lines,
-                          void (*cb)(const char *sender, const char *message,
-                                     void *data),
-                          void *data)
-{
-   @autoreleasepool {
-      NSError *error = nil;
-      OSLogStore *store =
-         [OSLogStore storeWithScope:OSLogStoreCurrentProcessIdentifier
-                              error:&error];
-      if (!store)
-         return;
-      OSLogPosition *position =
-         [store positionWithDate:[NSDate dateWithTimeIntervalSinceNow:-seconds]];
-      NSPredicate *predicate = [NSPredicate
-         predicateWithFormat:@"messageType == error OR messageType == fault"];
-      OSLogEnumerator *entries =
-         [store entriesEnumeratorWithOptions:0
-                                    position:position
-                                   predicate:predicate
-                                       error:&error];
-      unsigned lines = 0u;
-      for (OSLogEntry *entry in entries) {
-         if (![entry isKindOfClass:[OSLogEntryLog class]])
-            continue;
-         NSString *sender = ((OSLogEntryLog *)entry).sender;
-         if (![sender containsString:@"Metal"] &&
-             ![sender containsString:@"IOGPU"] && ![sender hasPrefix:@"AGX"])
-            continue;
-         cb(sender.UTF8String, entry.composedMessage.UTF8String, data);
-         if (++lines == max_lines)
-            break;
-      }
    }
 }
 

@@ -1060,8 +1060,13 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
    ralloc_steal(NULL, (void *)entrypoint_name);
    data->entrypoint_name = (char *)entrypoint_name;
 
-   if (KK_DEBUG(MSL))
-      mesa_logi("%s\n", data->code);
+   if (KK_DEBUG(MSL)) {
+      /* The hash command buffer records name it by (kk_cb_record) */
+      uint32_t hash;
+      uint8_t features;
+      kk_msl_digest(data->code, &hash, &features);
+      mesa_logi("kk: MSL %08x %s:\n%s\n", hash, entrypoint_name, data->code);
+   }
 
    ralloc_free(nir);
 }
@@ -1964,6 +1969,52 @@ kk_build_shaders(struct kk_device *dev, uint32_t shader_count,
    return VK_SUCCESS;
 }
 
+static void
+kk_digest_msl(struct kk_cb_program *record,
+              const struct msl_compile_data *data, int slot)
+{
+   if (data->code == NULL)
+      return;
+   uint32_t hash;
+   uint8_t features;
+   kk_msl_digest(data->code, &hash, &features);
+   kk_msl_note_excerpt(hash, features, data->code);
+   if (slot >= 0)
+      record->hash[slot] = hash;
+   record->features |= features;
+}
+
+/* STEAMAC-G: the MSL hashes and features command buffer records name a
+ * program by: its kernel, or its Metal vertex function (the stage before the
+ * FS) and FS, with the features of the compute passes before it. */
+static void
+kk_digest_program(struct kk_shader *s)
+{
+   struct kk_cb_program *record = &s->pipeline.record;
+   *record = (struct kk_cb_program){
+      .compute = s->info.stage == MESA_SHADER_COMPUTE,
+   };
+   if (record->compute) {
+      kk_digest_msl(record, &s->msl_data[MESA_SHADER_COMPUTE], 0);
+      return;
+   }
+
+   const uint32_t pre = s->info.vs.additional_stages_bits &
+                        ~BITFIELD_BIT(MESA_SHADER_FRAGMENT);
+   const mesa_shader_stage vs_stage =
+      pre ? (mesa_shader_stage)(util_last_bit(pre) - 1u) : MESA_SHADER_VERTEX;
+   record->pre_render = pre != 0u;
+   kk_digest_msl(record, &s->msl_data[vs_stage], 0);
+   kk_digest_msl(record, &s->msl_data[MESA_SHADER_FRAGMENT], 1);
+   u_foreach_bit(stage, pre | BITFIELD_BIT(MESA_SHADER_VERTEX)) {
+      if (stage != vs_stage)
+         kk_digest_msl(record, &s->msl_data[stage], -1);
+   }
+   kk_digest_msl(record, &s->gs_main, -1);
+   kk_digest_msl(record, &s->gs_count, -1);
+   kk_digest_msl(record, &s->pre_gs, -1);
+}
+
 /* Creates the Metal pipelines of a program (its VS or CS). */
 static VkResult
 kk_compile_program(struct kk_device *dev, struct kk_shader *s)
@@ -1979,8 +2030,10 @@ kk_compile_program(struct kk_device *dev, struct kk_shader *s)
    } else {
       result = kk_compile_graphics_pipeline(dev, s);
    }
-   if (result == VK_SUCCESS)
+   if (result == VK_SUCCESS) {
+      kk_digest_program(s);
       p_atomic_set(&s->pipeline_ready, true);
+   }
    return result;
 }
 

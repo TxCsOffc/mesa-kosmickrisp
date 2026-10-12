@@ -21,6 +21,9 @@
 
 #include "vk_cmd_queue.h"
 
+#include <ctype.h>
+#include <string.h>
+
 struct kk_commit_data {
    struct kk_queue *queue;
    struct kk_cmd_buffer *cmd;
@@ -44,17 +47,140 @@ kk_queue_release_cmd_buffer_locked(struct kk_queue *queue,
    util_dynarray_append(&queue->free_cmd_buffers, &cmd->vk);
 }
 
+/* The IOGPU reason of a command queue error, from its userInfo
+ * ("... (00000003:kIOGPUCommandBufferCallbackErrorHang) ..." gives "Hang"),
+ * else the Metal error; "ok" without an error. */
 static void
-kk_queue_log_gpu_error(const char *sender, const char *message, void *data)
+kk_queue_feedback_outcome(const struct mtl_feedback_data *data, char *out,
+                          size_t size)
 {
-   mesa_loge("kk: os_log %s: %s", sender, message);
+   static const char reason[] = "kIOGPUCommandBufferCallbackError";
+
+   if (data->error == MTL_COMMAND_QUEUE_ERROR_NONE) {
+      snprintf(out, size, "ok");
+      return;
+   }
+   const char *at = data->error_info ? strstr(data->error_info, reason) : NULL;
+   size_t n = 0u;
+   if (at) {
+      at += sizeof(reason) - 1u;
+      for (; n + 1u < size && isalnum((unsigned char)at[n]); n++)
+         out[n] = at[n];
+   }
+   if (n)
+      out[n] = '\0';
+   else
+      snprintf(out, size, "%s", mtl_command_queue_error_to_string(data->error));
+}
+
+/* A commit's GPU time relative to the failed command buffer's start */
+static void
+kk_queue_format_gpu_time(const struct kk_queue_record *r, double failed_start,
+                         char *out, size_t size)
+{
+   if (r->gpu_start <= 0.0)
+      snprintf(out, size, "never started");
+   else if (failed_start <= 0.0)
+      snprintf(out, size, "ran %.1f ms", (r->gpu_end - r->gpu_start) * 1000.0);
+   else if (r->gpu_end < r->gpu_start || r->gpu_end - r->gpu_start > 1000.0)
+      snprintf(out, size, "started %+.1f ms, no end",
+               (r->gpu_start - failed_start) * 1000.0);
+   else
+      snprintf(out, size, "%+.1f to %+.1f ms",
+               (r->gpu_start - failed_start) * 1000.0,
+               (r->gpu_end - failed_start) * 1000.0);
+}
+
+#define KK_QUEUE_IN_FLIGHT_LINES 24u
+#define KK_QUEUE_IN_FLIGHT_WAIT_NS (300ll * 1000 * 1000)
+
+struct kk_queue_in_flight {
+   const struct kk_device *failed_dev;
+   uint64_t failed_seq;
+   /* GPU start of the failed command buffer, its feedback (host seconds) */
+   double failed_start, failed_feedback;
+   int64_t now;
+   unsigned pending, lines, skipped, hangs;
+   struct kk_cb_record hang[2];
+};
+
+/* Commits of the process other than the failed one that were on the GPU
+ * with it: still awaiting feedback, failed, or ran while it did. */
+static bool
+kk_queue_record_in_flight(const struct kk_queue_record *r,
+                          const struct kk_device *dev,
+                          const struct kk_queue_in_flight *s)
+{
+   if (r->seq == 0u || r->commit_ns > s->now ||
+       (dev == s->failed_dev && r->seq == s->failed_seq))
+      return false;
+   if (!r->done || strcmp(r->outcome, "ok"))
+      return true;
+   return r->gpu_end >= s->failed_start && r->gpu_start <= s->failed_feedback;
+}
+
+static void
+kk_queue_count_in_flight(struct kk_device *dev, void *data)
+{
+   struct kk_queue_in_flight *s = data;
+   if (!dev->has_queue)
+      return;
+   mtx_lock(&dev->queue.mutex);
+   for (uint32_t i = 0u; i < KK_QUEUE_RECORDS; i++) {
+      const struct kk_queue_record *r = &dev->queue.records[i];
+      s->pending += !r->done && kk_queue_record_in_flight(r, dev, s);
+   }
+   mtx_unlock(&dev->queue.mutex);
+}
+
+static void
+kk_queue_log_in_flight(struct kk_device *dev, void *data)
+{
+   struct kk_queue_in_flight *s = data;
+   if (!dev->has_queue)
+      return;
+   char app[64];
+   kk_device_app_name(dev, app, sizeof(app));
+
+   struct kk_queue *queue = &dev->queue;
+   mtx_lock(&queue->mutex);
+   for (uint32_t k = 1u; k <= KK_QUEUE_RECORDS; k++) {
+      const struct kk_queue_record *r =
+         &queue->records[(queue->commit_seq + k) % KK_QUEUE_RECORDS];
+      if (!kk_queue_record_in_flight(r, dev, s))
+         continue;
+      if (s->lines == KK_QUEUE_IN_FLIGHT_LINES) {
+         s->skipped++;
+         continue;
+      }
+      s->lines++;
+      char text[448], gpu[48];
+      kk_cb_record_format(&r->cb, text, sizeof(text));
+      if (r->done) {
+         kk_queue_format_gpu_time(r, s->failed_start, gpu, sizeof(gpu));
+         mesa_loge("kk: with it: command buffer %" PRIu64 " of %s, %s, GPU "
+                   "%s: %s",
+                   r->seq, app, r->outcome, gpu, text);
+      } else {
+         mesa_loge("kk: with it: command buffer %" PRIu64 " of %s, no "
+                   "feedback, committed %.1f ms ago: %s",
+                   r->seq, app, (s->now - r->commit_ns) / 1e6, text);
+      }
+      if (!strcmp(r->outcome, "Hang") && s->hangs < ARRAY_SIZE(s->hang))
+         s->hang[s->hangs++] = r->cb;
+   }
+   mtx_unlock(&queue->mutex);
 }
 
 /* STEAMAC-G: a command queue error has to tell GPU work that ran too long
  * from a command buffer that never started (a semaphore wait, the GPU busy
- * elsewhere) and name what came right before: the queue's last completed
- * work and the last guest device created or destroyed in the process. Never
- * signalled semaphore waits submitted before their signal are listed. */
+ * elsewhere), name what the command buffer contained and what came right
+ * before: the queue's last completed work and the last guest device created
+ * or destroyed in the process. Never signalled semaphore waits submitted
+ * before their signal are listed. The first error in the process also names
+ * every command buffer of the process that was on the GPU with it and their
+ * outcome: GPU recovery fails all of them, the one that hung with "Hang", the
+ * others as innocent victims. */
 static void
 kk_queue_log_failure(struct kk_queue *queue,
                      const struct mtl_feedback_data *data)
@@ -68,6 +194,12 @@ kk_queue_log_failure(struct kk_queue *queue,
    const uint64_t committed = queue->commit_seq;
    const uint32_t awaiting = queue->feedbacks_pending;
    const double last_gpu_end = queue->last_gpu_end;
+   const struct kk_queue_record *record =
+      &queue->records[data->tag % KK_QUEUE_RECORDS];
+   const bool recorded = record->seq == data->tag;
+   const struct kk_cb_record cb = record->cb;
+   char outcome[sizeof(record->outcome)];
+   memcpy(outcome, record->outcome, sizeof(outcome));
    mtx_unlock(&queue->mutex);
 
    mesa_loge("kk: command buffer %" PRIu64 " of %s failed %.1f ms after its "
@@ -94,7 +226,13 @@ kk_queue_log_failure(struct kk_queue *queue,
    } else {
       mesa_loge("kk: no command buffer of the queue completed before");
    }
-   if (data->error_info)
+   if (recorded) {
+      char text[448];
+      kk_cb_record_format(&cb, text, sizeof(text));
+      mesa_loge("kk: it failed with %s and had %s", outcome, text);
+   }
+   if (data->error_info && !(recorded && strcmp(outcome, "ok") &&
+                             strstr(data->error_info, outcome)))
       mesa_loge("kk: Metal error info: %s", data->error_info);
 
    mtx_lock(&queue->mutex);
@@ -115,11 +253,42 @@ kk_queue_log_failure(struct kk_queue *queue,
 
    kk_device_log_lifecycle();
 
-   /* Once per process: reading os_log takes about a second, and the first
-    * failure names the cause (later ones are often its victims). */
-   static bool os_log_read;
-   if (!p_atomic_xchg(&os_log_read, true))
-      mtl_log_recent_gpu_errors(10.0, 16u, kk_queue_log_gpu_error, NULL);
+   /* Once per process: the first error names the cause, later ones are
+    * mostly its victims. The other command buffers' feedback comes on other
+    * threads: wait a little for their outcome. */
+   static bool first_logged;
+   if (p_atomic_xchg(&first_logged, true))
+      return;
+   struct kk_queue_in_flight s = {
+      .failed_dev = dev,
+      .failed_seq = data->tag,
+      .failed_start = data->gpu_start,
+      .failed_feedback = data->feedback_time,
+      .now = now,
+   };
+   const int64_t deadline = now + KK_QUEUE_IN_FLIGHT_WAIT_NS;
+   do {
+      s.pending = 0u;
+      kk_device_foreach(kk_queue_count_in_flight, &s);
+      if (s.pending == 0u)
+         break;
+      os_time_sleep(5000);
+   } while (os_time_get_nano() < deadline);
+
+   kk_device_foreach(kk_queue_log_in_flight, &s);
+   if (s.skipped)
+      mesa_loge("kk: with it: %u more command buffers", s.skipped);
+   else if (s.lines == 0u)
+      mesa_loge("kk: no other command buffer of the process was on the GPU "
+                "with it");
+
+   /* The MSL of programs that could spin or wait, of the command buffers
+    * that hung or else of the failed one */
+   unsigned excerpts = 0u;
+   for (unsigned i = 0u; i < s.hangs; i++)
+      excerpts += kk_cb_record_log_excerpts(&s.hang[i], 3u - excerpts);
+   if (recorded && excerpts < 3u)
+      kk_cb_record_log_excerpts(&cb, 3u - excerpts);
 }
 
 /* MESA_KK_DEBUG=commits */
@@ -140,11 +309,45 @@ kk_queue_log_slow_commit(struct kk_queue *queue,
              data->tag, app, delay_ms, gpu_ms, feedback_ms);
 }
 
+/* The commit's outcome, for kk_queue_log_failure and MESA_KK_DEBUG=cbs */
+static void
+kk_queue_note_feedback(struct kk_queue *queue,
+                       const struct mtl_feedback_data *data)
+{
+   struct kk_queue_record *record =
+      &queue->records[data->tag % KK_QUEUE_RECORDS];
+   char outcome[sizeof(record->outcome)];
+   kk_queue_feedback_outcome(data, outcome, sizeof(outcome));
+
+   mtx_lock(&queue->mutex);
+   const bool recorded = record->seq == data->tag;
+   if (recorded) {
+      memcpy(record->outcome, outcome, sizeof(outcome));
+      record->gpu_start = data->gpu_start;
+      record->gpu_end = data->gpu_end;
+      record->done = true;
+   }
+   const struct kk_cb_record cb = record->cb;
+   mtx_unlock(&queue->mutex);
+
+   if (KK_DEBUG(CBS) && recorded) {
+      char app[64], text[448];
+      kk_device_app_name(kk_queue_device(queue), app, sizeof(app));
+      kk_cb_record_format(&cb, text, sizeof(text));
+      mesa_logi("kk: command buffer %" PRIu64 " of %s: %s, started %.2f ms "
+                "after its commit, %.2f ms on the GPU: %s",
+                data->tag, app, outcome,
+                (data->gpu_start - data->commit_time) * 1000.0,
+                (data->gpu_end - data->gpu_start) * 1000.0, text);
+   }
+}
+
 static void
 kk_queue_check_feedback(struct kk_queue *queue, struct mtl_feedback_data *data)
 {
    struct kk_device *dev = kk_queue_device(queue);
 
+   kk_queue_note_feedback(queue, data);
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
       kk_queue_log_failure(queue, data);
       vk_device_set_lost(
@@ -241,6 +444,13 @@ kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
    mtx_lock(&queue->mutex);
    const uint64_t seq = ++queue->commit_seq;
    queue->feedbacks_pending++;
+   struct kk_queue_record *record = &queue->records[seq % KK_QUEUE_RECORDS];
+   record->seq = seq;
+   record->commit_ns = os_time_get_nano();
+   record->done = false;
+   record->outcome[0] = '\0';
+   record->gpu_start = record->gpu_end = 0.0;
+   record->cb = cmd->record;
    mtx_unlock(&queue->mutex);
 
    mtl_commit_options *options = mtl_new_commit_options();
@@ -451,6 +661,7 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
 
    queue->free_cmd_buffers = UTIL_DYNARRAY_INIT;
    memset(queue->pending_waits, 0, sizeof(queue->pending_waits));
+   memset(queue->records, 0, sizeof(queue->records));
    queue->pending_wait_next = 0;
    queue->commits_in_flight = 0u;
    queue->feedbacks_pending = 0u;

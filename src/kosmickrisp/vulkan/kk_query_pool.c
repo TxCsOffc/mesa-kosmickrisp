@@ -387,6 +387,7 @@ kk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_QUERY_RESET);
 
    assert(cmd->metal.render == NULL);
 
@@ -461,6 +462,7 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_TIMESTAMP);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    assert(kk_pool_is_ts(pool) && pool->ts.chunks);
 
@@ -526,6 +528,7 @@ kk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_QUERY);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    /* GS emulation adds to this query until it ends. */
@@ -683,6 +686,7 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   kk_cb_record_op(&cmd->record, KK_CB_OP_QUERY_COPY);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    /* Timestamp results are resolved into the pool BO on a deferred command
