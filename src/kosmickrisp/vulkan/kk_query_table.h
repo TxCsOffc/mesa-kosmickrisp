@@ -62,36 +62,44 @@ void kk_query_table_remove(struct kk_device *dev, struct kk_query_table *table,
  * pass writes the chunk of its active query; a query of another chunk
  * restarts the Metal render pass with that chunk (kk_flush_render_pass).
  * Pools of up to one chunk get their queries from a single chunk.
+ *
+ * KK_OQ_MAX_CHUNKS only sizes the chunk table libkk reads (32 KB): 4096
+ * chunks are 2^27 queries and 32 GB of results, so device memory runs out
+ * first. 16 chunks (524288 queries) let a device have only 128 of
+ * vkd3d-proton's occlusion query pools of 4096 at a time.
  */
-#define KK_OQ_MAX_CHUNKS 16u
+#define KK_OQ_MAX_CHUNKS 4096u
 
 struct kk_oq_chunk {
    struct kk_bo *bo;
    uint32_t next;       /**< Queries below `next` were allocated before */
    uint32_t free_count; /**< Entries of `free` */
-   uint32_t *free;      /**< Freed queries (chunk-local) */
+   uint32_t free[];     /**< Freed queries (chunk-local) */
 };
 
 struct kk_oq_heap {
    simple_mtx_t mutex;
    uint32_t chunk_count;
-   struct kk_oq_chunk chunks[KK_OQ_MAX_CHUNKS];
+   /* Created chunks; an entry never changes once set, so recording reads it
+    * without the mutex. */
+   struct kk_oq_chunk *chunks[KK_OQ_MAX_CHUNKS];
    /* GPU addresses of the chunks (uint64_t each), for libkk's query kernels */
    struct kk_bo *chunk_table;
 };
 
 VkResult kk_oq_heap_init(struct kk_device *dev, struct kk_oq_heap *heap);
 void kk_oq_heap_finish(struct kk_device *dev, struct kk_oq_heap *heap);
-/* Allocates `count` zeroed queries into `indices` (all or none). */
+/* Allocates `count` zeroed queries into `indices` (all or none). On failure
+ * `why` names the reason. */
 VkResult kk_oq_heap_alloc(struct kk_device *dev, struct kk_oq_heap *heap,
-                          uint32_t count, uint32_t *indices);
+                          uint32_t count, uint32_t *indices, const char **why);
 void kk_oq_heap_free(struct kk_oq_heap *heap, const uint32_t *indices,
                      uint32_t count);
 
 static inline struct kk_bo *
 kk_oq_heap_chunk_bo(struct kk_oq_heap *heap, uint32_t index)
 {
-   return heap->chunks[index / KK_OQ_CHUNK_QUERIES].bo;
+   return heap->chunks[index / KK_OQ_CHUNK_QUERIES]->bo;
 }
 
 #endif /* KK_QUERY_TABLE_H */

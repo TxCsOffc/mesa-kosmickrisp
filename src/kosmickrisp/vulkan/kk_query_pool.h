@@ -17,14 +17,7 @@
  */
 #define KK_TS_HEAP_MAX_ENTRIES 4096u
 
-struct kk_ts_state {
-   /* Chunks of the process' shared Metal 4 counter heaps backing a
-    * VK_QUERY_TYPE_TIMESTAMP pool (kk_ts_slots in kk_query_pool.c): query q
-    * is entry q % KK_TS_CHUNK of chunk chunks[q / KK_TS_CHUNK]. Timestamps
-    * are sampled there and later resolved into `bo`. */
-   uint16_t *chunks;
-   uint32_t chunk_count;
-};
+struct kk_cmd_buffer;
 
 struct kk_oq_state {
    unsigned queries;
@@ -39,15 +32,16 @@ struct kk_query_pool {
    uint32_t query_start;
    uint32_t query_stride;
 
-   union {
-      struct kk_ts_state ts;
-      struct kk_oq_state oq;
-   };
+   struct kk_oq_state oq;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_query_pool, vk.base, VkQueryPool,
                                VK_OBJECT_TYPE_QUERY_POOL)
 
 uint32_t *kk_pool_index_ptr(const struct kk_query_pool *pool);
+
+/* Gives the timestamp counter heap entries a command buffer recorded samples
+ * into back to the process (reset/free). */
+void kk_cmd_release_timestamps(struct kk_cmd_buffer *cmd);
 
 #endif /* KK_QUERY_POOL_H */

@@ -241,7 +241,8 @@ kk_query_table_remove(struct kk_device *dev, struct kk_query_table *table,
 }
 
 static VkResult kk_oq_heap_add_chunk_locked(struct kk_device *dev,
-                                            struct kk_oq_heap *heap);
+                                            struct kk_oq_heap *heap,
+                                            const char **why);
 
 VkResult
 kk_oq_heap_init(struct kk_device *dev, struct kk_oq_heap *heap)
@@ -259,7 +260,8 @@ kk_oq_heap_init(struct kk_device *dev, struct kk_oq_heap *heap)
    memset(heap->chunk_table->cpu, 0, KK_OQ_MAX_CHUNKS * sizeof(uint64_t));
 
    /* Render passes always have chunk 0 as visibility buffer to start with */
-   result = kk_oq_heap_add_chunk_locked(dev, heap);
+   const char *why;
+   result = kk_oq_heap_add_chunk_locked(dev, heap, &why);
    if (result != VK_SUCCESS) {
       kk_oq_heap_finish(dev, heap);
       return result;
@@ -271,8 +273,8 @@ void
 kk_oq_heap_finish(struct kk_device *dev, struct kk_oq_heap *heap)
 {
    for (uint32_t c = 0; c < heap->chunk_count; c++) {
-      kk_destroy_bo(dev, heap->chunks[c].bo);
-      vk_free(&dev->vk.alloc, heap->chunks[c].free);
+      kk_destroy_bo(dev, heap->chunks[c]->bo);
+      vk_free(&dev->vk.alloc, heap->chunks[c]);
    }
    if (heap->chunk_table)
       kk_destroy_bo(dev, heap->chunk_table);
@@ -286,39 +288,44 @@ kk_oq_chunk_available(const struct kk_oq_chunk *chunk)
 }
 
 static VkResult
-kk_oq_heap_add_chunk_locked(struct kk_device *dev, struct kk_oq_heap *heap)
+kk_oq_heap_add_chunk_locked(struct kk_device *dev, struct kk_oq_heap *heap,
+                            const char **why)
 {
-   if (heap->chunk_count == KK_OQ_MAX_CHUNKS)
-      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                       "out of occlusion queries (%u chunks of %u)",
-                       KK_OQ_MAX_CHUNKS, KK_OQ_CHUNK_QUERIES);
+   STATIC_ASSERT(KK_OQ_MAX_CHUNKS == 4096 && KK_OQ_CHUNK_QUERIES == 32768);
+   if (heap->chunk_count == KK_OQ_MAX_CHUNKS) {
+      *why = "out of occlusion query chunks (4096 of 32768 queries)";
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
 
-   struct kk_oq_chunk *chunk = &heap->chunks[heap->chunk_count];
+   struct kk_oq_chunk *chunk =
+      vk_alloc(&dev->vk.alloc,
+               sizeof(*chunk) + KK_OQ_CHUNK_QUERIES * sizeof(chunk->free[0]),
+               8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (chunk == NULL) {
+      *why = "out of host memory for an occlusion query chunk";
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
    VkResult result =
       kk_alloc_bo(dev, &dev->vk.base, KK_OQ_CHUNK_QUERIES * sizeof(uint64_t),
                   256, &chunk->bo);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      vk_free(&dev->vk.alloc, chunk);
+      *why = "visibility result buffer allocation failed";
       return result;
-
-   chunk->free = vk_alloc(&dev->vk.alloc, KK_OQ_CHUNK_QUERIES * sizeof(uint32_t),
-                          4, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
-   if (chunk->free == NULL) {
-      kk_destroy_bo(dev, chunk->bo);
-      chunk->bo = NULL;
-      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
    chunk->next = 0;
    chunk->free_count = 0;
 
    ((uint64_t *)heap->chunk_table->cpu)[heap->chunk_count] = chunk->bo->gpu;
-   heap->chunk_count++;
+   heap->chunks[heap->chunk_count++] = chunk;
    return VK_SUCCESS;
 }
 
 static uint32_t
 kk_oq_chunk_take(struct kk_oq_heap *heap, uint32_t c)
 {
-   struct kk_oq_chunk *chunk = &heap->chunks[c];
+   struct kk_oq_chunk *chunk = heap->chunks[c];
    uint32_t local =
       chunk->free_count ? chunk->free[--chunk->free_count] : chunk->next++;
    ((uint64_t *)chunk->bo->cpu)[local] = 0;
@@ -327,39 +334,38 @@ kk_oq_chunk_take(struct kk_oq_heap *heap, uint32_t c)
 
 VkResult
 kk_oq_heap_alloc(struct kk_device *dev, struct kk_oq_heap *heap,
-                 uint32_t count, uint32_t *indices)
+                 uint32_t count, uint32_t *indices, const char **why)
 {
    VkResult result = VK_SUCCESS;
 
    simple_mtx_lock(&heap->mutex);
 
-   uint32_t available = 0;
-   for (uint32_t c = 0; c < heap->chunk_count; c++)
-      available += kk_oq_chunk_available(&heap->chunks[c]);
-
    if (count <= KK_OQ_CHUNK_QUERIES) {
       /* One chunk, so draws of one pool never restart the render pass */
       uint32_t c = 0;
       while (c < heap->chunk_count &&
-             kk_oq_chunk_available(&heap->chunks[c]) < count)
+             kk_oq_chunk_available(heap->chunks[c]) < count)
          c++;
       if (c == heap->chunk_count) {
-         result = kk_oq_heap_add_chunk_locked(dev, heap);
+         result = kk_oq_heap_add_chunk_locked(dev, heap, why);
          if (result != VK_SUCCESS)
             goto unlock;
       }
       for (uint32_t i = 0; i < count; i++)
          indices[i] = kk_oq_chunk_take(heap, c);
    } else {
+      uint32_t available = 0;
+      for (uint32_t c = 0; c < heap->chunk_count; c++)
+         available += kk_oq_chunk_available(heap->chunks[c]);
       while (available < count) {
-         result = kk_oq_heap_add_chunk_locked(dev, heap);
+         result = kk_oq_heap_add_chunk_locked(dev, heap, why);
          if (result != VK_SUCCESS)
             goto unlock;
          available += KK_OQ_CHUNK_QUERIES;
       }
       uint32_t i = 0;
       for (uint32_t c = 0; i < count; c++) {
-         while (i < count && kk_oq_chunk_available(&heap->chunks[c]))
+         while (i < count && kk_oq_chunk_available(heap->chunks[c]))
             indices[i++] = kk_oq_chunk_take(heap, c);
       }
    }
@@ -375,8 +381,7 @@ kk_oq_heap_free(struct kk_oq_heap *heap, const uint32_t *indices,
 {
    simple_mtx_lock(&heap->mutex);
    for (uint32_t i = 0; i < count; i++) {
-      struct kk_oq_chunk *chunk =
-         &heap->chunks[indices[i] / KK_OQ_CHUNK_QUERIES];
+      struct kk_oq_chunk *chunk = heap->chunks[indices[i] / KK_OQ_CHUNK_QUERIES];
       chunk->free[chunk->free_count++] = indices[i] % KK_OQ_CHUNK_QUERIES;
    }
    simple_mtx_unlock(&heap->mutex);

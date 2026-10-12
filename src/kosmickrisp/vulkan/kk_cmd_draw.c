@@ -435,7 +435,7 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    cmd->state.gfx.occlusion.pass_chunk = cmd->state.gfx.occlusion.chunk;
    mtl_render_pass_descriptor_set_visibility_buffer(
       pass_descriptor,
-      dev->occlusion_queries.chunks[cmd->state.gfx.occlusion.chunk].bo->map);
+      dev->occlusion_queries.chunks[cmd->state.gfx.occlusion.chunk]->bo->map);
 
    // TODO_KOSMICKRISP Fragment shading rate support goes here if Metal supports
    // it
@@ -971,7 +971,7 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
       struct kk_device *dev = kk_cmd_buffer_device(cmd);
       mtl_render_pass_descriptor_set_visibility_buffer(
          gfx->render_pass_descriptor,
-         dev->occlusion_queries.chunks[gfx->occlusion.chunk].bo->map);
+         dev->occlusion_queries.chunks[gfx->occlusion.chunk]->bo->map);
       gfx->occlusion.pass_chunk = gfx->occlusion.chunk;
       needs_restart = true;
    }

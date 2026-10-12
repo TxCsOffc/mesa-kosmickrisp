@@ -13,6 +13,7 @@
 #include "kk_entrypoints.h"
 #include "kk_format.h"
 #include "kk_image_view.h"
+#include "kk_query_pool.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/mtl_command_buffer.h"
@@ -70,6 +71,7 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->post_render_writes);
    util_dynarray_clear(&cmd->ts_resolves);
    util_dynarray_clear(&cmd->ts_stage_map);
+   kk_cmd_release_timestamps(cmd);
    util_dynarray_clear(&cmd->minmax_uab_sets);
    kk_cmd_release_cmd_bufs(cmd);
 }
@@ -120,6 +122,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    util_dynarray_fini(&cmd->post_render_writes);
    util_dynarray_fini(&cmd->ts_resolves);
    util_dynarray_fini(&cmd->ts_stage_map);
+   util_dynarray_fini(&cmd->ts_chunks);
    util_dynarray_fini(&cmd->minmax_uab_sets);
    util_dynarray_fini(&cmd->metal.cmd_bufs);
 
@@ -153,6 +156,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
 
    cmd->ts_resolves = UTIL_DYNARRAY_INIT;
    cmd->ts_stage_map = UTIL_DYNARRAY_INIT;
+   cmd->ts_chunks = UTIL_DYNARRAY_INIT;
    cmd->post_render_writes = UTIL_DYNARRAY_INIT;
    cmd->minmax_uab_sets = UTIL_DYNARRAY_INIT;
    cmd->metal.cmd_bufs = UTIL_DYNARRAY_INIT;
