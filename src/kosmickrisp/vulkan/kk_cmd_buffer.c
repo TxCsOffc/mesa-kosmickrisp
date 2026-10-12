@@ -37,6 +37,20 @@ kk_descriptor_state_fini(struct kk_cmd_buffer *cmd,
    }
 }
 
+/* Returns the Metal command buffers of the last recording to the pool, but
+ * cmd_buf (kept for the next one) */
+static void
+kk_cmd_release_cmd_bufs(struct kk_cmd_buffer *cmd)
+{
+   struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
+
+   util_dynarray_foreach(&cmd->metal.cmd_bufs, mtl_command_buffer *, cmd_buf) {
+      if (*cmd_buf != cmd->metal.cmd_buf)
+         kk_cmd_pool_return_cmd_buf(pool, *cmd_buf);
+   }
+   util_dynarray_clear(&cmd->metal.cmd_bufs);
+}
+
 static void
 kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
 {
@@ -57,9 +71,11 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->ts_resolves);
    util_dynarray_clear(&cmd->ts_stage_map);
    util_dynarray_clear(&cmd->minmax_uab_sets);
+   kk_cmd_release_cmd_bufs(cmd);
 }
 
-/* Ends Metal command buffer recording and returns allocator to pool for reuse */
+/* Ends Metal command buffer recording and returns allocators to pool for
+ * reuse */
 static void
 end_recording(struct kk_cmd_buffer *cmd)
 {
@@ -68,8 +84,13 @@ end_recording(struct kk_cmd_buffer *cmd)
 
    cs_end(cmd);
    mtl_end_command_buffer(cmd->metal.cmd_buf);
-   kk_cmd_pool_return_allocator(kk_cmd_buffer_pool(cmd), cmd->metal.allocator);
+   struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
+   kk_cmd_pool_return_allocator(pool, cmd->metal.allocator);
    cmd->metal.allocator = NULL;
+   if (cmd->metal.pre_gfx.allocator) {
+      kk_cmd_pool_return_allocator(pool, cmd->metal.pre_gfx.allocator);
+      cmd->metal.pre_gfx.allocator = NULL;
+   }
 }
 
 static void
@@ -84,6 +105,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
 
    /* Ensure closed command buffer for safe returns to pool */
    end_recording(cmd);
+   kk_cmd_release_cmd_bufs(cmd);
    if (cmd->metal.cmd_buf)
       kk_cmd_pool_return_cmd_buf(pool, cmd->metal.cmd_buf);
    cmd->metal.cmd_buf = NULL;
@@ -99,6 +121,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    util_dynarray_fini(&cmd->ts_resolves);
    util_dynarray_fini(&cmd->ts_stage_map);
    util_dynarray_fini(&cmd->minmax_uab_sets);
+   util_dynarray_fini(&cmd->metal.cmd_bufs);
 
    vk_free(&pool->vk.alloc, cmd);
 }
@@ -132,6 +155,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    cmd->ts_stage_map = UTIL_DYNARRAY_INIT;
    cmd->post_render_writes = UTIL_DYNARRAY_INIT;
    cmd->minmax_uab_sets = UTIL_DYNARRAY_INIT;
+   cmd->metal.cmd_bufs = UTIL_DYNARRAY_INIT;
 
    {
       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
@@ -228,6 +252,9 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
       if (cmd->metal.allocator == NULL)
          goto fail_allocator;
    }
+   kk_cmd_release_cmd_bufs(cmd);
+   util_dynarray_append(&cmd->metal.cmd_bufs, cmd->metal.cmd_buf);
+   cmd->metal.cmd_buf_used = false;
    mtl_begin_command_buffer(cmd->metal.cmd_buf, cmd->metal.allocator);
 
    return VK_SUCCESS;
@@ -275,6 +302,24 @@ kk_encoder_wait_for_sparse_binds(struct kk_cmd_buffer *cmd,
                                      MTL_STAGE_ALL);
 }
 
+/* Ends cmd_buf and continues in a new Metal command buffer (on failure in
+ * cmd_buf, which cmd_buf_used tells) */
+static void
+kk_cmd_next_cmd_buf(struct kk_cmd_buffer *cmd)
+{
+   mtl_command_buffer *next = kk_cmd_pool_get_cmd_buf(kk_cmd_buffer_pool(cmd));
+   if (next == NULL)
+      return;
+
+   mtl_end_command_buffer(cmd->metal.cmd_buf);
+   mtl_begin_command_buffer(next, cmd->metal.allocator);
+   if (cmd->vk.base.object_name)
+      mtl_command_buffer_set_label(next, cmd->vk.base.object_name);
+   util_dynarray_append(&cmd->metal.cmd_bufs, next);
+   cmd->metal.cmd_buf = next;
+   cmd->metal.cmd_buf_used = false;
+}
+
 void
 cs_start_render(struct kk_cmd_buffer *cmd)
 {
@@ -284,6 +329,13 @@ cs_start_render(struct kk_cmd_buffer *cmd)
 
    /* Ensure no other active encoder, aka compute */
    cs_end(cmd);
+
+   /* The render encoder starts a Metal command buffer, so that its pre_gfx
+    * pass can be committed right before it (cs_get_pre_gfx) */
+   if (cmd->metal.cmd_buf_used)
+      kk_cmd_next_cmd_buf(cmd);
+   cmd->metal.render_first = !cmd->metal.cmd_buf_used;
+   cmd->metal.cmd_buf_used = true;
 
    cmd->metal.render = mtl_new_render_command_encoder_with_descriptor(
       cmd->metal.cmd_buf, state->render_pass_descriptor);
@@ -348,6 +400,7 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
 
    if (cmd->metal.compute == NULL) {
       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
+      cmd->metal.cmd_buf_used = true;
       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
       kk_encoder_update_debug(cmd, cmd->metal.compute);
       kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.compute);
@@ -355,6 +408,71 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
    }
 
    return cmd->metal.compute;
+}
+
+/* The compute encoder of pre_gfx work (kk_dispatch_precomp): while a render
+ * encoder is open, a compute pass in a Metal command buffer of its own that
+ * cs_end commits right before the render encoder's, which starts with it
+ * (cs_start_render). The render encoder goes on, where ending it for a compute
+ * pass would store its attachments and load them again after (STEAMAC-G: the
+ * unroll kernel of every indexed draw with a flat varying and the last vertex
+ * provoking did, the web helper's frames ran up to 37 render passes). Other
+ * work, and work outside render passes, uses cs_get_compute. */
+mtl_compute_encoder *
+cs_get_pre_gfx(struct kk_cmd_buffer *cmd)
+{
+   if (!cmd->metal.render || !cmd->metal.render_first)
+      return cs_get_compute(cmd);
+
+   if (cmd->metal.pre_gfx.compute == NULL) {
+      struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
+      if (cmd->metal.pre_gfx.allocator == NULL)
+         cmd->metal.pre_gfx.allocator = kk_cmd_pool_get_allocator(pool);
+      mtl_command_buffer *cmd_buf = kk_cmd_pool_get_cmd_buf(pool);
+      if (cmd->metal.pre_gfx.allocator == NULL || cmd_buf == NULL) {
+         if (cmd_buf)
+            kk_cmd_pool_return_cmd_buf(pool, cmd_buf);
+         return cs_get_compute(cmd);
+      }
+
+      mtl_begin_command_buffer(cmd_buf, cmd->metal.pre_gfx.allocator);
+      if (cmd->vk.base.object_name)
+         mtl_command_buffer_set_label(cmd_buf, cmd->vk.base.object_name);
+      mtl_compute_encoder *encoder = mtl_new_compute_command_encoder(cmd_buf);
+      mtl_compute_set_argument_table(encoder, cmd->argument_table);
+      kk_encoder_update_debug(cmd, encoder);
+      kk_encoder_wait_for_sparse_binds(cmd, encoder);
+      kk_cb_record_count(&cmd->record.compute_encoders);
+      cmd->metal.pre_gfx.cmd_buf = cmd_buf;
+      cmd->metal.pre_gfx.compute = encoder;
+   }
+
+   return cmd->metal.pre_gfx.compute;
+}
+
+/* Ends the pre_gfx pass of the render encoder that ended, committed before
+ * the render encoder's Metal command buffer (cmd_buf, which it starts) */
+static void
+end_pre_gfx(struct kk_cmd_buffer *cmd)
+{
+   if (cmd->metal.pre_gfx.compute == NULL)
+      return;
+
+   mtl_barrier_after_stages(cmd->metal.pre_gfx.compute, MTL_STAGE_ALL,
+                            MTL_STAGE_ALL);
+   mtl_end_encoding(cmd->metal.pre_gfx.compute);
+   mtl_release(cmd->metal.pre_gfx.compute);
+   mtl_end_command_buffer(cmd->metal.pre_gfx.cmd_buf);
+
+   util_dynarray_append(&cmd->metal.cmd_bufs, cmd->metal.cmd_buf);
+   mtl_command_buffer **cmd_bufs =
+      util_dynarray_begin(&cmd->metal.cmd_bufs);
+   const unsigned count =
+      util_dynarray_num_elements(&cmd->metal.cmd_bufs, mtl_command_buffer *);
+   cmd_bufs[count - 2u] = cmd->metal.pre_gfx.cmd_buf;
+
+   cmd->metal.pre_gfx.cmd_buf = NULL;
+   cmd->metal.pre_gfx.compute = NULL;
 }
 
 static void
@@ -399,6 +517,10 @@ cs_end(struct kk_cmd_buffer *cmd)
    if (cmd->metal.render) {
       end_encoder(cmd, cmd->metal.render);
       cmd->metal.render = NULL;
+      end_pre_gfx(cmd);
+
+      /* The render encoder's draws are done with the geometry heap */
+      cmd->uses_heap = false;
 
       /* The stage map is only valid for the current render encoder */
       util_dynarray_clear(&cmd->ts_stage_map);
@@ -834,7 +956,8 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
    struct kk_precompiled_shader *prog = &dev->precompiled_cache.shaders[idx];
    cmd->record.precomp |= BITFIELD_BIT(idx);
 
-   mtl_compute_encoder *encoder = cs_get_compute(cmd);
+   mtl_compute_encoder *encoder =
+      pre_gfx ? cs_get_pre_gfx(cmd) : cs_get_compute(cmd);
    mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
                                     MTL_STAGE_DISPATCH);
 

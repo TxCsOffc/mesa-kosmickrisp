@@ -262,9 +262,26 @@ struct kk_cmd_buffer {
 
    struct {
       mtl_command_allocator *allocator;
+      /* The Metal command buffer being encoded, the last of cmd_bufs */
       mtl_command_buffer *cmd_buf;
+      /* Metal command buffers of the recording in commit order. A render
+       * encoder starts one of its own (cs_start_render), so that its pre_gfx
+       * pass can be committed right before it. */
+      struct util_dynarray cmd_bufs;
+      /* cmd_buf has an encoder */
+      bool cmd_buf_used;
+      /* The open render encoder is the first encoder of cmd_buf */
+      bool render_first;
       mtl_render_encoder *render;
       mtl_compute_encoder *compute;
+      /* Compute pass of pre_gfx dispatches recorded while the render encoder
+       * is open (kk_dispatch_precomp): a Metal command buffer of its own,
+       * committed before the render encoder's. */
+      struct {
+         mtl_command_allocator *allocator;
+         mtl_command_buffer *cmd_buf;
+         mtl_compute_encoder *compute;
+      } pre_gfx;
    } metal;
    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
    struct util_dynarray ts_resolves;
@@ -294,7 +311,8 @@ struct kk_cmd_buffer {
    /* Owned large BOs */
    struct util_dynarray large_bos;
 
-   /* Does the command buffer use the geometry heap? */
+   /* The geometry heap was reset for the open or next render encoder: its
+    * allocations stay until that render encoder ends (cs_end). */
    bool uses_heap;
    /* Set at vkBeginCommandBuffer. One-time-submit buffers skip command
     * enqueueing in the trampolines since they can never be replayed. */
@@ -349,6 +367,7 @@ kk_get_descriptors_state(struct kk_cmd_buffer *cmd,
 void cs_start_render(struct kk_cmd_buffer *cmd);
 mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
 mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd);
+mtl_compute_encoder *cs_get_pre_gfx(struct kk_cmd_buffer *cmd);
 void cs_end(struct kk_cmd_buffer *cmd);
 void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
                                         uint64_t addr);
@@ -361,11 +380,6 @@ kk_cmd_buffer_dirty_all_gfx(struct kk_cmd_buffer *cmd)
    cmd->state.dirty_shaders = ~0u;
    cmd->state.gfx.dirty = ~0u;
    cmd->state.gfx.descriptors.root_dirty = true;
-
-   /* We just flushed out the heap use. If we want to use it again, we'll need
-    * to queue a free for it again.
-    */
-   cmd->uses_heap = false;
 }
 
 void kk_cmd_release_dynamic_ds_state(struct kk_cmd_buffer *cmd);
@@ -455,6 +469,12 @@ kk_grid_is_indirect(struct kk_grid grid)
    return grid.mode != KK_GRID_DIRECT;
 }
 
+/* pre_gfx: while a render encoder is open, the dispatch goes into its pre_gfx
+ * pass, which runs before it (cs_get_pre_gfx) instead of ending it. Only for
+ * work that reads nothing the render pass's draws may write (index, indirect
+ * and predicate buffers: transfers are not allowed in a render pass, and a
+ * self-dependency cannot order shader writes before index or indirect reads)
+ * and whose results only the render pass's draws read. */
 void kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
                          bool pre_gfx, enum libkk_program idx, void *data,
                          size_t data_size);

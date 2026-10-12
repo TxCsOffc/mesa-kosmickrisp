@@ -1080,28 +1080,25 @@ kk_init_heap(const void *data)
    };
 }
 
+/* The geometry heap for work recorded with pre_gfx (kk_dispatch_precomp) */
 static uint64_t
-kk_heap(struct kk_cmd_buffer *cmd)
+kk_heap(struct kk_cmd_buffer *cmd, bool pre_gfx)
 {
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    util_call_once_data(&dev->heap_init_once, kk_init_heap, cmd);
 
-   /* We need to free all allocations after each command buffer execution */
+   /* Other work ends the render encoder first: its draws are done with what
+    * the heap holds (cs_end), allocations from here on are for the next one.
+    * pre_gfx work allocates for the open one, before it starts. */
+   if (!pre_gfx)
+      cs_get_compute(cmd);
+
+   /* Zeroing the allocated index frees what earlier render encoders used */
    if (!cmd->uses_heap) {
       uint64_t addr = dev->heap->gpu;
-
-      /* Zeroing the allocated index frees everything. Force compute encoder
-       * since this path is only taken by tessellation, GS and unroll, which
-       * already force a compute encoder break */
-      mtl_compute_encoder *encoder = cs_get_compute(cmd);
-      kk_cmd_write(cmd, (struct libkk_imm_write){
-                           addr + offsetof(struct poly_heap, bottom), 0});
-
-      /* Ensure heap is set to 0 before we allocate anything. */
-      mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
-                                       MTL_STAGE_DISPATCH);
-
+      libkk_write_u32(cmd, kk_grid_1d(1), pre_gfx,
+                      addr + offsetof(struct poly_heap, bottom), 0u);
       cmd->uses_heap = true;
    }
 
@@ -1110,10 +1107,10 @@ kk_heap(struct kk_cmd_buffer *cmd)
 
 /* GPU-generated indices are allocated from the heap, past its header */
 static struct kk_addr_range
-kk_heap_indices(struct kk_cmd_buffer *cmd)
+kk_heap_indices(struct kk_cmd_buffer *cmd, bool pre_gfx)
 {
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
-   uint64_t heap = kk_heap(cmd);
+   uint64_t heap = kk_heap(cmd, pre_gfx);
 
    /* TODO_KOSMICKRISP Self-contained until we have rodata at the device. */
    return (struct kk_addr_range){
@@ -1238,7 +1235,7 @@ kk_upload_tess_params(struct kk_cmd_buffer *cmd, struct poly_tess_params *out,
          : POLY_TESS_PARTITIONING_FRACTIONAL_EVEN;
 
    struct poly_tess_params args = {
-      .heap = kk_heap(cmd),
+      .heap = kk_heap(cmd, false),
       .tcs_stride_el = tcs->info.tess.tcs_output_stride / 4,
       .statistic = 0u,
       .input_patch_size = dyn->ts.patch_control_points,
@@ -1375,7 +1372,7 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
       /* The indirect setup kernel writes the draw and allocates from the
        * heap, including the index buffer */
       if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED)
-         gfx->gs.index = kk_heap_indices(cmd);
+         gfx->gs.index = kk_heap_indices(cmd, false);
    } else {
       poly_geometry_params_set_draw(&params, mode, shape, max_indices,
                                     draw->grid.size.x, draw->grid.size.y);
@@ -1742,8 +1739,8 @@ kk_set_unrolled_draw(struct kk_draw_command *data, enum mesa_prim prim,
 }
 
 /* Indices of a direct draw without an index buffer the CPU writes: the
- * unroll kernel ends the render pass (its attachments are stored, loaded
- * again after it), which here costs more than the draw. */
+ * unroll kernel needs a compute pass (and a Metal command buffer) before the
+ * render encoder (cs_get_pre_gfx), which here costs more than the draw. */
 #define KK_CPU_UNROLL_MAX_INDICES (1u << 20)
 
 /* Direct draws without an index buffer unroll to indices known at recording,
@@ -1836,13 +1833,13 @@ kk_direct_unroll_size_B(const struct kk_draw_command *data)
 /* The heap an unroll allocates its indices from, and their range. Direct
  * draws get one of their own in command buffer memory, sized for the draws
  * (direct_size_B, kk_direct_unroll_size_B): no reset, nothing shared with
- * other command buffers or render passes, and no device heap for processes
- * that only unroll direct draws. The device heap is reset to its start by the
- * first unroll of every command buffer and render pass (kk_heap), which is
- * only safe while the queue runs every pass after the previous one ended
- * (end_encoder's barrier). */
+ * other command buffers or render encoders, and no device heap for processes
+ * that only unroll direct draws. The device heap is reset to its start for
+ * every render encoder that uses it (kk_heap), which is only safe while the
+ * queue runs every pass after the previous one ended (end_encoder's
+ * barrier). */
 static uint64_t
-kk_unroll_heap(struct kk_cmd_buffer *cmd, uint64_t direct_size_B,
+kk_unroll_heap(struct kk_cmd_buffer *cmd, uint64_t direct_size_B, bool pre_gfx,
                struct kk_addr_range *indices)
 {
    if (direct_size_B < KK_HEAP_SIZE_B) {
@@ -1860,16 +1857,17 @@ kk_unroll_heap(struct kk_cmd_buffer *cmd, uint64_t direct_size_B,
       }
    }
 
-   const uint64_t heap = kk_heap(cmd);
-   *indices = kk_heap_indices(cmd);
+   const uint64_t heap = kk_heap(cmd, pre_gfx);
+   *indices = kk_heap_indices(cmd, pre_gfx);
    return heap;
 }
 
 /* Unrolling will always be done through indirect rendering, so if this is
- * called from non-indirect calls, we will fake it. */
+ * called from non-indirect calls, we will fake it. pre_gfx:
+ * kk_dispatch_precomp, false when a passthrough GS reads the unrolled draw. */
 static bool
 kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
-                   uint64_t direct_size_B)
+                   uint64_t direct_size_B, bool pre_gfx)
 {
    if (kk_unroll_geometry_cpu(cmd, data))
       return true;
@@ -1888,7 +1886,7 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
    struct kk_addr_range indices;
    struct libkk_unroll_geometry_args info = {
       .index_buffer = data->index_buffer.addr,
-      .heap = kk_unroll_heap(cmd, direct_size_B, &indices),
+      .heap = kk_unroll_heap(cmd, direct_size_B, pre_gfx, &indices),
       .in_draw = data->indirect_command.addr,
       .out_draw = out_draws.gpu,
       .in_draw_stride_el = data->indirect_command.stride / sizeof(uint32_t),
@@ -1903,8 +1901,8 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
       .mode = data->prim,
    };
 
-   libkk_unroll_geometry_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
-                                info);
+   libkk_unroll_geometry_struct(cmd, kk_grid_1d(1024 * data->draw_count),
+                                pre_gfx, info);
 
    kk_set_unrolled_draw(data, u_decomposed_prim(data->prim), indices,
                         out_draws.gpu);
@@ -1913,10 +1911,11 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
 }
 
 /* Metal has no adjacency topologies, so draws without a GS draw the lines or
- * triangles they rasterize instead. */
+ * triangles they rasterize instead. pre_gfx: kk_dispatch_precomp, false when a
+ * passthrough GS reads the unrolled draw. */
 static bool
 kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
-                    uint64_t direct_size_B)
+                    uint64_t direct_size_B, bool pre_gfx)
 {
    if (unlikely(!kk_convert_to_indirect_draw(cmd, data)))
       return false;
@@ -1929,7 +1928,7 @@ kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
    struct kk_addr_range indices;
    struct libkk_unroll_adjacency_args info = {
       .index_buffer = data->index_buffer.addr,
-      .heap = kk_unroll_heap(cmd, direct_size_B, &indices),
+      .heap = kk_unroll_heap(cmd, direct_size_B, pre_gfx, &indices),
       .in_draw = data->indirect_command.addr,
       .out_draw = out_draws.gpu,
       .in_draw_stride_el = data->indirect_command.stride / sizeof(uint32_t),
@@ -1941,8 +1940,8 @@ kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
       .mode = data->prim,
    };
 
-   libkk_unroll_adjacency_struct(cmd, kk_grid_1d(1024 * data->draw_count), true,
-                                 info);
+   libkk_unroll_adjacency_struct(cmd, kk_grid_1d(1024 * data->draw_count),
+                                 pre_gfx, info);
 
    kk_set_unrolled_draw(data, u_reduced_prim(data->prim), indices,
                         out_draws.gpu);
@@ -2341,7 +2340,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
             draw.index.gpu.range / args.in_index_size_B;
       }
 
-      libkk_tess_setup_indirect_struct(cmd, kk_grid_1d(1), true, args);
+      libkk_tess_setup_indirect_struct(cmd, kk_grid_1d(1), false, args);
 
       uint32_t grid_stride = sizeof(uint32_t) * 3;
       grid_vs = kk_grid_indirect(gfx->tess.indirect_ptr.gpu + 0u * grid_stride);
@@ -2383,17 +2382,17 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
    }
 
    /* First generate counts, then prefix sum them, and then tessellate. */
-   libkk_tessellate(cmd, grid_tess, true, info.mode, POLY_TESS_MODE_COUNT,
+   libkk_tessellate(cmd, grid_tess, false, info.mode, POLY_TESS_MODE_COUNT,
                     state);
 
-   libkk_prefix_sum_tess(cmd, kk_grid_1d(1024u), true, state);
+   libkk_prefix_sum_tess(cmd, kk_grid_1d(1024u), false, state);
 
-   libkk_tessellate(cmd, grid_tess, true, info.mode, POLY_TESS_MODE_WITH_COUNTS,
-                    state);
+   libkk_tessellate(cmd, grid_tess, false, info.mode,
+                    POLY_TESS_MODE_WITH_COUNTS, state);
 
    draw.grid = kk_grid_indirect(gfx->tess.out_draws_addr);
 
-   draw.index.gpu = kk_heap_indices(cmd);
+   draw.index.gpu = kk_heap_indices(cmd, false);
    draw.index.el_size_B = 4u;
    draw.primitive_type = mesa_prim_to_mtl_primitive_type(gfx->tess.prim);
    return draw;
@@ -2413,7 +2412,7 @@ kk_draw_without_restart(struct kk_cmd_buffer *cmd,
 
    struct libkk_unroll_restart_args args = {
       .index_buffer = draw.index.gpu.addr,
-      .heap = kk_heap(cmd),
+      .heap = kk_heap(cmd, false),
       .in_draw = draw.grid.addr,
       .out_draw = out_draw.gpu,
       .restart_index = data->restart_index,
@@ -2422,10 +2421,10 @@ kk_draw_without_restart(struct kk_cmd_buffer *cmd,
       .flatshade_first = data->flatshade_first,
       .mode = data->prim,
    };
-   libkk_unroll_restart_struct(cmd, kk_grid_1d(1024u), true, args);
+   libkk_unroll_restart_struct(cmd, kk_grid_1d(1024u), false, args);
 
    draw.grid = kk_grid_indirect(out_draw.gpu);
-   draw.index.gpu = kk_heap_indices(cmd);
+   draw.index.gpu = kk_heap_indices(cmd, false);
    return draw;
 }
 
@@ -2458,7 +2457,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
          .draw = draw.grid.addr,
          .vp = vertex_params,
          .p = geometry_params,
-         .heap = kk_heap(cmd),
+         .heap = kk_heap(cmd, false),
          .vs_outputs =
             tes ? tes->info.tess.tes_outputs : vs->info.vs.outputs_written,
          .prim = mode,
@@ -2473,7 +2472,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
             draw.index.gpu.range / draw.index.el_size_B;
       }
 
-      libkk_gs_setup_indirect_struct(cmd, kk_grid_1d(1u), true, args);
+      libkk_gs_setup_indirect_struct(cmd, kk_grid_1d(1u), false, args);
 
       grid_vs = kk_grid_indirect_local(
          vertex_params + offsetof(struct poly_vertex_params, grid));
@@ -2514,7 +2513,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
       }
 
       if (gs->prefix_sum) {
-         libkk_prefix_sum_geom(cmd, kk_grid_1d(1024u * gs->count_words), true,
+         libkk_prefix_sum_geom(cmd, kk_grid_1d(1024u * gs->count_words), false,
                                geometry_params);
       }
 
@@ -2621,9 +2620,14 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
    bool geom = kk_gs_info(cmd);
 
+   /* Unrolls run before the render encoder (pre_gfx), but those a
+    * passthrough GS reads: its compute pass ends the render encoder, and
+    * frees what the device heap held for it (kk_heap). */
+   const bool pre_gfx = !geom;
+
    /* Unroll geometry. Skip draw if we fail. */
    if (requires_unroll(cmd, data)) {
-      if (!kk_unroll_geometry(cmd, data, unroll_size_B))
+      if (!kk_unroll_geometry(cmd, data, unroll_size_B, pre_gfx))
          return;
       /* Adjacency is unrolled again from what the GPU unrolled */
       unroll_size_B = UINT64_MAX;
@@ -2631,7 +2635,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
    if (!cmd->state.shaders[MESA_SHADER_GEOMETRY] &&
        mesa_prim_has_adjacency(data->prim) &&
-       !kk_unroll_adjacency(cmd, data, unroll_size_B))
+       !kk_unroll_adjacency(cmd, data, unroll_size_B, pre_gfx))
       return;
 
    /* Patch lists do not restart, so only a GS fed by the input assembly needs
@@ -3077,7 +3081,7 @@ kk_CmdDrawIndirectByteCount2EXT(
    if (unlikely(!draw.gpu))
       return;
 
-   libkk_draw_byte_count(cmd, kk_grid_1d(1u), true, draw.gpu,
+   libkk_draw_byte_count(cmd, kk_grid_1d(1u), false, draw.gpu,
                          pCounterInfo->addressRange.address, counterOffset,
                          vertexStride, instanceCount, firstInstance);
 

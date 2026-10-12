@@ -456,8 +456,12 @@ kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
    mtl_commit_options *options = mtl_new_commit_options();
    mtl_commit_options_add_feedback_handler(options, callback, user_data, seq);
 
-   mtl_command_queue_commit(queue->mtl_handle, &cmd->metal.cmd_buf, 1u,
-                            options);
+   /* The recording's Metal command buffers in order, a render encoder's
+    * pre_gfx pass in one before the render encoder's (cs_get_pre_gfx) */
+   mtl_command_queue_commit(
+      queue->mtl_handle, util_dynarray_begin(&cmd->metal.cmd_bufs),
+      util_dynarray_num_elements(&cmd->metal.cmd_bufs, mtl_command_buffer *),
+      options);
    mtl_release(options);
 }
 
