@@ -261,12 +261,10 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
                        uint32_t elem)
 {
    struct kk_texel_buffer_descriptor desc = {};
-   if (bufferView != VK_NULL_HANDLE) {
-      VK_FROM_HANDLE(kk_buffer_view, view, bufferView);
-
-      assert(view->mtl_texel_buffer_handle);
-      assert(view->texel_buffer_gpu_id);
-
+   /* Views of formats no texture buffer backs have no texture
+    * (kk_CreateBufferView): null descriptors */
+   VK_FROM_HANDLE(kk_buffer_view, view, bufferView);
+   if (view != NULL && view->mtl_texel_buffer_handle != NULL) {
       desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
       desc.texel_offset = view->texel_offset;
       desc.residency_gpu_resource_id = view->residency_gpu_id;

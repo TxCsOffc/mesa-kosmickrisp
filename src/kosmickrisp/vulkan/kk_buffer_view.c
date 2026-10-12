@@ -8,6 +8,7 @@
 #include "kk_buffer_view.h"
 
 #include "kk_buffer.h"
+#include "kk_descriptor_types.h"
 #include "kk_device.h"
 #include "kk_entrypoints.h"
 #include "kk_format.h"
@@ -19,7 +20,31 @@
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/mtl_format.h"
 
+#include "util/log.h"
+#include "vk_enum_to_str.h"
 #include "vk_format.h"
+
+#include <stdatomic.h>
+
+/* Metal has no 3-component pixel formats: uniform texel buffers of
+ * R32G32B32 formats are R32 texture buffers of three texels per element
+ * (struct kk_texel_buffer_descriptor, KK_TEXEL_BUFFER_RGB32). vkd3d-proton
+ * views structured buffers of 12-byte strides as R32G32B32_UINT texel
+ * buffers. Returns the R32 format, PIPE_FORMAT_NONE for other formats. */
+static enum pipe_format
+kk_texel_buffer_rgb32_component(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R32G32B32_UINT:
+      return PIPE_FORMAT_R32_UINT;
+   case PIPE_FORMAT_R32G32B32_SINT:
+      return PIPE_FORMAT_R32_SINT;
+   case PIPE_FORMAT_R32G32B32_FLOAT:
+      return PIPE_FORMAT_R32_FLOAT;
+   default:
+      return PIPE_FORMAT_NONE;
+   }
+}
 
 VkFormatFeatureFlags2
 kk_get_buffer_format_features(struct kk_physical_device *pdev,
@@ -47,10 +72,30 @@ kk_get_buffer_format_features(struct kk_physical_device *pdev,
          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
    }
 
+   if (kk_texel_buffer_rgb32_component(p_format) != PIPE_FORMAT_NONE)
+      features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
+
    if (kk_vbo_supports_format(p_format))
       features |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
 
    return features;
+}
+
+/* A view no Metal texture buffer can back: vkd3d-proton creates typed views
+ * without checking the format's features (and Venus forwards them), so one
+ * reached the driver and dereferenced the missing format (STEAMAC-2Z). The view
+ * gets no texture; its descriptors read as null descriptors (zero). */
+static void
+kk_buffer_view_warn_unsupported(VkFormat format, bool sparse)
+{
+   static atomic_uint warned[8];
+   const unsigned bit = 1u << (format & 31);
+   if ((uint32_t)format < 256 &&
+       (atomic_fetch_or(&warned[format >> 5], bit) & bit))
+      return;
+   mesa_logw("kk: texel buffer views of %s%s are not supported; they read "
+             "as null descriptors",
+             vk_Format_to_str(format), sparse ? " in sparse buffers" : "");
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -64,12 +109,25 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    if (!view)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   struct kk_buffer *buffer =
+      container_of(view->vk.buffer, struct kk_buffer, vk);
    enum pipe_format p_format = vk_format_to_pipe_format(view->vk.format);
+   const enum pipe_format rgb32_component =
+      kk_texel_buffer_rgb32_component(p_format);
+   const bool rgb32 = rgb32_component != PIPE_FORMAT_NONE;
+   if (rgb32)
+      p_format = rgb32_component;
    const struct kk_va_format *supported_format = kk_get_va_format(p_format);
 
-   /* If we reached here, we support reading at least */
+   if (!supported_format || !supported_format->texel_buffer.read ||
+       (rgb32 && buffer->sparse)) {
+      kk_buffer_view_warn_unsupported(view->vk.format, buffer->sparse);
+      *pBufferView = kk_buffer_view_to_handle(view);
+      return VK_SUCCESS;
+   }
+
    enum mtl_texture_usage usage = MTL_TEXTURE_USAGE_SHADER_READ;
-   if (supported_format->texel_buffer.write)
+   if (supported_format->texel_buffer.write && !rgb32)
       usage |= MTL_TEXTURE_USAGE_SHADER_WRITE;
 
    /* Only these formats allow atomics for texel buffers */
@@ -80,9 +138,8 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    /* Metal needs texture buffers at KK_MIN_TEXEL_BUFFER_ALIGNMENT; views may
     * start at any texel. Start the texture at the aligned offset below the
     * view, texel_offset texels earlier (shaders add it to coordinates).
+    * R32G32B32 views count R32 texels.
     */
-   struct kk_buffer *buffer =
-      container_of(view->vk.buffer, struct kk_buffer, vk);
    const uint64_t mtl_offset = kk_buffer_mtl_offset(buffer, view->vk.offset);
    uint64_t texture_offset =
       mtl_offset & ~(uint64_t)(KK_MIN_TEXEL_BUFFER_ALIGNMENT - 1);
@@ -99,9 +156,16 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       texture_offset = mtl_offset;
    }
    view->texel_offset = (mtl_offset - texture_offset) / texel_B;
+   uint64_t width_px = view->vk.elements + view->texel_offset;
+   if (rgb32) {
+      /* Texels past maxTexelBufferElements read as out of bounds */
+      width_px = MIN2(view->vk.elements * 3u + view->texel_offset,
+                      KK_MAX_TEXEL_BUFFER_ELEMENTS);
+      view->texel_offset |= KK_TEXEL_BUFFER_RGB32;
+   }
 
    struct kk_image_layout layout = {
-      .width_px = view->vk.elements + view->texel_offset,
+      .width_px = width_px,
       .height_px = 1u,
       .depth_px = 1u,
       .layers = 1u,
@@ -159,10 +223,11 @@ kk_DestroyBufferView(VkDevice _device, VkBufferView bufferView,
 
    if (view->sparse)
       kk_buffer_view_sparse_finish(dev, view);
-   else
+   else if (view->mtl_texel_buffer_handle)
       kk_device_remove_texture_from_residency_set(
          dev, view->mtl_texel_buffer_handle);
-   mtl_release(view->mtl_texel_buffer_handle);
+   if (view->mtl_texel_buffer_handle)
+      mtl_release(view->mtl_texel_buffer_handle);
    vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
 }
 

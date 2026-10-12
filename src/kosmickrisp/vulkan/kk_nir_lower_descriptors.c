@@ -899,6 +899,47 @@ lower_sampled_view_residency(nir_builder *b, nir_tex_instr *tex,
                             nir_if_phi(b, view_code, other_code));
 }
 
+/* Texel fetch `tex` (at Metal texel x) from an R32G32B32 texel buffer when
+ * rgb32 (struct kk_texel_buffer_descriptor, KK_TEXEL_BUFFER_RGB32): tex reads
+ * the red R32 texel, copies of it green and blue at x + 1 and x + 2; alpha is
+ * 1, the residency code is tex's. */
+static void
+lower_rgb32_texel_fetch(nir_builder *b, nir_tex_instr *tex, nir_def *rgb32,
+                        nir_def *x)
+{
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+
+   b->cursor = nir_after_instr(&tex->instr);
+   nir_def *first = nir_mov(b, &tex->def);
+   const unsigned n = first->num_components;
+   const unsigned colors = n - (tex->is_sparse ? 1u : 0u);
+   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+
+   nir_push_if(b, rgb32);
+   for (unsigned c = 0; c < n; c++)
+      comps[c] = nir_channel(b, first, c);
+   for (unsigned c = 1; c < MIN2(colors, 3u); c++) {
+      nir_def *texel = nir_vector_insert_imm(b, coord, nir_iadd_imm(b, x, c), 0);
+      nir_tex_instr *copy =
+         nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
+      nir_builder_instr_insert(b, &copy->instr);
+      set_tex_src(copy, nir_tex_src_coord, texel);
+      comps[c] = nir_channel(b, &copy->def, 0);
+   }
+   if (colors > 3u) {
+      comps[3] =
+         nir_alu_type_get_base_type(tex->dest_type) == nir_type_float
+            ? nir_imm_floatN_t(b, 1.0, first->bit_size)
+            : nir_imm_intN_t(b, 1, first->bit_size);
+   }
+   nir_def *rgb = nir_vec(b, comps, n);
+   nir_pop_if(b, NULL);
+
+   nir_def_rewrite_uses_after_instr(&tex->def, nir_if_phi(b, rgb, first),
+                                    nir_def_instr(first));
+}
+
 static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex,
           const struct lower_descriptors_ctx *ctx)
@@ -999,35 +1040,52 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
 
       /* Texel buffers: the Metal texture starts texel_offset texels before
-       * the view (struct kk_texel_buffer_descriptor).
+       * the view; R32G32B32 views are R32 textures of three texels per
+       * element (struct kk_texel_buffer_descriptor).
        */
       if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
-         nir_def *texel_offset = load_resource_deref_desc(
+         nir_def *desc_offset = load_resource_deref_desc(
             b, 1, 32, nir_src_as_deref(nir_src_for_ssa(texture)),
             plane_offset_B +
                offsetof(struct kk_texel_buffer_descriptor, texel_offset),
             ctx);
+         nir_def *rgb32 = nir_test_mask(b, desc_offset, KK_TEXEL_BUFFER_RGB32);
+         nir_def *texel_offset =
+            nir_iand_imm(b, desc_offset, ~KK_TEXEL_BUFFER_RGB32);
          const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
          if (tex->op == nir_texop_txs) {
             b->cursor = nir_after_instr(&tex->instr);
             nir_def *size = &tex->def;
             nir_def *x = nir_isub(b, nir_channel(b, size, 0),
                                   nir_u2uN(b, texel_offset, size->bit_size));
+            x = nir_bcsel(b, rgb32, nir_udiv_imm(b, x, 3), x);
             nir_def_rewrite_uses_after(size,
                                        nir_vector_insert_imm(b, size, x, 0));
             b->cursor = nir_before_instr(&tex->instr);
          } else if (coord_idx >= 0) {
             nir_def *coord = tex->src[coord_idx].src.ssa;
-            nir_def *x = nir_iadd(b, nir_channel(b, coord, 0),
-                                  nir_u2uN(b, texel_offset, coord->bit_size));
+            nir_def *i = nir_channel(b, coord, 0);
+            nir_def *offset = nir_u2uN(b, texel_offset, coord->bit_size);
+            /* Elements whose texels would wrap stay out of bounds (all three
+             * texels, lower_rgb32_texel_fetch) */
+            const uint64_t max = u_uintN_max(coord->bit_size);
+            nir_def *rgb32_x = nir_bcsel(
+               b, nir_ult_imm(b, i, (max - 6u) / 3u),
+               nir_iadd(b, nir_imul_imm(b, i, 3), offset),
+               nir_imm_intN_t(b, max - 2u, coord->bit_size));
+            nir_def *x =
+               nir_bcsel(b, rgb32, rgb32_x, nir_iadd(b, i, offset));
             nir_src_rewrite(&tex->src[coord_idx].src,
                             nir_vector_insert_imm(b, coord, x, 0));
-            if (tex->is_sparse) {
-               nir_def *residency = load_texel_buffer_residency(
+            nir_def *residency = NULL;
+            if (tex->is_sparse)
+               residency = load_texel_buffer_residency(
                   b, nir_src_as_deref(nir_src_for_ssa(texture)), x, ctx);
+            if (tex->op == nir_texop_txf)
+               lower_rgb32_texel_fetch(b, tex, rgb32, x);
+            if (residency)
                and_sparse_residency(b, &tex->instr, &tex->def, residency);
-               b->cursor = nir_before_instr(&tex->instr);
-            }
+            b->cursor = nir_before_instr(&tex->instr);
          }
       }
    }

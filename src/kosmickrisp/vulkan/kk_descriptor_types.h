@@ -82,6 +82,12 @@ static_assert(sizeof(struct kk_storage_image_descriptor) == 16,
  * texture is in buffer page
  * min(residency_first_page + (x >> residency_page_shift), residency_last_page).
  * residency_gpu_resource_id is 0 for other views (always resident).
+ *
+ * Views of R32G32B32 formats (no Metal pixel format, uniform texel buffers
+ * only): the Metal texture is an R32 texture buffer of three texels per
+ * element, texel_offset counts those texels and has KK_TEXEL_BUFFER_RGB32 set;
+ * fetches read texels 3 * x + texel_offset + {0, 1, 2} (alpha 1), size queries
+ * divide by 3. Never set for views of sparse buffers.
  */
 struct kk_texel_buffer_descriptor {
    uint64_t image_gpu_resource_id;
@@ -94,6 +100,8 @@ struct kk_texel_buffer_descriptor {
 
 static_assert(sizeof(struct kk_texel_buffer_descriptor) == 32,
               "kk_texel_buffer_descriptor has no holes");
+
+#define KK_TEXEL_BUFFER_RGB32 (1u << 31)
 
 /* The residency texture of a sparse residency buffer: an R8Uint 2D array of
  * 256x256 texel (64 KiB) tiles, one per buffer page, 64 tiles per row and
