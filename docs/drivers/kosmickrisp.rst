@@ -75,13 +75,22 @@ Environment variables
 
 KosmicKrisp specific environment variables:
 
-- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders. ``novertexsubgroups`` to stop advertising subgroups in the vertex stage (A/B for the lane-id recovery there).
+- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders. ``novertexsubgroups`` to stop advertising subgroups in the vertex stage (A/B for the lane-id recovery there). ``noint64atomics`` to stop advertising ``VK_KHR_shader_atomic_int64``.
 - ``MESA_KK_GPU_CAPTURE``: Starts Metal capture at device create and ends it at device destroy. Set to ``1`` to activate.
 - ``MESA_KK_GPU_CAPTURE_DIRECTORY``: Metal capture will be saved to the specified directory. Defaults to Xcode if no path is provided.
 - ``MESA_KK_DISABLE_WORKAROUNDS``: Provide ``all`` to disable all workarounds. Otherwise, provide a comma separated list to disable wanted workarounds e.g. ``1,3,4`` to disable workaround 1, 3 and 4.
 - ``MESA_KK_EXPERIMENTAL``: Enables advertising experimental features which may not provide full correctness or may negatively impact performance when enabled. Provide ``all`` to advertise all listed features.
   - ``custom_border`` to advertise ``VK_EXT_custom_border_color`` and ``VK_EXT_border_color_swizzle``.
   - ``m5_optimize_e5r9g9b9`` to use allowGPUOptimizedContents on M5 with this format, which causes some CTS tests for vkCmdCopyImage() to fail
+
+``VK_KHR_shader_atomic_int64`` is supported for 64-bit buffer atomics: Metal has a
+void ``atomic_min_explicit``/``atomic_max_explicit`` on device ``atomic_ulong`` and nothing else,
+so ``OpAtomicUMax``/``OpAtomicUMin`` lower to it, preceded by a read of the cell when the result is
+used. That returned value is the cell's contents just before the operation, which can differ from
+the original value OpAtomicUMax is defined to return when another invocation wins the race in
+between. Metal has no 64-bit atomic in threadgroup memory and no signed 64-bit atomic at all, so
+``shaderSharedInt64Atomics`` stays unsupported along with ``OpAtomicSMax``/``OpAtomicSMin`` on
+64-bit integers (and 64-bit atomic add, exchange and compare-exchange).
 
 Metal workarounds
 *****************

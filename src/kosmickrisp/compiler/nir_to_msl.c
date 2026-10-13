@@ -960,6 +960,54 @@ atomic_op_to_msl(nir_atomic_op op)
    }
 }
 
+/* 64-bit integer atomics are the one part of MSL's atomic support that is not 32-bit-shaped, and
+ * they are shaped differently again: metal_atomic's _valid_fetch_other_type and
+ * _valid_non_fetch_type admit int, uint and float only, so there is no 64-bit fetch min/max, no
+ * 64-bit load/store, exchange or compare-exchange, and __HAVE_ATOMIC_ULONG_MIN_MAX__ (defined on
+ * this GPU, an M5 Max, by the GPU compiler) adds a *void* atomic_min/max_explicit for device
+ * atomic_ulong and nothing else: no signed atomic_long exists, and no threadgroup 64-bit atomic at
+ * all (metal_atomic's _valid_max_type is "device ulong*" alone). This lowers OpAtomicUMax/UMin on a
+ * 64-bit device pointer to the void form, which is Metal's only 64-bit atomic operation. The effect
+ * on memory is exactly Vulkan's; the returned value is the cell's contents read just before the
+ * operation, which differs from OpAtomicUMax's exact original value when another invocation wins
+ * the race in between. Without the lowering those pipelines do not compile at all. */
+static bool
+atomic_is_64bit_unsigned_minmax(nir_intrinsic_instr *instr)
+{
+   if (instr->intrinsic != nir_intrinsic_global_atomic ||
+       instr->def.bit_size != 64)
+      return false;
+
+   nir_atomic_op op = nir_intrinsic_atomic_op(instr);
+   return op == nir_atomic_op_umax || op == nir_atomic_op_umin;
+}
+
+static void
+atomic_64bit_minmax_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+{
+   const bool is_max = nir_intrinsic_atomic_op(instr) == nir_atomic_op_umax;
+   const char *type = msl_type_for_def(ctx->types, &instr->def);
+
+   /* Only read the cell when the result is used: the load exists to give the fetch form something
+    * to return, and skipping it keeps an unused atomic a pure store. tN is declared by
+    * predeclare_ssa_values like every other intrinsic result: a declaration here would shadow it
+    * inside the bounds-check `if` of a storage buffer access (a use after that scope then reads
+    * the predeclared 0) and is a redefinition with physical-pointer (buffer device address)
+    * access, which has no such `if`. */
+   if (!nir_def_is_unused(&instr->def)) {
+      P_IND(ctx, "t%d = *(device %s*)(", instr->def.index, type);
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, ");\n");
+   }
+
+   P_IND(ctx, "%s_explicit((device atomic_%s*)", is_max ? "atomic_max" : "atomic_min",
+         type);
+   src_to_msl(ctx, &instr->src[0]);
+   P(ctx, ", ");
+   src_to_msl(ctx, &instr->src[1]);
+   P(ctx, ", memory_order_relaxed);\n");
+}
+
 static void
 atomic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
               const char *scope, bool shared)
@@ -1130,6 +1178,11 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
        instr->intrinsic == nir_intrinsic_load_barycentric_at_sample ||
        instr->intrinsic == nir_intrinsic_load_barycentric_at_offset)
       return;
+
+   if (atomic_is_64bit_unsigned_minmax(instr)) {
+      atomic_64bit_minmax_to_msl(ctx, instr);
+      return;
+   }
 
    const nir_intrinsic_info *info = &nir_intrinsic_infos[instr->intrinsic];
    if (instrinsic_needs_dest_type(instr)) {

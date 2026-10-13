@@ -84,6 +84,19 @@ struct kk_physical_device {
    uint8_t queue_family_count;
 };
 
+/* Metal's only 64-bit atomics are the void atomic_max/min_explicit on device
+ * atomic_ulong and the matching texture atomic_max/min on ulong textures, both
+ * from Apple8 on macOS (Metal feature set tables: "64-bit atomic min/max on
+ * buffers and textures"). Apple7 (M1) rejects them at pipeline creation
+ * ("Unsupported i64 atomic operation for given target"), so VK_KHR_shader_
+ * atomic_int64, VK_EXT_shader_image_atomic_int64 and the R64 storage formats
+ * are advertised only from Apple8. */
+static inline bool
+kk_physical_device_has_int64_minmax_atomics(const struct kk_physical_device *pdev)
+{
+   return pdev->info.gpu_apple_family >= 8;
+}
+
 static inline uint32_t
 kk_min_cbuf_alignment()
 {

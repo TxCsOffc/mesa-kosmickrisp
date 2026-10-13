@@ -24,6 +24,10 @@ enum kk_debug {
    /* Log every Metal compile (library, compute or render pipeline) with its
     * MSL hashes, thread, MTL4Compiler and the compiles in flight with it */
    KK_DEBUG_COMPILES = 1ull << 6,
+   /* Do not advertise VK_KHR_shader_atomic_int64 (64-bit buffer atomics,
+    * lowered in nir_to_msl.c): A/B and a fallback if a title trips over the
+    * lowering's racy fetch result */
+   KK_DEBUG_NO_INT64_ATOMICS = 1ull << 7,
    /* Do not advertise subgroups in the vertex stage (the lane id is recovered
     * there by emit_vertex_lane_id_helper's kk_vertex_lane_id): A/B for the
     * recovery */

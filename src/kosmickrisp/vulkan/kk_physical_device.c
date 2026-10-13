@@ -77,6 +77,15 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .KHR_imageless_framebuffer = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_separate_depth_stencil_layouts = true,
+      /* 64-bit buffer atomics: MSL has no 64-bit fetch min/max, load, store or
+       * CAS, but a void atomic_max/min_explicit on device atomic_ulong, which
+       * nir_to_msl.c lowers OpAtomicUMax/OpAtomicUMin to. Threadgroup 64-bit
+       * atomics stay unsupported (MSL has no threadgroup 64-bit atomic at
+       * all), so shaderSharedInt64Atomics stays false. Apple8 and later only
+       * (kk_physical_device_has_int64_minmax_atomics). */
+      .KHR_shader_atomic_int64 =
+         kk_physical_device_has_int64_minmax_atomics(pdev) &&
+         !KK_DEBUG(NO_INT64_ATOMICS),
       .KHR_shader_float_controls = true,
       .KHR_shader_float16_int8 = true,
       .KHR_shader_subgroup_extended_types = true,
@@ -307,6 +316,7 @@ kk_get_device_features(
       .samplerMirrorClampToEdge = true,
       .scalarBlockLayout = true,
       .separateDepthStencilLayouts = true,
+      .shaderBufferInt64Atomics = supported_extensions->KHR_shader_atomic_int64,
       .shaderFloat16 = true,
       .shaderInputAttachmentArrayDynamicIndexing = true,
       .shaderInputAttachmentArrayNonUniformIndexing = true,
@@ -314,6 +324,7 @@ kk_get_device_features(
       .shaderOutputLayer = true,
       .shaderOutputViewportIndex = true,
       .shaderSampledImageArrayNonUniformIndexing = true,
+      .shaderSharedInt64Atomics = false,
       .shaderStorageBufferArrayNonUniformIndexing = true,
       .shaderStorageImageArrayNonUniformIndexing = true,
       .shaderStorageTexelBufferArrayDynamicIndexing = true,
