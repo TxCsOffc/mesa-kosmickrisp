@@ -77,7 +77,6 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .KHR_imageless_framebuffer = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_separate_depth_stencil_layouts = true,
-      .KHR_shader_atomic_int64 = false,
       .KHR_shader_float_controls = true,
       .KHR_shader_float16_int8 = true,
       .KHR_shader_subgroup_extended_types = true,
@@ -692,8 +691,13 @@ kk_get_device_properties(
 
       /* Vulkan 1.1 properties */
       .subgroupSize = 32,
+      /* Metal rejects the SIMD-group *attributes* ([[thread_index_in_simdgroup]]
+       * and friends) in a vertex function, but allows every SIMD-group
+       * *function* there, so nir_to_msl.c recovers the lane id from a ballot
+       * and a scan instead of declaring it. */
       .subgroupSupportedStages =
-         VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+         VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+         (KK_DEBUG(NO_VERTEX_SUBGROUPS) ? 0 : VK_SHADER_STAGE_VERTEX_BIT),
       .subgroupSupportedOperations =
          VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
          VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |

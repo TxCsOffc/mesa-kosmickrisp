@@ -70,16 +70,38 @@ static const char *sysval_table[SYSTEM_VALUE_MAX] = {
 static const char *sysval_sample_mask_in_post_depth_coverage =
    "uint gl_SampleMask [[sample_mask, post_depth_coverage]]";
 
+/* The SIMD-group and grid attributes Metal accepts in compute and fragment functions but rejects in
+ * a vertex function ("invalid '...' attribute for input declaration in a vertex function").
+ * Verified on macOS 27 with the runtime MSL compiler: [[thread_index_in_simdgroup]],
+ * [[simdgroup_index_in_threadgroup]], [[threads_per_simdgroup]] and
+ * [[simdgroups_per_threadgroup]] are all rejected there, while the SIMD-group *functions*
+ * (simd_ballot, simd_prefix_exclusive_sum, simd_shuffle*, quad_*, ...) are all accepted. */
+static bool
+sysval_vertex_illegal_attribute(unsigned sysval)
+{
+   return sysval == SYSTEM_VALUE_SUBGROUP_SIZE ||
+          sysval == SYSTEM_VALUE_SUBGROUP_INVOCATION ||
+          sysval == SYSTEM_VALUE_NUM_SUBGROUPS ||
+          sysval == SYSTEM_VALUE_SUBGROUP_ID;
+}
+
 static void
 emit_sysvals(struct nir_to_msl_ctx *ctx, nir_shader *shader)
 {
    bool is_frag_with_post_depth_coverage =
       ctx->shader->info.stage == MESA_SHADER_FRAGMENT &&
       ctx->shader->info.fs.post_depth_coverage;
+   const bool vertex = ctx->shader->info.stage == MESA_SHADER_VERTEX;
 
    unsigned i;
    BITSET_FOREACH_SET(i, shader->info.system_values_read, SYSTEM_VALUE_MAX) {
       const char *sysval;
+      /* Metal rejects these attributes in a vertex function ("invalid
+       * 'thread_index_in_simdgroup' attribute for input declaration in a vertex
+       * function"): they are declared as locals in emit_local_vars() instead,
+       * computed from SIMD-group functions Metal does allow there. */
+      if (vertex && sysval_vertex_illegal_attribute(i))
+         continue;
       if (is_frag_with_post_depth_coverage && i == SYSTEM_VALUE_SAMPLE_MASK_IN)
          sysval = sysval_sample_mask_in_post_depth_coverage;
       else
@@ -126,6 +148,25 @@ output_type(nir_shader *shader)
 static void
 emit_local_vars(struct nir_to_msl_ctx *ctx, nir_shader *shader)
 {
+   /* The SIMD-group sysvals Metal refuses to take as vertex-function inputs
+    * (sysval_vertex_illegal_attribute) are locals here. The lane id is the one
+    * that carries meaning: it is recovered by kk_vertex_lane_id() from
+    * functions a vertex function may call. A vertex invocation belongs to no
+    * workgroup, so gl_SubGroupID and gl_NumSubGroups have no faithful value
+    * (0 and 1); a vertex shader that indexes by SIMD group cannot be expressed. */
+   if (shader->info.stage == MESA_SHADER_VERTEX) {
+      if (BITSET_TEST(shader->info.system_values_read,
+                      SYSTEM_VALUE_SUBGROUP_SIZE))
+         P_IND(ctx, "uint gl_SubGroupSize = 32u;\n");
+      if (BITSET_TEST(shader->info.system_values_read,
+                      SYSTEM_VALUE_SUBGROUP_INVOCATION))
+         P_IND(ctx, "uint gl_SubGroupInvocation = kk_vertex_lane_id();\n");
+      if (BITSET_TEST(shader->info.system_values_read,
+                      SYSTEM_VALUE_NUM_SUBGROUPS))
+         P_IND(ctx, "uint gl_NumSubGroups = 1u;\n");
+      if (BITSET_TEST(shader->info.system_values_read, SYSTEM_VALUE_SUBGROUP_ID))
+         P_IND(ctx, "uint gl_SubGroupID = 0u;\n");
+   }
    if (shader->info.shared_size) {
       P_IND(ctx, "threadgroup char shared_data[%d];\n",
             shader->info.shared_size);
@@ -1954,6 +1995,32 @@ emit_minmax_helpers(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
    }
 }
 
+/* The lane id of a vertex invocation, from the SIMD-group functions Metal allows in a vertex
+ * function: the ballot of an always-true predicate is the set of active lanes, the exclusive scan
+ * of 1 over them is the number of active lanes below this invocation, and clearing that many low
+ * bits off the ballot leaves this invocation's own bit, whose index is the lane id. In a fully
+ * active SIMD group the scan already is the lane id, and the loop (one iteration per active lane
+ * below this one) clears exactly the bits below it. */
+static void
+emit_vertex_lane_id_helper(struct nir_to_msl_ctx *ctx, nir_shader *shader)
+{
+   if (shader->info.stage != MESA_SHADER_VERTEX ||
+       !BITSET_TEST(shader->info.system_values_read,
+                    SYSTEM_VALUE_SUBGROUP_INVOCATION))
+      return;
+
+   P(ctx, "static uint\n"
+          "kk_vertex_lane_id(void)\n"
+          "{\n"
+          "   uint mask = (uint)(ulong)simd_ballot(true);\n"
+          "   uint compact = simd_prefix_exclusive_sum(1u);\n"
+          "   uint m = mask;\n"
+          "   for (uint i = 0; i < compact; ++i)\n"
+          "      m &= m - 1u;\n"
+          "   return m == 0u ? 0u : ctz(m);\n"
+          "}\n\n");
+}
+
 static void
 tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
 {
@@ -2961,6 +3028,7 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
    }
 
    emit_minmax_helpers(&ctx, impl);
+   emit_vertex_lane_id_helper(&ctx, shader);
 
    msl_emit_constant_data(&ctx, shader);
 

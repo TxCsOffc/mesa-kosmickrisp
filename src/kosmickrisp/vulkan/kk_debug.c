@@ -17,6 +17,7 @@ const struct debug_named_value debug_flags[] = {
    {"commits", KK_DEBUG_COMMITS},
    {"cbs", KK_DEBUG_CBS},
    {"compiles", KK_DEBUG_COMPILES},
+   {"novertexsubgroups", KK_DEBUG_NO_VERTEX_SUBGROUPS},
    {NULL, 0},
 };
 

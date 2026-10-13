@@ -24,6 +24,10 @@ enum kk_debug {
    /* Log every Metal compile (library, compute or render pipeline) with its
     * MSL hashes, thread, MTL4Compiler and the compiles in flight with it */
    KK_DEBUG_COMPILES = 1ull << 6,
+   /* Do not advertise subgroups in the vertex stage (the lane id is recovered
+    * there by emit_vertex_lane_id_helper's kk_vertex_lane_id): A/B for the
+    * recovery */
+   KK_DEBUG_NO_VERTEX_SUBGROUPS = 1ull << 8,
 };
 
 extern enum kk_debug kk_mesa_debug_flags;
