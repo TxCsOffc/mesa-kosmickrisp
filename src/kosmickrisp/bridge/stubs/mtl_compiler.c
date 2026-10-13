@@ -8,6 +8,11 @@
 
 #include "mtl_format.h"
 
+void
+mtl_compiler_set_log(bool enabled)
+{
+}
+
 /* Compiler */
 mtl_compiler *
 mtl_new_compiler(mtl_device *device)

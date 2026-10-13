@@ -21,6 +21,9 @@ enum kk_debug {
    /* Log every command buffer's record (encoders, draws, dispatches,
     * operations, kernels and program MSL hashes) when its feedback comes */
    KK_DEBUG_CBS = 1ull << 5,
+   /* Log every Metal compile (library, compute or render pipeline) with its
+    * MSL hashes, thread, MTL4Compiler and the compiles in flight with it */
+   KK_DEBUG_COMPILES = 1ull << 6,
 };
 
 extern enum kk_debug kk_mesa_debug_flags;

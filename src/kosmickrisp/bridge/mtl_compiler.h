@@ -18,6 +18,9 @@ enum mtl_pixel_format;
 /* Compiler */
 mtl_compiler *mtl_new_compiler(mtl_device *device);
 
+/* MESA_KK_DEBUG=compiles: log every Metal compile (STEAMAC-31/39) */
+void mtl_compiler_set_log(bool enabled);
+
 /* Library */
 mtl_library *
 mtl_new_library(mtl_compiler *compiler, const char *src,

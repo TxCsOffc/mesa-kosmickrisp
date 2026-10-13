@@ -5,6 +5,8 @@
 #include "kk_debug.h"
 #include "util/u_debug.h"
 
+#include "kosmickrisp/bridge/mtl_compiler.h"
+
 enum kk_debug kk_mesa_debug_flags = 0;
 
 const struct debug_named_value debug_flags[] = {
@@ -14,6 +16,7 @@ const struct debug_named_value debug_flags[] = {
    {"minmax", KK_DEBUG_MINMAX},
    {"commits", KK_DEBUG_COMMITS},
    {"cbs", KK_DEBUG_CBS},
+   {"compiles", KK_DEBUG_COMPILES},
    {NULL, 0},
 };
 
@@ -36,4 +39,5 @@ kk_process_debug_variable(void)
 {
    kk_mesa_debug_flags = debug_get_option_mesa_kk_debug();
    kk_mesa_experimental_flags = debug_get_option_mesa_kk_experimental();
+   mtl_compiler_set_log(KK_DEBUG(COMPILES));
 }

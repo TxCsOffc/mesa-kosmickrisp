@@ -174,9 +174,22 @@ instances are unique within the process, so no matter how many Vulkan devices
 we create, the same GPU uses the same `MTLDevice`. Each `MTL4Compiler` instance
 is still capable of performing concurrent compilation.
 
+macOS 27 betas before beta 5 also report version 27.0.0, so turning the
+workaround off from 27.0.0 brought the bug back on them: virglrenderer (one
+Vulkan device per Venus context) crashed in libmalloc's heap corruption trap
+on beta 1 (26A5353q, M4 Pro) and beta 4 (26A5388g, M3 Max). When a guest
+session started, two threads were compiling libkk's compute pipelines in
+``vkCreateDevice`` of two devices at once, both freeing memory inside the
+Metal compiler (``newComputePipelineStateWithDescriptor:`` or the autorelease
+pool popped after it) when the trap fired; a render pipeline crashed with a
+protection fault inside AGXMetalG16X's compiler in the same burst. One shared
+compiler compiles as many pipelines concurrently as one compiler per device
+(16 threads compiling on an M1 Max), so the workaround stays on everywhere.
+
 | Log:
 | 2026-05-28: Workaround implemented
 | 2026-08-10: Resolved in macOS 27 beta 5
+| 2026-10-13: Kept on macOS 27: its betas 1-4 crash without it (steamac STEAMAC-31/39)
 
 KK_WORKAROUND_10
 ----------------
