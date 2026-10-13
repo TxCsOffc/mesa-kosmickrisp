@@ -249,6 +249,36 @@ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
    }
 }
 
+void
+kk_render_pass_descriptor_load_attachments(struct kk_cmd_buffer *cmd)
+{
+   mtl_render_pass_descriptor *pass_descriptor =
+      cmd->state.gfx.render_pass_descriptor;
+   const struct kk_rendering_state *render = &cmd->state.gfx.render;
+
+   for (uint32_t i = 0; i < render->color_att_count; i++) {
+      const struct kk_image_view *iview = render->color_att[i].iview;
+      if (!iview)
+         continue;
+      mtl_render_pass_attachment_descriptor *attachment_descriptor =
+         mtl_render_pass_descriptor_get_color_attachment(pass_descriptor, i);
+      mtl_render_pass_attachment_descriptor_set_load_action(
+         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
+   }
+   if (render->depth_att.iview) {
+      mtl_render_pass_attachment_descriptor *attachment_descriptor =
+         mtl_render_pass_descriptor_get_depth_attachment(pass_descriptor);
+      mtl_render_pass_attachment_descriptor_set_load_action(
+         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
+   }
+   if (render->stencil_att.iview) {
+      mtl_render_pass_attachment_descriptor *attachment_descriptor =
+         mtl_render_pass_descriptor_get_stencil_attachment(pass_descriptor);
+      mtl_render_pass_attachment_descriptor_set_load_action(
+         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                      const VkRenderingInfo *pRenderingInfo)
@@ -441,35 +471,17 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    // it
 
    /* Rendering with no attachments requires pushing the start of the render
-    * pass to first pipeline binding to know sample count. */
+    * pass to first pipeline binding to know sample count. One that would
+    * follow other encoders of the Metal command buffer starts at its first
+    * use: work the first draw records before it (pre_gfx: unroll kernels,
+    * draw predicates) runs ahead of it in that command buffer, and the
+    * rendering's render encoder starts a Metal command buffer of its own
+    * after it only then (cs_start_render). */
    cmd->state.gfx.render_pass_descriptor = pass_descriptor;
-   if (!no_framebuffer)
-      cs_start_render(cmd);
-
-   /* Store descriptor in case we need to restart the pass at pipeline barrier,
-    * but force loads */
-   for (uint32_t i = 0; i < render->color_att_count; i++) {
-      const struct kk_image_view *iview = render->color_att[i].iview;
-      if (!iview)
-         continue;
-      mtl_render_pass_attachment_descriptor *attachment_descriptor =
-         mtl_render_pass_descriptor_get_color_attachment(pass_descriptor, i);
-      mtl_render_pass_attachment_descriptor_set_load_action(
-         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
-   }
-   if (render->depth_att.iview) {
-      mtl_render_pass_attachment_descriptor *attachment_descriptor =
-         mtl_render_pass_descriptor_get_depth_attachment(pass_descriptor);
-      mtl_render_pass_attachment_descriptor_set_load_action(
-         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
-   }
-   if (render->stencil_att.iview) {
-      mtl_render_pass_attachment_descriptor *attachment_descriptor =
-         mtl_render_pass_descriptor_get_stencil_attachment(pass_descriptor);
-      mtl_render_pass_attachment_descriptor_set_load_action(
-         attachment_descriptor, MTL_LOAD_ACTION_LOAD);
-   }
-   cmd->state.gfx.need_to_start_render_pass = no_framebuffer;
+   render->first_start = !no_framebuffer;
+   cmd->state.gfx.need_to_start_render_pass = true;
+   if (!no_framebuffer && !cmd->metal.cmd_buf_used)
+      cs_get_render(cmd);
 
    kk_cmd_buffer_dirty_all_gfx(cmd);
 
@@ -630,6 +642,10 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       .pStencilAttachment = &vk_stencil_att,
    };
 
+   /* A rendering whose render encoder never started still loads or clears,
+    * stores and resolves its attachments */
+   if (render->first_start)
+      cs_get_render(cmd);
    kk_apply_attachment_store_ops(cmd, false);
 
    /* Clean up previous encoder */
@@ -980,6 +996,10 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
       if (memcmp(render->color_map, dyn->cal.color_map,
                  render->color_att_count * sizeof(render->color_map[0])) != 0) {
          assert(cmd->state.gfx.render_pass_descriptor);
+
+         /* The first render encoder takes the attachments' load actions */
+         if (render->first_start)
+            cs_get_render(cmd);
 
          /* Apply the store ops before the new color map is stored. */
          kk_apply_attachment_store_ops(cmd, true);
@@ -2596,8 +2616,6 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
 
-   kk_flush_gfx_state(cmd);
-
    data->restart = dyn->ia.primitive_restart_enable;
    data->restart_index = dyn->ia.primitive_restart_index;
    data->flatshade_first =
@@ -2643,6 +2661,10 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    bool gs_restart = geom && !tess && data->restart && data->indexed;
    if (gs_restart && !kk_convert_to_indirect_draw(cmd, data))
       return;
+
+   /* After the pre_gfx work: a render encoder yet to start follows it
+    * (kk_CmdBeginRendering) */
+   kk_flush_gfx_state(cmd);
 
    for (uint32_t i = 0; i < data->draw_count; i++) {
       struct kk_draw_data draw_data = build_draw_data(cmd, data, i);

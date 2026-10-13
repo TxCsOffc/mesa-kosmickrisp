@@ -136,6 +136,15 @@ struct kk_rendering_state {
    VkSampleLocationEXT sample_locations[KK_MAX_SAMPLES];
    bool force_attachment_store;
    bool rendering_to_whole_framebuffer;
+   /* The rendering has attachments and its first render encoder is yet to
+    * start (cs_start_render): that one takes the attachments' load actions
+    * and sample count. It starts at the first use when it would follow other
+    * encoders of its Metal command buffer (kk_CmdBeginRendering). */
+   bool first_start;
+   /* A draw of the rendering recorded pre_gfx work (cs_get_pre_gfx): its
+    * render encoders that would follow other encoders start a Metal command
+    * buffer (cs_start_render). */
+   bool pre_gfx;
 };
 
 /* Dirty tracking bits for state not tracked by vk_dynamic_graphics_state or
@@ -264,9 +273,9 @@ struct kk_cmd_buffer {
       mtl_command_allocator *allocator;
       /* The Metal command buffer being encoded, the last of cmd_bufs */
       mtl_command_buffer *cmd_buf;
-      /* Metal command buffers of the recording in commit order. A render
-       * encoder starts one of its own (cs_start_render), so that its pre_gfx
-       * pass can be committed right before it. */
+      /* Metal command buffers of the recording in commit order. Render
+       * encoders of renderings with pre_gfx work start one (cs_start_render),
+       * so that their pre_gfx pass can be committed right before them. */
       struct util_dynarray cmd_bufs;
       /* cmd_buf has an encoder */
       bool cmd_buf_used;
@@ -275,8 +284,11 @@ struct kk_cmd_buffer {
       mtl_render_encoder *render;
       mtl_compute_encoder *compute;
       /* Compute pass of pre_gfx dispatches recorded while the render encoder
-       * is open (kk_dispatch_precomp): a Metal command buffer of its own,
-       * committed before the render encoder's. */
+       * is open (cs_get_pre_gfx), at the end of the Metal command buffer
+       * committed right before the render encoder's: the one the render
+       * encoder started after, or one of its own. Two Metal command buffers
+       * are encoded at once then, each with an allocator of its own:
+       * pre_gfx.cmd_buf with pre_gfx.allocator, cmd_buf with allocator. */
       struct {
          mtl_command_allocator *allocator;
          mtl_command_buffer *cmd_buf;
@@ -410,6 +422,10 @@ void kk_cmd_buffer_flush_push_descriptors(struct kk_cmd_buffer *cmd,
                                           struct kk_descriptor_state *desc);
 
 void kk_apply_attachment_store_ops(struct kk_cmd_buffer *cmd, bool force_store);
+
+/* Attachments of the render pass descriptor load (restarted render encoders
+ * of the rendering) */
+void kk_render_pass_descriptor_load_attachments(struct kk_cmd_buffer *cmd);
 
 bool kk_attachment_do_renderpass_resolve(const struct kk_attachment *attachment,
                                          bool rendering_to_whole_framebuffer,

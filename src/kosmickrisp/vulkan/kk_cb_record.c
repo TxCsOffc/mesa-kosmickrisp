@@ -223,9 +223,9 @@ kk_cb_record_format(const struct kk_cb_record *r, char *buf, size_t size)
                     r->max_samples);
    kk_out_printf(&out,
                  ", %u compute encoders, %u draws (%u indirect), %u "
-                 "dispatches (%u indirect)",
+                 "dispatches (%u indirect), %u Metal command buffers",
                  r->compute_encoders, r->draws, r->indirect_draws,
-                 r->dispatches, r->indirect_dispatches);
+                 r->dispatches, r->indirect_dispatches, r->metal_cmd_bufs);
    if (r->ops) {
       kk_out_printf(&out, "; ops");
       for (uint32_t i = 0u; i < KK_CB_OP_COUNT; i++) {

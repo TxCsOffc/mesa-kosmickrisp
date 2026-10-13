@@ -67,6 +67,8 @@ struct kk_cb_record {
    uint16_t indirect_draws;
    uint16_t dispatches;
    uint16_t indirect_dispatches;
+   /* Metal command buffers committed for it */
+   uint16_t metal_cmd_bufs;
    uint8_t max_samples;
    uint8_t program_count;
    /* Programs bound past programs[] */

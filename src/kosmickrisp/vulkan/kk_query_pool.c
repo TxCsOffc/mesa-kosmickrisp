@@ -510,7 +510,7 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
           * compute work in the encoder to trigger it.  Rewrite the low half of
           * the sentinel the report already holds, which leaves the query
           * unavailable until the resolve lands. */
-         libkk_write_u32(cmd, kk_grid_1d(1), true,
+         libkk_write_u32(cmd, kk_grid_1d(1), false,
                          kk_query_report_addr(dev, pool, query),
                          (uint32_t)LIBKK_QUERY_UNAVAILABLE);
 
