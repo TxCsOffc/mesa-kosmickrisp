@@ -93,6 +93,16 @@ struct kk_device {
     * lifetime and their source strings are owned by the table. */
    struct hash_table *msl_libraries;
 
+   /* Metal pipeline states by what the Metal pipeline is built from, so that
+    * two pipelines with the same programs and the same state share one. The
+    * compiler spends its time here, not in the library: a title that rebuilds
+    * its pipeline set every launch compiles the same program tens of times
+    * (Dragon's Dogma 2: 26,452 program compiles for 4,594 distinct programs in
+    * one run). Keys own their entry-point names; the states and the keys are
+    * held for the device's lifetime (kk_metal_pipelines_init). */
+   struct hash_table *metal_render_pipelines;
+   struct hash_table *metal_compute_pipelines;
+
    /* Dispatch table exposed to the user. Required since we need to record all
     * commands due to Metal limitations */
    struct vk_device_dispatch_table exposed_dispatch_table;
@@ -139,9 +149,16 @@ struct kk_device {
    uint32_t compile_thread_count;
    thrd_t *compile_threads;
 
-   /* Serializes the compiled-library table (msl_libraries), which the compile
-    * pool shares */
-   simple_mtx_t msl_libraries_lock;
+   /* Serializes the compiled-library table (msl_libraries) and the Metal
+    * pipeline tables, which the compile pool shares. Not held across a
+    * compile: that would serialize the pool. */
+   mtx_t msl_libraries_lock;
+   mtx_t metal_pipelines_lock;
+   /* Signalled when a table entry stops being compiled: the pool has many
+    * workers asking for the same program at once, and only one of them should
+    * compile it (kk_get_msl_library, kk_find_metal_render_pipeline). */
+   cnd_t msl_libraries_cnd;
+   cnd_t metal_pipelines_cnd;
 
    /* os_time_get_nano() at creation (command queue error diagnostics) */
    int64_t created_ns;

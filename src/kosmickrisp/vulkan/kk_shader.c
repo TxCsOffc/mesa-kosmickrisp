@@ -1311,6 +1311,282 @@ get_empty_nir(struct kk_device *dev, mesa_shader_stage stage,
    return nir;
 }
 
+/* --- shared Metal pipeline states -------------------------------------------
+ * The compiled MSL library is shared per source (kk_get_msl_library), but the
+ * Metal pipeline state built on top of it - the part Metal spends tens of
+ * milliseconds on - was created once per Vulkan pipeline. A title that rebuilds
+ * its pipeline set every launch compiles the same program tens of times: in one
+ * Dragon's Dogma 2 run 26,452 program compiles covered 4,594 distinct programs,
+ * and the host benchmark compiles one program 197 times in one process. Two
+ * pipelines built from the same libraries, entry points and state are the same
+ * Metal pipeline, so the later one finds the earlier one here.
+ *
+ * The keys hold the library handles, which kk_get_msl_library hands out as one
+ * canonical instance per source: equal pipelines then compare equal without
+ * hashing or holding the MSL again. The entry-point names are copied into the
+ * key, because the shader owns its own and outlives nothing here.
+ */
+struct kk_metal_render_key {
+   mtl_library *vs_library;
+   mtl_library *fs_library;
+   char *vs_entrypoint;
+   char *fs_entrypoint;
+   enum mtl_primitive_topology_class topology;
+   enum mtl_pixel_format rt_formats[MAX_DRAW_BUFFERS];
+   uint32_t raster_sample_count;
+   uint32_t max_amplification;
+};
+
+struct kk_metal_compute_key {
+   mtl_library *library;
+   char *entrypoint;
+   uint32_t max_total_threads;
+};
+
+static void
+kk_metal_render_key_free(struct kk_metal_render_key *key)
+{
+   free(key->vs_entrypoint);
+   free(key->fs_entrypoint);
+   free(key);
+}
+
+static struct kk_metal_render_key *
+kk_metal_render_key_create(struct kk_shader *vs,
+                           const struct msl_compile_data *vs_data,
+                           const struct msl_compile_data *fs_data,
+                           mtl_library *vs_library, mtl_library *fs_library)
+{
+   struct kk_metal_render_key *key = calloc(1, sizeof(*key));
+   if (key == NULL)
+      return NULL;
+
+   key->vs_library = vs_library;
+   key->fs_library = fs_library;
+   key->vs_entrypoint = strdup(vs_data->entrypoint_name);
+   key->fs_entrypoint = strdup(fs_data->entrypoint_name);
+   /* What kk_compile_graphics_pipeline puts on the Metal descriptor */
+   key->topology = vs->info.vs.topology;
+   memcpy(key->rt_formats, vs->info.vs.rt_formats, sizeof(key->rt_formats));
+   key->raster_sample_count =
+      vs->info.vs.has_ms ? vs->info.vs.sample_count : 1u;
+   key->max_amplification =
+      vs->info.vs.view_mask ? util_bitcount(vs->info.vs.view_mask) : 0u;
+
+   if (key->vs_entrypoint == NULL || key->fs_entrypoint == NULL) {
+      kk_metal_render_key_free(key);
+      return NULL;
+   }
+   return key;
+}
+
+static uint32_t
+kk_metal_render_key_hash(const void *key)
+{
+   const struct kk_metal_render_key *k = key;
+   uint32_t hash = _mesa_hash_pointer(k->vs_library);
+   hash = _mesa_hash_data_with_seed(k->vs_entrypoint,
+                                    strlen(k->vs_entrypoint), hash);
+   hash = _mesa_hash_pointer(k->fs_library) ^ (hash * 0x9e3779b1u);
+   hash = _mesa_hash_data_with_seed(k->fs_entrypoint,
+                                    strlen(k->fs_entrypoint), hash);
+   hash = _mesa_hash_data_with_seed(&k->topology, sizeof(k->topology), hash);
+   hash = _mesa_hash_data_with_seed(k->rt_formats, sizeof(k->rt_formats),
+                                    hash);
+   hash = _mesa_hash_data_with_seed(&k->raster_sample_count,
+                                    sizeof(k->raster_sample_count), hash);
+   return _mesa_hash_data_with_seed(&k->max_amplification,
+                                    sizeof(k->max_amplification), hash);
+}
+
+static bool
+kk_metal_render_key_equal(const void *a, const void *b)
+{
+   const struct kk_metal_render_key *x = a;
+   const struct kk_metal_render_key *y = b;
+   return x->vs_library == y->vs_library &&
+          x->fs_library == y->fs_library &&
+          x->topology == y->topology &&
+          x->raster_sample_count == y->raster_sample_count &&
+          x->max_amplification == y->max_amplification &&
+          memcmp(x->rt_formats, y->rt_formats, sizeof(x->rt_formats)) == 0 &&
+          strcmp(x->vs_entrypoint, y->vs_entrypoint) == 0 &&
+          strcmp(x->fs_entrypoint, y->fs_entrypoint) == 0;
+}
+
+static void
+kk_metal_compute_key_free(struct kk_metal_compute_key *key)
+{
+   free(key->entrypoint);
+   free(key);
+}
+
+static struct kk_metal_compute_key *
+kk_metal_compute_key_create(mtl_library *library, const char *entrypoint,
+                            uint32_t max_total_threads)
+{
+   struct kk_metal_compute_key *key = calloc(1, sizeof(*key));
+   if (key == NULL)
+      return NULL;
+
+   key->library = library;
+   key->entrypoint = strdup(entrypoint);
+   key->max_total_threads = max_total_threads;
+   if (key->entrypoint == NULL) {
+      kk_metal_compute_key_free(key);
+      return NULL;
+   }
+   return key;
+}
+
+static uint32_t
+kk_metal_compute_key_hash(const void *key)
+{
+   const struct kk_metal_compute_key *k = key;
+   uint32_t hash = _mesa_hash_pointer(k->library);
+   hash = _mesa_hash_data_with_seed(k->entrypoint, strlen(k->entrypoint), hash);
+   return _mesa_hash_data_with_seed(&k->max_total_threads,
+                                    sizeof(k->max_total_threads), hash);
+}
+
+static bool
+kk_metal_compute_key_equal(const void *a, const void *b)
+{
+   const struct kk_metal_compute_key *x = a;
+   const struct kk_metal_compute_key *y = b;
+   return x->library == y->library &&
+          x->max_total_threads == y->max_total_threads &&
+          strcmp(x->entrypoint, y->entrypoint) == 0;
+}
+
+/* The tables are created with the device: shaders are compiled into them from
+ * the pool, which starts right after. */
+void
+kk_metal_pipelines_init(struct kk_device *dev)
+{
+   mtx_init(&dev->metal_pipelines_lock, mtx_plain);
+   cnd_init(&dev->metal_pipelines_cnd);
+   dev->metal_render_pipelines =
+      _mesa_hash_table_create(NULL /* ralloc context, not vk.alloc */, kk_metal_render_key_hash,
+                              kk_metal_render_key_equal);
+   dev->metal_compute_pipelines =
+      _mesa_hash_table_create(NULL /* ralloc context, not vk.alloc */, kk_metal_compute_key_hash,
+                              kk_metal_compute_key_equal);
+}
+
+void
+kk_metal_pipelines_finish(struct kk_device *dev)
+{
+   if (dev->metal_render_pipelines != NULL) {
+      hash_table_foreach(dev->metal_render_pipelines, entry) {
+         mtl_release(entry->data);
+         kk_metal_render_key_free((struct kk_metal_render_key *)entry->key);
+      }
+      _mesa_hash_table_destroy(dev->metal_render_pipelines, NULL);
+   }
+   if (dev->metal_compute_pipelines != NULL) {
+      hash_table_foreach(dev->metal_compute_pipelines, entry) {
+         mtl_release(entry->data);
+         kk_metal_compute_key_free((struct kk_metal_compute_key *)entry->key);
+      }
+      _mesa_hash_table_destroy(dev->metal_compute_pipelines, NULL);
+   }
+   cnd_destroy(&dev->metal_pipelines_cnd);
+   mtx_destroy(&dev->metal_pipelines_lock);
+}
+
+/* A reference to the shared pipeline state for key, or NULL when this caller
+ * has to compile it. Waiting while another worker compiles it is the point:
+ * the pool starts many pipelines with the same programs at once, and one
+ * MTL4Compiler compiles them one at a time anyway. A caller that gets NULL owns
+ * the table's reservation for the key and publishes with
+ * kk_publish_metal_render_pipeline(); a caller that gets a state has had its key
+ * freed for it. */
+static mtl_render_pipeline_state *
+kk_find_metal_render_pipeline(struct kk_device *dev,
+                              struct kk_metal_render_key *key)
+{
+   mtx_lock(&dev->metal_pipelines_lock);
+   struct hash_entry *entry =
+      _mesa_hash_table_search(dev->metal_render_pipelines, key);
+   /* An entry without a pipeline is another worker's compile in flight */
+   while (entry != NULL && entry->data == NULL) {
+      cnd_wait(&dev->metal_pipelines_cnd, &dev->metal_pipelines_lock);
+      entry = _mesa_hash_table_search(dev->metal_render_pipelines, key);
+   }
+   mtl_render_pipeline_state *state =
+      entry != NULL ? mtl_retain(entry->data) : NULL;
+   if (state == NULL && entry == NULL)
+      _mesa_hash_table_insert(dev->metal_render_pipelines, key, NULL);
+   mtx_unlock(&dev->metal_pipelines_lock);
+   if (state != NULL)
+      kk_metal_render_key_free(key);
+   return state;
+}
+
+/* Takes ownership of the reserved key and one reference to state, or of the key
+ * alone when state is NULL (the compile failed and the next worker tries). */
+static void
+kk_publish_metal_render_pipeline(struct kk_device *dev,
+                                 struct kk_metal_render_key *key,
+                                 mtl_render_pipeline_state *state)
+{
+   mtx_lock(&dev->metal_pipelines_lock);
+   struct hash_entry *entry =
+      _mesa_hash_table_search(dev->metal_render_pipelines, key);
+   if (entry != NULL && entry->data == NULL) {
+      if (state != NULL)
+         entry->data = mtl_retain(state);
+      else {
+         kk_metal_render_key_free((struct kk_metal_render_key *)entry->key);
+         _mesa_hash_table_remove(dev->metal_render_pipelines, entry);
+      }
+   }
+   cnd_broadcast(&dev->metal_pipelines_cnd);
+   mtx_unlock(&dev->metal_pipelines_lock);
+}
+
+static mtl_compute_pipeline_state *
+kk_find_metal_compute_pipeline(struct kk_device *dev,
+                               struct kk_metal_compute_key *key)
+{
+   mtx_lock(&dev->metal_pipelines_lock);
+   struct hash_entry *entry =
+      _mesa_hash_table_search(dev->metal_compute_pipelines, key);
+   while (entry != NULL && entry->data == NULL) {
+      cnd_wait(&dev->metal_pipelines_cnd, &dev->metal_pipelines_lock);
+      entry = _mesa_hash_table_search(dev->metal_compute_pipelines, key);
+   }
+   mtl_compute_pipeline_state *state =
+      entry != NULL ? mtl_retain(entry->data) : NULL;
+   if (state == NULL && entry == NULL)
+      _mesa_hash_table_insert(dev->metal_compute_pipelines, key, NULL);
+   mtx_unlock(&dev->metal_pipelines_lock);
+   if (state != NULL)
+      kk_metal_compute_key_free(key);
+   return state;
+}
+
+static void
+kk_publish_metal_compute_pipeline(struct kk_device *dev,
+                                  struct kk_metal_compute_key *key,
+                                  mtl_compute_pipeline_state *state)
+{
+   mtx_lock(&dev->metal_pipelines_lock);
+   struct hash_entry *entry =
+      _mesa_hash_table_search(dev->metal_compute_pipelines, key);
+   if (entry != NULL && entry->data == NULL) {
+      if (state != NULL)
+         entry->data = mtl_retain(state);
+      else {
+         kk_metal_compute_key_free((struct kk_metal_compute_key *)entry->key);
+         _mesa_hash_table_remove(dev->metal_compute_pipelines, entry);
+      }
+   }
+   cnd_broadcast(&dev->metal_pipelines_cnd);
+   mtx_unlock(&dev->metal_pipelines_lock);
+}
+
 /* The compiled library of an MSL source, kept for the device's lifetime: a title
  * asks for the same program once per pipeline (Dragon's Dogma 2: ~100 times per
  * program), and while Metal's own cache answers each request in fractions of a
@@ -1323,11 +1599,28 @@ kk_get_msl_library(struct kk_device *device, const char *source)
    /* The compile pool shares this table, and the lock guards the table only.
     * Holding it across mtl_new_library would make the pool compile one library
     * at a time, which is exactly what the pool exists to avoid. */
-   simple_mtx_lock(&device->msl_libraries_lock);
-   struct hash_entry *entry =
-      _mesa_hash_table_search(device->msl_libraries, source);
+   mtx_lock(&device->msl_libraries_lock);
+   struct hash_entry *entry = _mesa_hash_table_search(device->msl_libraries,
+                                                      source);
+   /* An entry without a library is a source another worker is compiling: wait
+    * for it rather than compile the same MSL a second time. Sixteen workers
+    * asking for the same program at once is the normal case (a title starts
+    * every pipeline of a burst with the same shaders). */
+   while (entry != NULL && entry->data == NULL) {
+      cnd_wait(&device->msl_libraries_cnd, &device->msl_libraries_lock);
+      entry = _mesa_hash_table_search(device->msl_libraries, source);
+   }
    mtl_library *cached = entry != NULL ? mtl_retain(entry->data) : NULL;
-   simple_mtx_unlock(&device->msl_libraries_lock);
+   if (cached == NULL) {
+      /* Compile this source: the placeholder keeps anyone else off it */
+      char *key = strdup(source);
+      if (key == NULL) {
+         mtx_unlock(&device->msl_libraries_lock);
+         return NULL;
+      }
+      entry = _mesa_hash_table_insert(device->msl_libraries, key, NULL);
+   }
+   mtx_unlock(&device->msl_libraries_lock);
    if (cached != NULL)
       return cached;
 
@@ -1335,35 +1628,27 @@ kk_get_msl_library(struct kk_device *device, const char *source)
    mtl_library *library = mtl_new_library(
       device->mtl_compiler_handle, source, pdev->info.msl_version,
       MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
-   if (library == NULL)
-      return NULL;
 
-   char *key = strdup(source);
-   if (key == NULL) {
-      mtl_release(library);
-      return NULL;
-   }
-
-   /* Two threads can compile the same program at the same time now. Keep the
-    * first library in the table and hand this caller that one (the second
-    * library is released), so the table holds one entry and one reference per
-    * source and every caller gets a library that is in it. */
-   simple_mtx_lock(&device->msl_libraries_lock);
+   mtx_lock(&device->msl_libraries_lock);
+   /* The placeholder is looked up again: the table may have moved its entries
+    * while the lock was dropped. */
    entry = _mesa_hash_table_search(device->msl_libraries, source);
-   if (entry != NULL) {
-      mtl_library *existing = mtl_retain(entry->data);
-      simple_mtx_unlock(&device->msl_libraries_lock);
-      free(key);
-      mtl_release(library);
-      return existing;
+   if (entry != NULL && entry->data == NULL) {
+      if (library != NULL)
+         entry->data = mtl_retain(library);
+      else {
+         /* Nobody waits forever on a source that cannot be compiled */
+         free((char *)entry->key);
+         _mesa_hash_table_remove(device->msl_libraries, entry);
+      }
    }
-   _mesa_hash_table_insert(device->msl_libraries, key, mtl_retain(library));
-   simple_mtx_unlock(&device->msl_libraries_lock);
+   cnd_broadcast(&device->msl_libraries_cnd);
+   mtx_unlock(&device->msl_libraries_lock);
    return library;
 }
 
 static VkResult
-kk_compile_compute_pipeline(struct kk_device *device,
+kk_compile_compute_pipeline(struct kk_device *device, mtl_compiler *compiler,
                             const struct msl_compile_data *data,
                             uint32_t local_size_threads,
                             mtl_compute_pipeline_state **pipe)
@@ -1372,15 +1657,31 @@ kk_compile_compute_pipeline(struct kk_device *device,
    if (library == NULL)
       return VK_ERROR_INVALID_SHADER_NV;
 
-   mtl_function_descriptor *function =
-      mtl_new_library_function_descriptor(library, data->entrypoint_name);
-   mtl_compute_pipeline_state *pipeline = mtl_new_compute_pipeline_state(
-      device->mtl_compiler_handle, function, local_size_threads);
-   mtl_release(function);
-   mtl_release(library);
+   struct kk_metal_compute_key *key = kk_metal_compute_key_create(
+      library, data->entrypoint_name, local_size_threads);
+   if (key == NULL) {
+      mtl_release(library);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
 
-   if (pipeline == NULL)
-      return VK_ERROR_INVALID_SHADER_NV;
+   /* A compute pipeline with the same kernel and threadgroup size is the same
+    * Metal pipeline (kk_metal_pipelines_init) */
+   mtl_compute_pipeline_state *pipeline =
+      kk_find_metal_compute_pipeline(device, key);
+   if (pipeline == NULL) {
+      mtl_function_descriptor *function =
+         mtl_new_library_function_descriptor(library, data->entrypoint_name);
+      pipeline = mtl_new_compute_pipeline_state(compiler, function,
+                                                local_size_threads);
+      mtl_release(function);
+      /* Takes the key, which this caller no longer owns */
+      kk_publish_metal_compute_pipeline(device, key, pipeline);
+      if (pipeline == NULL) {
+         mtl_release(library);
+         return VK_ERROR_INVALID_SHADER_NV;
+      }
+   }
+   mtl_release(library);
 
    *pipe = pipeline;
 
@@ -1603,7 +1904,8 @@ gather_graphics_pipeline_create_info(
 }
 
 static VkResult
-kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+kk_compile_graphics_pipeline(struct kk_device *device, mtl_compiler *compiler,
+                             struct kk_shader *vs)
 {
    struct kk_physical_device *pdev = kk_device_physical(device);
 
@@ -1621,7 +1923,8 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
       uint32_t local_thread_size = vs_stage == MESA_SHADER_TESS_CTRL
                                       ? vs->info.vs.tess_local_thread_size
                                       : KK_POLY_WG_SIZE;
-      result = kk_compile_compute_pipeline(device, &vs->msl_data[vs_stage],
+      result = kk_compile_compute_pipeline(device, compiler,
+                                           &vs->msl_data[vs_stage],
                                            local_thread_size,
                                            &pipe->gfx.pre_render[i]);
 
@@ -1635,21 +1938,22 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
    if (vs->info.vs.additional_stages_bits &
        BITFIELD_BIT(MESA_SHADER_GEOMETRY)) {
       result = kk_compile_compute_pipeline(
-         device, &vs->gs_main, KK_POLY_WG_SIZE,
+         device, compiler, &vs->gs_main, KK_POLY_WG_SIZE,
          &pipe->gfx.pre_render[pipe->gfx.pre_render_count++]);
       if (result != VK_SUCCESS)
          return VK_ERROR_INVALID_SHADER_NV;
 
       if (vs->gs_count.code) {
          result = kk_compile_compute_pipeline(
-            device, &vs->gs_count, KK_POLY_WG_SIZE, &pipe->gfx.gs_count);
+            device, compiler, &vs->gs_count, KK_POLY_WG_SIZE,
+            &pipe->gfx.gs_count);
          if (result != VK_SUCCESS)
             return VK_ERROR_INVALID_SHADER_NV;
       }
 
       if (vs->pre_gs.code) {
-         result = kk_compile_compute_pipeline(device, &vs->pre_gs, 1u,
-                                              &pipe->gfx.pre_gs);
+         result = kk_compile_compute_pipeline(device, compiler, &vs->pre_gs,
+                                              1u, &pipe->gfx.pre_gs);
          if (result != VK_SUCCESS)
             return VK_ERROR_INVALID_SHADER_NV;
       }
@@ -1660,70 +1964,92 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
    if (vertex_library == NULL)
       return VK_ERROR_INVALID_SHADER_NV;
 
-   mtl_function_descriptor *vertex_function =
-      mtl_new_library_function_descriptor(vertex_library,
-                                          vs_data->entrypoint_name);
-
    const struct msl_compile_data *fs_data = &vs->msl_data[MESA_SHADER_FRAGMENT];
    mtl_library *fragment_library = kk_get_msl_library(device, fs_data->code);
    if (fragment_library == NULL) {
-      result = VK_ERROR_INVALID_SHADER_NV;
-      goto destroy_vertex;
-   }
-   mtl_function_descriptor *fragment_function =
-      mtl_new_library_function_descriptor(fragment_library,
-                                          fs_data->entrypoint_name);
-
-   mtl_render_pipeline_descriptor *pipeline_descriptor =
-      mtl_new_render_pipeline_descriptor();
-   mtl_render_pipeline_descriptor_set_vertex_shader(pipeline_descriptor,
-                                                    vertex_function);
-   mtl_render_pipeline_descriptor_set_fragment_shader(pipeline_descriptor,
-                                                      fragment_function);
-
-   /* Layered rendering in Metal requires setting primitive topology class */
-   mtl_render_pipeline_descriptor_set_input_primitive_topology(
-      pipeline_descriptor, vs->info.vs.topology);
-
-   /* If color attachments are reordered there might be unused / invalid gaps
-    * in the array so need to check them all, not just first
-    * color_attachment_count entries.
-    */
-   for (uint8_t i = 0; i < MAX_DRAW_BUFFERS; ++i) {
-      if (vs->info.vs.rt_formats[i] != MTL_PIXEL_FORMAT_INVALID)
-         mtl_render_pipeline_descriptor_set_color_attachment_format(
-            pipeline_descriptor, i, vs->info.vs.rt_formats[i]);
+      mtl_release(vertex_library);
+      return VK_ERROR_INVALID_SHADER_NV;
    }
 
-   /* A pipeline whose minmax program was compiled first has it already */
+   /* A pipeline whose minmax program was compiled first has it already. The
+    * state is bound on its own, so it is needed on both paths below. */
    if (vs->info.vs.has_ds && pipe->gfx.ds_handle == NULL) {
       pipe->gfx.ds_handle = kk_compile_ds_state(device, &vs->info);
    }
 
-   if (vs->info.vs.view_mask) {
-      uint32_t max_amplification = util_bitcount(vs->info.vs.view_mask);
-      mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(
-         pipeline_descriptor, max_amplification);
+   /* A render pipeline built from the same two programs and state is the same
+    * Metal pipeline (kk_metal_pipelines_init) */
+   struct kk_metal_render_key *key =
+      kk_metal_render_key_create(vs, vs_data, fs_data, vertex_library,
+                                 fragment_library);
+   if (key == NULL) {
+      mtl_release(fragment_library);
+      mtl_release(vertex_library);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
-   if (vs->info.vs.has_ms) {
-      mtl_render_pipeline_descriptor_set_raster_sample_count(
-         pipeline_descriptor, vs->info.vs.sample_count);
+   mtl_render_pipeline_state *render =
+      kk_find_metal_render_pipeline(device, key);
+   if (render == NULL) {
+      mtl_function_descriptor *vertex_function =
+         mtl_new_library_function_descriptor(vertex_library,
+                                             vs_data->entrypoint_name);
+      mtl_function_descriptor *fragment_function =
+         mtl_new_library_function_descriptor(fragment_library,
+                                             fs_data->entrypoint_name);
+
+      mtl_render_pipeline_descriptor *pipeline_descriptor =
+         mtl_new_render_pipeline_descriptor();
+      mtl_render_pipeline_descriptor_set_vertex_shader(pipeline_descriptor,
+                                                       vertex_function);
+      mtl_render_pipeline_descriptor_set_fragment_shader(pipeline_descriptor,
+                                                         fragment_function);
+
+      /* Layered rendering in Metal requires setting primitive topology class */
+      mtl_render_pipeline_descriptor_set_input_primitive_topology(
+         pipeline_descriptor, vs->info.vs.topology);
+
+      /* If color attachments are reordered there might be unused / invalid gaps
+       * in the array so need to check them all, not just first
+       * color_attachment_count entries.
+       */
+      for (uint8_t i = 0; i < MAX_DRAW_BUFFERS; ++i) {
+         if (vs->info.vs.rt_formats[i] != MTL_PIXEL_FORMAT_INVALID)
+            mtl_render_pipeline_descriptor_set_color_attachment_format(
+               pipeline_descriptor, i, vs->info.vs.rt_formats[i]);
+      }
+
+      if (vs->info.vs.view_mask) {
+         uint32_t max_amplification = util_bitcount(vs->info.vs.view_mask);
+         mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(
+            pipeline_descriptor, max_amplification);
+      }
+
+      if (vs->info.vs.has_ms) {
+         mtl_render_pipeline_descriptor_set_raster_sample_count(
+            pipeline_descriptor, vs->info.vs.sample_count);
+      }
+
+      render = mtl_new_render_pipeline(compiler, pipeline_descriptor);
+
+      mtl_release(pipeline_descriptor);
+      mtl_release(fragment_function);
+      mtl_release(vertex_function);
+
+      /* Takes the key, which this caller no longer owns */
+      kk_publish_metal_render_pipeline(device, key, render);
+      if (render == NULL) {
+         mtl_release(fragment_library);
+         mtl_release(vertex_library);
+         return VK_ERROR_INVALID_SHADER_NV;
+      }
    }
 
-   pipe->gfx.render =
-      mtl_new_render_pipeline(device->mtl_compiler_handle, pipeline_descriptor);
-   if (pipe->gfx.render == NULL)
-      result = VK_ERROR_INVALID_SHADER_NV;
-
-   mtl_release(pipeline_descriptor);
-   mtl_release(fragment_function);
    mtl_release(fragment_library);
-destroy_vertex:
-   mtl_release(vertex_function);
    mtl_release(vertex_library);
+   pipe->gfx.render = render;
 
-   return result;
+   return VK_SUCCESS;
 }
 
 static bool
@@ -2077,7 +2403,8 @@ kk_digest_program(struct kk_shader *s)
 
 /* Creates the Metal pipelines of a program (its VS or CS). */
 static VkResult
-kk_compile_program(struct kk_device *dev, struct kk_shader *s)
+kk_compile_program(struct kk_device *dev, struct kk_shader *s,
+                   mtl_compiler *compiler)
 {
    VkResult result;
    if (s->info.stage == MESA_SHADER_COMPUTE) {
@@ -2085,10 +2412,11 @@ kk_compile_program(struct kk_device *dev, struct kk_shader *s)
                                     s->info.cs.local_size.y *
                                     s->info.cs.local_size.z;
       result =
-         kk_compile_compute_pipeline(dev, &s->msl_data[MESA_SHADER_COMPUTE],
+         kk_compile_compute_pipeline(dev, compiler,
+                                     &s->msl_data[MESA_SHADER_COMPUTE],
                                      local_size_threads, &s->pipeline.cs);
    } else {
-      result = kk_compile_graphics_pipeline(dev, s);
+      result = kk_compile_graphics_pipeline(dev, compiler, s);
    }
    if (result == VK_SUCCESS) {
       kk_digest_program(s);
@@ -2126,7 +2454,12 @@ kk_compile_worker(void *data)
       s->compile_next = NULL;
       mtx_unlock(&dev->compile_mtx);
 
-      VkResult result = kk_compile_program(dev, s);
+      /* The device's compiler: one MTL4Compiler compiles its compiles one at a
+       * time (measured: 16 workers take as long as one, or as 16 compilers in
+       * one process, while a second process does get a second channel), so
+       * there is nothing to gain from one per worker. */
+      VkResult result =
+         kk_compile_program(dev, s, dev->mtl_compiler_handle);
 
       mtx_lock(&dev->compile_mtx);
       s->compile_result = result;
@@ -2228,7 +2561,7 @@ kk_compile_wait(struct kk_device *dev, struct kk_shader *s)
     * destruction knows that this thread still owns the program's handles. */
    s->compile_running = true;
    mtx_unlock(&dev->compile_mtx);
-   const VkResult result = kk_compile_program(dev, s);
+   const VkResult result = kk_compile_program(dev, s, dev->mtl_compiler_handle);
    mtx_lock(&dev->compile_mtx);
    s->compile_result = result;
    s->compile_done = true;
