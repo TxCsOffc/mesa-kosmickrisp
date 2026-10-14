@@ -2502,7 +2502,8 @@ kk_compile_program(struct kk_device *dev, struct kk_shader *s,
  * compilation (Dragon's Dogma 2: ~1,100 programs and ~130,000 pipelines, which
  * measured 62 minutes of first-run compilation). Programs are queued at
  * creation and compiled here instead, on as many threads as the machine has
- * cores; the first use of a program, and its destruction, wait for its compile.
+ * cores. The first use of a program compiles it if it is still queued, or waits
+ * for the worker compiling it; its destruction leaves it to that worker.
  * The pool shares the Metal compiler (safe to use concurrently) and the
  * device's compiled-library table (`msl_libraries_lock`). */
 static int
@@ -2522,6 +2523,7 @@ kk_compile_worker(void *data)
       if (dev->compile_head == NULL)
          dev->compile_tail = NULL;
       s->compile_next = NULL;
+      s->compile_running = true;
       /* Nothing will use a destroyed program once the device goes away */
       const bool skip = s->compile_orphaned && dev->compile_shutdown;
       mtx_unlock(&dev->compile_mtx);
@@ -2626,6 +2628,36 @@ kk_compile_wait(struct kk_device *dev, struct kk_shader *s)
       return VK_SUCCESS;
 
    mtx_lock(&dev->compile_mtx);
+   if (s->compile_queued && !s->compile_running && !s->compile_done) {
+      /* First use of a program that is still in the queue: a title's whole
+       * pipeline set can be queued ahead of it, and the thread waiting here
+       * (a bind or draw on the ring thread, under virglrenderer's submission
+       * lock that every guest context shares) would wait for all of it -
+       * Dragon's Dogma 2's desktop froze for minutes after its compile screen.
+       * Take it out of the queue and compile it now. */
+      struct kk_shader **link = &dev->compile_head, *prev = NULL;
+      while (*link != s) {
+         prev = *link;
+         link = &(*link)->compile_next;
+      }
+      *link = s->compile_next;
+      if (dev->compile_tail == s)
+         dev->compile_tail = prev;
+      s->compile_next = NULL;
+      s->compile_running = true;
+      mtx_unlock(&dev->compile_mtx);
+
+      const VkResult result =
+         kk_compile_program(dev, s, dev->mtl_compiler_handle);
+
+      mtx_lock(&dev->compile_mtx);
+      s->compile_result = result;
+      s->compile_done = true;
+      dev->compile_pending--;
+      cnd_broadcast(&dev->compile_cnd);
+      mtx_unlock(&dev->compile_mtx);
+      return result;
+   }
    while (!s->compile_done && (s->compile_queued || s->compile_running))
       cnd_wait(&dev->compile_cnd, &dev->compile_mtx);
    if (s->compile_done) {

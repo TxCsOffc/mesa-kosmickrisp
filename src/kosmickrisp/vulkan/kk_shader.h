@@ -179,6 +179,7 @@ struct kk_shader {
     * for compile_done; destruction does not (compile_orphaned). */
    struct kk_shader *compile_next;
    bool compile_queued;
+   /* A worker (or a thread that needed it first) is compiling it */
    bool compile_running;
    bool compile_done;
    VkResult compile_result;
