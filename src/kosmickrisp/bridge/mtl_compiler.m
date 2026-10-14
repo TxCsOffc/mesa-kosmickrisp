@@ -160,10 +160,11 @@ mtl_compile_end(struct mtl_compile *c, bool ok)
    pthread_threadid_np(NULL, &thread);
    fprintf(stderr,
            "kk: compile %s%s on thread %" PRIu64 " with MTL4Compiler %u: %.1f ms%s; "
-           "%u compiles in flight at its start on %u compilers, up to %u on %u\n",
+           "%u compiles in flight at its start on %u compilers, up to %u on %u"
+           " [t %.3f %.3f]\n",
            c->kind, msl, thread, c->compiler, (end_ns - c->start_ns) / 1e6,
            ok ? "" : ", failed", c->in_flight, c->compilers, peak_in_flight,
-           peak_compilers);
+           peak_compilers, c->start_ns / 1e6, end_ns / 1e6);
 }
 
 /* Compiler */
