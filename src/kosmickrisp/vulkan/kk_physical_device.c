@@ -998,6 +998,13 @@ kk_get_device_properties(
             "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
 }
 
+static uint64_t
+kk_physical_device_compiler_flags(const struct kk_physical_device *pdev)
+{
+   return (uint64_t)pdev->info.gpu_apple_family |
+          ((uint64_t)pdev->info.msl_version << 32);
+}
+
 static void
 kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
 {
@@ -1009,12 +1016,39 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
                        sizeof(instance->driver_build_sha));
 
+   /* The MSL a shader translates to depends on the GPU family, the MSL
+    * version and the workarounds in effect (MESA_KK_DISABLE_WORKAROUNDS and
+    * the OS version), so a cached shader is only valid for the same ones */
+   const uint64_t compiler_flags = kk_physical_device_compiler_flags(pdev);
+   _mesa_blake3_update(&blake3_ctx, &compiler_flags, sizeof(compiler_flags));
+   _mesa_blake3_update(&blake3_ctx, &pdev->settings.disabled_workarounds,
+                       sizeof(pdev->settings.disabled_workarounds));
+   /* The other debug flags only affect logging or advertised capabilities.
+    * force_robustness changes both SPIR-V translation and NIR lowering. */
+   const bool force_robustness = KK_DEBUG(FORCE_ROBUSTNESS);
+   _mesa_blake3_update(&blake3_ctx, &force_robustness,
+                       sizeof(force_robustness));
+
    unsigned char blake3[BLAKE3_KEY_LEN];
    _mesa_blake3_final(&blake3_ctx, blake3);
 
    STATIC_ASSERT(BLAKE3_KEY_LEN >= VK_UUID_SIZE);
    memcpy(pdev->vk.properties.pipelineCacheUUID, blake3, VK_UUID_SIZE);
    memcpy(pdev->vk.properties.shaderBinaryUUID, blake3, VK_UUID_SIZE);
+
+#ifdef ENABLE_SHADER_CACHE
+   /* The translated MSL of every shader, so a title's second run does not
+    * translate its whole shader set again (Metal keeps the compiled libraries
+    * in its own cache, keyed by the MSL) */
+   char renderer[16];
+   snprintf(renderer, sizeof(renderer), "kk_apple%u",
+            pdev->info.gpu_apple_family);
+
+   char timestamp[BLAKE3_HEX_LEN];
+   _mesa_blake3_format(timestamp, blake3);
+
+   pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, compiler_flags);
+#endif
 }
 
 static void

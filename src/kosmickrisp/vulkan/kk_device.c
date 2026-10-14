@@ -427,6 +427,18 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
       dev->has_queue = true;
    }
 
+   /* Shaders of pipelines created without a VkPipelineCache are kept here (and
+    * in the disk cache), so an equal pipeline does not translate its SPIR-V
+    * to MSL again: a D3D12 title creates the same pipelines many times over */
+   struct vk_pipeline_cache_create_info cache_info = {
+      .weak_ref = true,
+   };
+   dev->vk.mem_cache = vk_pipeline_cache_create(&dev->vk, &cache_info, NULL);
+   if (dev->vk.mem_cache == NULL) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_queue;
+   }
+
    result = kk_device_init_meta(dev);
    if (result != VK_SUCCESS)
       goto fail_mem_cache;
@@ -463,6 +475,8 @@ fail_query_table:
 fail_meta:
    kk_device_finish_meta(dev);
 fail_mem_cache:
+   vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
+fail_queue:
    if (dev->has_queue) {
       kk_queue_finish(dev, &dev->queue);
       dev->has_queue = false;
@@ -507,6 +521,9 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    kk_device_finish_lib(dev);
    kk_oq_heap_finish(dev, &dev->occlusion_queries);
    kk_destroy_sampler_heap(dev, &dev->samplers);
+
+   /* Its shaders wait for their compiles, so before the compile pool goes */
+   vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
 
    /* Geometry heap */
    if (dev->heap)

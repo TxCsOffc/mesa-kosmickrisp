@@ -267,6 +267,9 @@ kk_hash_graphics_state(struct vk_physical_device *device,
 
    enum kk_feature_key feature_key = kk_make_feature_key(enabled_features);
    _mesa_blake3_update(&blake3_ctx, &feature_key, sizeof(feature_key));
+   const bool force_robustness = KK_DEBUG(FORCE_ROBUSTNESS);
+   _mesa_blake3_update(&blake3_ctx, &force_robustness,
+                       sizeof(force_robustness));
 
    _mesa_blake3_final(&blake3_ctx, blake3_out);
 }
