@@ -716,6 +716,11 @@ tex_type_name(nir_alu_type ty)
       return "ushort";
    case nir_type_uint32:
       return "uint";
+   case nir_type_int64:
+   case nir_type_uint64:
+      /* Metal's 64-bit textures are ulong only (R32G32_UINT storage), including
+       * the signed R64 formats, so signed and unsigned share the type. */
+      return "ulong";
    case nir_type_float16:
       return "half";
    case nir_type_float32:
@@ -985,9 +990,11 @@ atomic_is_64bit_unsigned_minmax(nir_intrinsic_instr *instr)
 /* The one 64-bit atomic operation MSL has is the void min/max above, so a shader that uses any
  * other one - the signed min/max OpAtomicSMax/SMin lowers to with no atomic_long to lower it to,
  * add/and/or/xor/exchange, compare-exchange, an atomic load or store, or any of them in threadgroup
- * memory - cannot be expressed at all. Saying it here, before the MSL is built, is what lets a
- * caller that compiles programs in the background (kk_compile_pool_init) reject the pipeline while
- * creation can still return the error to the application. */
+ * memory - cannot be expressed at all. The same holds for 64-bit image atomics: only umax/umin on
+ * a storage image lowers to the void texture form, so a 64-bit bindless_image_atomic with any other
+ * op, and any 64-bit bindless_image_atomic_swap, are unsupported. Saying it here, before the MSL is
+ * built, is what lets a caller that compiles programs in the background (kk_compile_pool_init)
+ * reject the pipeline while creation can still return the error to the application. */
 bool
 nir_uses_unsupported_64bit_atomics(nir_shader *shader)
 {
@@ -1008,7 +1015,16 @@ nir_uses_unsupported_64bit_atomics(nir_shader *shader)
                return true;
             break;
          }
+         case nir_intrinsic_bindless_image_atomic: {
+            if (intrin->def.bit_size != 64)
+               break;
+            nir_atomic_op op = nir_intrinsic_atomic_op(intrin);
+            if (op != nir_atomic_op_umax && op != nir_atomic_op_umin)
+               return true;
+            break;
+         }
          case nir_intrinsic_global_atomic_swap:
+         case nir_intrinsic_bindless_image_atomic_swap:
          case nir_intrinsic_shared_atomic:
          case nir_intrinsic_shared_atomic_swap:
             if (intrin->def.bit_size == 64)
@@ -1057,6 +1073,52 @@ atomic_64bit_minmax_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *inst
    P(ctx, ", ");
    src_to_msl(ctx, &instr->src[1]);
    P(ctx, ", memory_order_relaxed);\n");
+}
+
+/* The 64-bit image case is the same shape as the buffer case above: Metal's texture template
+ * declares the same void atomic_max/atomic_min taking a ulong4 on a texture2d<ulong> (and the
+ * other dims), with no fetch form, so OpAtomicUMax/UMin on an R64_UINT storage image lower to a
+ * level-0 texel read (storage images have one level) followed by the void atomic. The returned
+ * value has the same caveat: it is the texel read just before the operation. Signed R64 images
+ * share the unsigned ulong texture type (nir_to_msl's tex_type_name), and signed min/max is
+ * rejected before this point (nir_uses_unsupported_64bit_atomics). */
+static bool
+atomic_is_64bit_unsigned_image_minmax(nir_intrinsic_instr *instr)
+{
+   if (instr->intrinsic != nir_intrinsic_bindless_image_atomic ||
+       instr->def.bit_size != 64)
+      return false;
+
+   nir_atomic_op op = nir_intrinsic_atomic_op(instr);
+   return op == nir_atomic_op_umax || op == nir_atomic_op_umin;
+}
+
+static void
+atomic_64bit_image_minmax_to_msl(struct nir_to_msl_ctx *ctx,
+                                 nir_intrinsic_instr *instr)
+{
+   const bool is_max = nir_intrinsic_atomic_op(instr) == nir_atomic_op_umax;
+
+   /* Only read the texel when the result is used: the read exists to give the fetch form something
+    * to return, and skipping it keeps an unused atomic a pure store. */
+   if (!nir_def_is_unused(&instr->def)) {
+      P_IND(ctx, "t%d = ", instr->def.index);
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, ".read(");
+      image_coord_swizzle(ctx, instr);
+      /* The atomic has no LOD source; a storage image only has level 0. */
+      if (nir_intrinsic_image_dim(instr) != GLSL_SAMPLER_DIM_BUF)
+         P(ctx, ", 0");
+      P(ctx, ").x;\n");
+   }
+
+   P_INDENT(ctx);
+   src_to_msl(ctx, &instr->src[0]);
+   P(ctx, ".atomic_%s(", is_max ? "max" : "min");
+   image_coord_swizzle(ctx, instr);
+   P(ctx, ", ulong4(");
+   src_to_msl(ctx, &instr->src[3]);
+   P(ctx, "));\n");
 }
 
 static void
@@ -1232,6 +1294,11 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
 
    if (atomic_is_64bit_unsigned_minmax(instr)) {
       atomic_64bit_minmax_to_msl(ctx, instr);
+      return;
+   }
+
+   if (atomic_is_64bit_unsigned_image_minmax(instr)) {
+      atomic_64bit_image_minmax_to_msl(ctx, instr);
       return;
    }
 

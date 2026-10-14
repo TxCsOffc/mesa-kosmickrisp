@@ -75,7 +75,7 @@ Environment variables
 
 KosmicKrisp specific environment variables:
 
-- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders. ``novertexsubgroups`` to stop advertising subgroups in the vertex stage (A/B for the lane-id recovery there). ``noint64atomics`` to stop advertising ``VK_KHR_shader_atomic_int64``.
+- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders. ``novertexsubgroups`` to stop advertising subgroups in the vertex stage (A/B for the lane-id recovery there). ``noint64atomics`` to stop advertising ``VK_KHR_shader_atomic_int64``. ``noimageint64atomics`` to stop advertising ``VK_EXT_shader_image_atomic_int64`` (and to leave the ``R64`` formats unsupported).
 - ``MESA_KK_GPU_CAPTURE``: Starts Metal capture at device create and ends it at device destroy. Set to ``1`` to activate.
 - ``MESA_KK_GPU_CAPTURE_DIRECTORY``: Metal capture will be saved to the specified directory. Defaults to Xcode if no path is provided.
 - ``MESA_KK_DISABLE_WORKAROUNDS``: Provide ``all`` to disable all workarounds. Otherwise, provide a comma separated list to disable wanted workarounds e.g. ``1,3,4`` to disable workaround 1, 3 and 4.
@@ -91,6 +91,15 @@ the original value OpAtomicUMax is defined to return when another invocation win
 between. Metal has no 64-bit atomic in threadgroup memory and no signed 64-bit atomic at all, so
 ``shaderSharedInt64Atomics`` stays unsupported along with ``OpAtomicSMax``/``OpAtomicSMin`` on
 64-bit integers (and 64-bit atomic add, exchange and compare-exchange).
+
+``VK_EXT_shader_image_atomic_int64`` is supported for 64-bit storage-image atomics: Metal declares
+the same void ``atomic_max``/``atomic_min`` on ``texture2d<ulong>`` (and the other dimensions) that
+it does on device ``atomic_ulong``, so ``OpAtomicUMax``/``OpAtomicUMin`` on an ``R64_UINT`` storage
+image lower to it, preceded by a level-0 texel read when the result is used. The returned value
+carries the same caveat as the buffer case (the texel read just before the operation), and the
+``R64_UINT``/``R64_SINT`` formats only expose storage-image and transfer use (no sampling, filtering,
+color attachment or blending). 64-bit signed image atomics, 64-bit add/exchange/compare-exchange on
+images and 64-bit sparse image atomics stay unsupported.
 
 Metal workarounds
 *****************

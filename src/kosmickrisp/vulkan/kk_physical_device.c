@@ -206,6 +206,15 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_robustness2 = true,
       .EXT_sample_locations = true,
       .EXT_shader_atomic_float = true,
+      /* 64-bit storage-image atomics: Metal has the same void atomic_max/min
+       * texture operations that the buffer path uses, which nir_to_msl.c lowers
+       * OpAtomicUMax/OpAtomicUMin on R64_UINT storage images to. Signed 64-bit
+       * image atomics and all other 64-bit image atomics stay unsupported, as
+       * does sparseImageInt64Atomics. Apple8 and later only, like the buffer
+       * path. */
+      .EXT_shader_image_atomic_int64 =
+         kk_physical_device_has_int64_minmax_atomics(pdev) &&
+         !KK_DEBUG(NO_IMAGE_INT64_ATOMICS),
       .EXT_shader_replicated_composites = true,
       .EXT_shader_subgroup_ballot = true,
       .EXT_shader_subgroup_vote = true,
@@ -317,6 +326,12 @@ kk_get_device_features(
       .scalarBlockLayout = true,
       .separateDepthStencilLayouts = true,
       .shaderBufferInt64Atomics = supported_extensions->KHR_shader_atomic_int64,
+      /* VK_EXT_shader_image_atomic_int64: 64-bit storage-image min/max with the
+       * same lowering and the same racy fetch result as the buffer path. Sparse
+       * 64-bit image atomics (sparseImageInt64Atomics) stay unsupported. */
+      .shaderImageInt64Atomics =
+         supported_extensions->EXT_shader_image_atomic_int64,
+      .sparseImageInt64Atomics = false,
       .shaderFloat16 = true,
       .shaderInputAttachmentArrayDynamicIndexing = true,
       .shaderInputAttachmentArrayNonUniformIndexing = true,

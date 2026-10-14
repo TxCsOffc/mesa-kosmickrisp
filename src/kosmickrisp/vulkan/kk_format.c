@@ -8,6 +8,7 @@
 #include "kk_format.h"
 
 #include "kk_buffer_view.h"
+#include "kk_debug.h"
 #include "kk_entrypoints.h"
 #include "kk_image.h"
 #include "kk_physical_device.h"
@@ -213,6 +214,14 @@ static const struct kk_va_format kk_vf_formats[] = {
    MTL_FMT_NATIVE(R16G16B16A16_SINT, MTL_FMT_WCMS(64), MTL_FMT_TB_ALL),
    MTL_FMT_NATIVE(R16G16B16A16_FLOAT, MTL_FMT_ALL_NO_ATOMIC(64),
                   MTL_FMT_TB_ALL),
+   /* Vulkan's R64 formats are R32G32_UINT to Metal: 64-bit texture atomics
+    * operate on exactly that storage. They are storage-image (atomic) only:
+    * kk_get_image_plane_format_features() keeps sampling, color attachment and
+    * blending off for them. */
+   MTL_FMT(R64_UINT, R32G32_UINT, MTL_SWIZZLE_IDENTITY, MTL_FMT_WCSA(64),
+           MTL_FMT_TB_NONE, false),
+   MTL_FMT(R64_SINT, R32G32_UINT, MTL_SWIZZLE_IDENTITY, MTL_FMT_WCSA(64),
+           MTL_FMT_TB_NONE, false),
 
    // 128-bit formats
    MTL_FMT_NATIVE(R32G32B32A32_UINT, MTL_FMT_WCS(128), MTL_FMT_TB_ALL),
@@ -367,6 +376,12 @@ const struct kk_va_format *
 kk_get_va_format(enum pipe_format format)
 {
    if (format >= ARRAY_SIZE(kk_vf_formats))
+      return NULL;
+
+   /* VK_EXT_shader_image_atomic_int64 can be turned off for A/B testing and as
+    * a fallback (kk_debug.h): R64 then stays unsupported exactly as before. */
+   if ((format == PIPE_FORMAT_R64_UINT || format == PIPE_FORMAT_R64_SINT) &&
+       KK_DEBUG(NO_IMAGE_INT64_ATOMICS))
       return NULL;
 
    if (kk_vf_formats[format].bit_widths == 0)

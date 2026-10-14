@@ -19,6 +19,7 @@ const struct debug_named_value debug_flags[] = {
    {"compiles", KK_DEBUG_COMPILES},
    {"noint64atomics", KK_DEBUG_NO_INT64_ATOMICS},
    {"novertexsubgroups", KK_DEBUG_NO_VERTEX_SUBGROUPS},
+   {"noimageint64atomics", KK_DEBUG_NO_IMAGE_INT64_ATOMICS},
    {NULL, 0},
 };
 

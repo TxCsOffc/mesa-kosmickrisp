@@ -47,6 +47,24 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
    if (va_format == NULL)
       return 0;
 
+   /* R64 formats are R32G32_UINT to Metal (kk_format.c) and exist only for
+    * VK_EXT_shader_image_atomic_int64's 64-bit storage-image atomics: expose
+    * storage (atomic) and transfer, but not sampling, filtering, color
+    * attachment or blending. Linear tiling stays unsupported, and so is the
+    * format as a whole where the atomics are not advertised (before Apple8,
+    * or with MESA_KK_DEBUG=noimageint64atomics), so an application that checks
+    * format support never creates an R64 image there. */
+   if (p_format == PIPE_FORMAT_R64_UINT || p_format == PIPE_FORMAT_R64_SINT) {
+      if (tiling != VK_IMAGE_TILING_OPTIMAL ||
+          !pdev->vk.supported_extensions.EXT_shader_image_atomic_int64)
+         return 0;
+
+      return VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+             VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
+             VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+             VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+   }
+
    // Textures can at least be sampled
    features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT;
    features |= VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
