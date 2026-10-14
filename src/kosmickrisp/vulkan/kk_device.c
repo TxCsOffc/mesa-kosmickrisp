@@ -392,11 +392,20 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
    dev->vk.get_timestamp = kk_get_timestamp;
    simple_mtx_init(&dev->lazy_pipeline_lock, mtx_plain);
+   dev->msl_libraries =
+      _mesa_hash_table_create(NULL /* ralloc context, not vk.alloc */, _mesa_hash_string,
+                              _mesa_key_string_equal);
+   if (dev->msl_libraries == NULL) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_device;
+   }
 
    /* Create a new Metal pipeline compiler for the device */
    dev->mtl_compiler_handle = kk_acquire_compiler(dev);
-   if (dev->mtl_compiler_handle == NULL)
+   if (dev->mtl_compiler_handle == NULL) {
+      result = VK_ERROR_INITIALIZATION_FAILED;
       goto fail_init;
+   }
 
    /* We need to initialize the device residency set before any bo is created. */
    simple_mtx_init(&dev->residency_set.mutex, mtx_plain);
@@ -458,6 +467,8 @@ fail_vab_memory:
 fail_compiler:
    kk_release_compiler(dev);
 fail_init:
+   _mesa_hash_table_destroy(dev->msl_libraries, NULL);
+fail_device:
    simple_mtx_destroy(&dev->lazy_pipeline_lock);
    vk_device_finish(&dev->vk);
 fail_alloc:
@@ -500,6 +511,13 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    /* Release the residency set last once all BOs are released. */
    mtl_release(dev->residency_set.handle);
    simple_mtx_destroy(&dev->residency_set.mutex);
+
+   /* Compiled MSL libraries are held for the device's lifetime. */
+   hash_table_foreach(dev->msl_libraries, entry) {
+      mtl_release(entry->data);
+      free((char *)entry->key);
+   }
+   _mesa_hash_table_destroy(dev->msl_libraries, NULL);
 
    kk_release_compiler(dev);
    simple_mtx_destroy(&dev->lazy_pipeline_lock);

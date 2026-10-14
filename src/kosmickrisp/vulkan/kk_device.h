@@ -82,6 +82,15 @@ struct kk_device {
    mtl_device *mtl_handle;
    mtl_compiler *mtl_compiler_handle;
 
+   /* Compiled MSL libraries by source string. A title asks for the same program
+    * once per pipeline (Dragon's Dogma 2: ~100 times per program), and every
+    * request otherwise costs a Metal compile call plus the guest round trip to
+    * reach it (FEX -> vkd3d -> Venus -> virglrenderer -> here): Metal answers
+    * from its own cache in fractions of a millisecond, but the round trip is
+    * milliseconds each time. The libraries are retained here for the device's
+    * lifetime and their source strings are owned by the table. */
+   struct hash_table *msl_libraries;
+
    /* Dispatch table exposed to the user. Required since we need to record all
     * commands due to Metal limitations */
    struct vk_device_dispatch_table exposed_dispatch_table;

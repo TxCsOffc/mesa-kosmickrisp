@@ -1294,17 +1294,43 @@ get_empty_nir(struct kk_device *dev, mesa_shader_stage stage,
    return nir;
 }
 
+/* The compiled library of an MSL source, kept for the device's lifetime: a title
+ * asks for the same program once per pipeline (Dragon's Dogma 2: ~100 times per
+ * program), and while Metal's own cache answers each request in fractions of a
+ * millisecond, every request still pays the guest round trip to reach it
+ * (FEX -> vkd3d -> Venus -> virglrenderer -> here). Returns a reference the
+ * caller releases, like mtl_new_library does. */
+static mtl_library *
+kk_get_msl_library(struct kk_device *device, const char *source)
+{
+   struct hash_entry *entry =
+      _mesa_hash_table_search(device->msl_libraries, source);
+   if (entry != NULL)
+      return mtl_retain(entry->data);
+
+   struct kk_physical_device *pdev = kk_device_physical(device);
+   mtl_library *library = mtl_new_library(
+      device->mtl_compiler_handle, source, pdev->info.msl_version,
+      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+   if (library == NULL)
+      return NULL;
+
+   char *key = strdup(source);
+   if (key == NULL) {
+      mtl_release(library);
+      return NULL;
+   }
+   _mesa_hash_table_insert(device->msl_libraries, key, mtl_retain(library));
+   return library;
+}
+
 static VkResult
 kk_compile_compute_pipeline(struct kk_device *device,
                             const struct msl_compile_data *data,
                             uint32_t local_size_threads,
                             mtl_compute_pipeline_state **pipe)
 {
-   struct kk_physical_device *pdev = kk_device_physical(device);
-
-   mtl_library *library = mtl_new_library(
-      device->mtl_compiler_handle, data->code, pdev->info.msl_version,
-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+   mtl_library *library = kk_get_msl_library(device, data->code);
    if (library == NULL)
       return VK_ERROR_INVALID_SHADER_NV;
 
@@ -1592,9 +1618,7 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
    }
 
    const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
-   mtl_library *vertex_library = mtl_new_library(
-      device->mtl_compiler_handle, vs_data->code, pdev->info.msl_version,
-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+   mtl_library *vertex_library = kk_get_msl_library(device, vs_data->code);
    if (vertex_library == NULL)
       return VK_ERROR_INVALID_SHADER_NV;
 
@@ -1603,9 +1627,7 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
                                           vs_data->entrypoint_name);
 
    const struct msl_compile_data *fs_data = &vs->msl_data[MESA_SHADER_FRAGMENT];
-   mtl_library *fragment_library = mtl_new_library(
-      device->mtl_compiler_handle, fs_data->code, pdev->info.msl_version,
-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+   mtl_library *fragment_library = kk_get_msl_library(device, fs_data->code);
    if (fragment_library == NULL) {
       result = VK_ERROR_INVALID_SHADER_NV;
       goto destroy_vertex;
