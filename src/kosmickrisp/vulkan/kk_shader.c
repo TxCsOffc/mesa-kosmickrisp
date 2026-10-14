@@ -844,20 +844,46 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
 
 static const struct vk_shader_ops kk_shader_ops;
 
+static void kk_shader_free(struct kk_device *dev, struct kk_shader *shader,
+                           const VkAllocationCallbacks *pAllocator);
+
 static void
 kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
                   const VkAllocationCallbacks *pAllocator)
 {
    struct kk_device *dev = container_of(vk_dev, struct kk_device, vk);
 
-   /* Both pool jobs and never-queued first-use compiles write the handles. */
+   /* A pool job or a never-queued first-use compile may still be writing the
+    * shader's pipeline handles (kk_compile_pool_init, kk_compile_wait). Waiting
+    * for it here blocks the ring thread on Metal, and a title destroys
+    * pipelines right after creating them (Dragon's Dogma 2's pipeline context
+    * spent 73% of its time in vkDestroyPipeline waiting for compiles), so the
+    * compiling thread frees it instead. The compile still finishes: an equal pipeline
+    * created later gets its Metal pipeline state from the device's tables.
+    * The runtime destroys pipeline shaders with the device's allocator; an
+    * application allocator may not outlive this call, so with one the destroy
+    * still waits. */
+   const bool device_alloc = pAllocator == NULL || pAllocator == &dev->vk.alloc;
    mtx_lock(&dev->compile_mtx);
    const bool compiling =
       (shader->compile_queued || shader->compile_running) && !shader->compile_done;
+   if (compiling && device_alloc) {
+      shader->compile_orphaned = true;
+      mtx_unlock(&dev->compile_mtx);
+      return;
+   }
    mtx_unlock(&dev->compile_mtx);
    if (compiling)
       (void) kk_compile_wait(dev, shader);
 
+   kk_shader_free(dev, shader, pAllocator);
+}
+
+static void
+kk_shader_free(struct kk_device *dev, struct kk_shader *shader,
+               const VkAllocationCallbacks *pAllocator)
+{
+   struct vk_device *vk_dev = &dev->vk;
    struct kk_pipeline_handles *pipe = &shader->pipeline;
 
    if (shader->info.stage == MESA_SHADER_COMPUTE) {
@@ -2452,20 +2478,27 @@ kk_compile_worker(void *data)
       if (dev->compile_head == NULL)
          dev->compile_tail = NULL;
       s->compile_next = NULL;
+      /* Nothing will use a destroyed program once the device goes away */
+      const bool skip = s->compile_orphaned && dev->compile_shutdown;
       mtx_unlock(&dev->compile_mtx);
 
-      /* The device's compiler: one MTL4Compiler compiles its compiles one at a
-       * time (measured: 16 workers take as long as one, or as 16 compilers in
-       * one process, while a second process does get a second channel), so
-       * there is nothing to gain from one per worker. */
-      VkResult result =
-         kk_compile_program(dev, s, dev->mtl_compiler_handle);
+      /* All workers share the device's compiler: Metal compiles concurrently
+       * on one MTL4Compiler as well as on several. */
+      VkResult result = skip ? VK_INCOMPLETE
+                             : kk_compile_program(dev, s,
+                                                  dev->mtl_compiler_handle);
 
       mtx_lock(&dev->compile_mtx);
       s->compile_result = result;
       s->compile_done = true;
       dev->compile_pending--;
       cnd_broadcast(&dev->compile_cnd);
+      if (s->compile_orphaned) {
+         /* Destroyed while it was queued or compiling (kk_shader_destroy) */
+         mtx_unlock(&dev->compile_mtx);
+         kk_shader_free(dev, s, &dev->vk.alloc);
+         mtx_lock(&dev->compile_mtx);
+      }
    }
    mtx_unlock(&dev->compile_mtx);
    return 0;
@@ -2566,7 +2599,10 @@ kk_compile_wait(struct kk_device *dev, struct kk_shader *s)
    s->compile_result = result;
    s->compile_done = true;
    cnd_broadcast(&dev->compile_cnd);
+   const bool orphaned = s->compile_orphaned;
    mtx_unlock(&dev->compile_mtx);
+   if (orphaned)
+      kk_shader_free(dev, s, &dev->vk.alloc);
    return result;
 }
 

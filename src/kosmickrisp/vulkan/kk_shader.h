@@ -175,13 +175,16 @@ struct kk_shader {
 
    /* Background compilation (kk_device::compile_*): the program is queued at
     * creation and the pool compiles it, so the ring thread does not spend a
-    * title's whole shader compilation one pipeline at a time. First use and
-    * destruction wait for compile_done. */
+    * title's whole shader compilation one pipeline at a time. First use waits
+    * for compile_done; destruction does not (compile_orphaned). */
    struct kk_shader *compile_next;
    bool compile_queued;
    bool compile_running;
    bool compile_done;
    VkResult compile_result;
+   /* Destroyed while queued or compiling: the worker that compiles it frees
+    * it afterwards */
+   bool compile_orphaned;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
