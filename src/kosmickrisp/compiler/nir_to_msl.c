@@ -982,6 +982,57 @@ atomic_is_64bit_unsigned_minmax(nir_intrinsic_instr *instr)
    return op == nir_atomic_op_umax || op == nir_atomic_op_umin;
 }
 
+/* The one 64-bit atomic operation MSL has is the void min/max above, so a shader that uses any
+ * other one - the signed min/max OpAtomicSMax/SMin lowers to with no atomic_long to lower it to,
+ * add/and/or/xor/exchange, compare-exchange, an atomic load or store, or any of them in threadgroup
+ * memory - cannot be expressed at all. Saying it here, before the MSL is built, is what lets a
+ * caller that compiles programs in the background (kk_compile_pool_init) reject the pipeline while
+ * creation can still return the error to the application. */
+bool
+nir_uses_unsupported_64bit_atomics(nir_shader *shader)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+
+   nir_foreach_block (block, impl) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+         switch (intrin->intrinsic) {
+         case nir_intrinsic_global_atomic: {
+            if (intrin->def.bit_size != 64)
+               break;
+            nir_atomic_op op = nir_intrinsic_atomic_op(intrin);
+            if (op != nir_atomic_op_umax && op != nir_atomic_op_umin)
+               return true;
+            break;
+         }
+         case nir_intrinsic_global_atomic_swap:
+         case nir_intrinsic_shared_atomic:
+         case nir_intrinsic_shared_atomic_swap:
+            if (intrin->def.bit_size == 64)
+               return true;
+            break;
+         case nir_intrinsic_load_global:
+            if (nir_intrinsic_access(intrin) & ACCESS_ATOMIC &&
+                intrin->def.bit_size == 64)
+               return true;
+            break;
+         case nir_intrinsic_store_global:
+            if (nir_intrinsic_access(intrin) & ACCESS_ATOMIC &&
+                nir_src_bit_size(intrin->src[0]) == 64)
+               return true;
+            break;
+         default:
+            break;
+         }
+      }
+   }
+
+   return false;
+}
+
 static void
 atomic_64bit_minmax_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
 {

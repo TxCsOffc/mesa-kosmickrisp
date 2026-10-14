@@ -391,7 +391,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.command_buffer_ops = &kk_cmd_buffer_ops;
    dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
    dev->vk.get_timestamp = kk_get_timestamp;
-   simple_mtx_init(&dev->lazy_pipeline_lock, mtx_plain);
+   simple_mtx_init(&dev->msl_libraries_lock, mtx_plain);
    dev->msl_libraries =
       _mesa_hash_table_create(NULL /* ralloc context, not vk.alloc */, _mesa_hash_string,
                               _mesa_key_string_equal);
@@ -399,6 +399,8 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
       goto fail_device;
    }
+   /* Programs are compiled by a pool of threads, not on the ring thread */
+   kk_compile_pool_init(dev);
 
    /* Create a new Metal pipeline compiler for the device */
    dev->mtl_compiler_handle = kk_acquire_compiler(dev);
@@ -467,9 +469,10 @@ fail_vab_memory:
 fail_compiler:
    kk_release_compiler(dev);
 fail_init:
+   kk_compile_pool_finish(dev);
    _mesa_hash_table_destroy(dev->msl_libraries, NULL);
 fail_device:
-   simple_mtx_destroy(&dev->lazy_pipeline_lock);
+   simple_mtx_destroy(&dev->msl_libraries_lock);
    vk_device_finish(&dev->vk);
 fail_alloc:
    vk_free(&dev->vk.alloc, dev);
@@ -519,8 +522,11 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    }
    _mesa_hash_table_destroy(dev->msl_libraries, NULL);
 
+   /* Drains the compile queue (nothing may compile into a shader being
+    * destroyed afterwards) before the compiler goes away. */
+   kk_compile_pool_finish(dev);
    kk_release_compiler(dev);
-   simple_mtx_destroy(&dev->lazy_pipeline_lock);
+   simple_mtx_destroy(&dev->msl_libraries_lock);
 
    vk_device_finish(&dev->vk);
 

@@ -172,12 +172,31 @@ struct kk_shader {
    /* Metal pipelines created, when minmax isn't NULL (one of the two
     * programs is compiled on first use) */
    bool pipeline_ready;
+
+   /* Background compilation (kk_device::compile_*): the program is queued at
+    * creation and the pool compiles it, so the ring thread does not spend a
+    * title's whole shader compilation one pipeline at a time. First use and
+    * destruction wait for compile_done. */
+   struct kk_shader *compile_next;
+   bool compile_queued;
+   bool compile_running;
+   bool compile_done;
+   VkResult compile_result;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
                                VK_OBJECT_TYPE_SHADER_EXT);
 
 extern const struct vk_device_shader_ops kk_device_shader_ops;
+
+/* Sets up and tears down the pool that compiles queued programs. */
+void kk_compile_pool_init(struct kk_device *dev);
+void kk_compile_pool_finish(struct kk_device *dev);
+
+/* Queues a program's compilation (idempotent) and waits for it. Waiting on a
+ * program that was never queued compiles it right there. */
+void kk_compile_enqueue(struct kk_device *dev, struct kk_shader *s);
+VkResult kk_compile_wait(struct kk_device *dev, struct kk_shader *s);
 
 static inline nir_address_format
 kk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)

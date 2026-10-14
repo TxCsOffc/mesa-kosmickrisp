@@ -24,6 +24,8 @@
 #include "vk_meta.h"
 #include "vk_queue.h"
 
+#include "c11/threads.h"
+
 struct kk_bo;
 struct kk_physical_device;
 struct vk_pipeline_cache;
@@ -118,9 +120,28 @@ struct kk_device {
     * pipeline cache (no set layouts to check) compile their min/max
     * emulating program first */
    bool reduction_sampler_sets;
-   /* Serializes compiling the second program of such a pipeline on first
-    * use (kk_cmd_shader_pipeline) */
-   simple_mtx_t lazy_pipeline_lock;
+   /* Compiling a program's Metal pipelines is the expensive part of creating a
+    * pipeline, and virglrenderer drains a guest's Venus context on one ring
+    * thread: a title's first run (Dragon's Dogma 2 asks for ~130,000 pipelines
+    * of ~1,100 programs) would otherwise compile them strictly one after
+    * another there — 62 minutes measured. Programs are queued here and compiled
+    * by a pool of threads instead (kk_shader.c), and the first use of a program
+    * waits for its compile. */
+   mtx_t compile_mtx;
+   cnd_t compile_cnd;
+   /* Programs whose pipelines are not compiled yet, linked by
+    * kk_shader::compile_next, oldest first */
+   struct kk_shader *compile_head;
+   struct kk_shader *compile_tail;
+   /* Queued or being compiled; the pool is only torn down when it reaches 0 */
+   uint32_t compile_pending;
+   bool compile_shutdown;
+   uint32_t compile_thread_count;
+   thrd_t *compile_threads;
+
+   /* Serializes the compiled-library table (msl_libraries), which the compile
+    * pool shares */
+   simple_mtx_t msl_libraries_lock;
 
    /* os_time_get_nano() at creation (command queue error diagnostics) */
    int64_t created_ns;

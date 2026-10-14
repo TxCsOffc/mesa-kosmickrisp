@@ -1624,7 +1624,10 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
    }
 }
 
-static void
+/* False when the pipeline's program has no Metal pipeline (its compile failed):
+ * nothing can be encoded for this draw, and the command buffer carries the
+ * error (kk_cmd_shader_pipeline). */
+static bool
 kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
 {
    struct kk_graphics_state *gfx = &cmd->state.gfx;
@@ -1633,6 +1636,9 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
    /* The VS's program with or without sampler min/max emulation */
    const struct kk_pipeline_handles *pipe = kk_cmd_shader_pipeline(
       cmd, cmd->state.shaders[MESA_SHADER_VERTEX], desc);
+   if (unlikely(pipe == NULL))
+      return false;
+
    if (pipe != gfx->pipe) {
       gfx->pipe = pipe;
       cmd->state.dirty_shaders |= BITFIELD_BIT(MESA_SHADER_VERTEX);
@@ -1650,6 +1656,7 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
    cmd->state.dirty_shaders = 0u;
    cmd->state.gfx.dirty = 0u;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
+   return true;
 }
 #undef IS_SHADER_DIRTY
 #undef IS_DIRTY
@@ -2664,7 +2671,8 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
    /* After the pre_gfx work: a render encoder yet to start follows it
     * (kk_CmdBeginRendering) */
-   kk_flush_gfx_state(cmd);
+   if (!kk_flush_gfx_state(cmd))
+      return;
 
    for (uint32_t i = 0; i < data->draw_count; i++) {
       struct kk_draw_data draw_data = build_draw_data(cmd, data, i);
@@ -2680,8 +2688,9 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
       /* TODO_KOSMICKRISP Remove this once unroll, tess and any compute does not
        * split render pass */
-      if (cmd->state.gfx.need_to_start_render_pass)
-         kk_flush_gfx_state(cmd);
+      if (cmd->state.gfx.need_to_start_render_pass &&
+          !kk_flush_gfx_state(cmd))
+         return;
 
       kk_dispatch_draw(cmd, draw_data);
    }

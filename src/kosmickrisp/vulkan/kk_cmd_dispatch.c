@@ -17,7 +17,10 @@
 
 #include "vk_common_entrypoints.h"
 
-static void
+/* False when the CS's program has no Metal pipeline (its compile failed):
+ * nothing can be dispatched, and the command buffer carries the error
+ * (kk_cmd_shader_pipeline). */
+static bool
 kk_flush_compute_state(struct kk_cmd_buffer *cmd)
 {
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
@@ -36,9 +39,13 @@ kk_flush_compute_state(struct kk_cmd_buffer *cmd)
    /* The CS's program with or without sampler min/max emulation */
    const struct kk_pipeline_handles *pipe =
       kk_cmd_shader_pipeline(cmd, cmd->state.shaders[MESA_SHADER_COMPUTE], desc);
+   if (unlikely(pipe == NULL))
+      return false;
+
    mtl_compute_set_pipeline_state(encoder, pipe->cs);
    kk_cb_record_program(&cmd->record, &pipe->record);
    kk_cb_record_count(&cmd->record.dispatches);
+   return true;
 }
 
 static void
@@ -101,7 +108,8 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
       kk_predicate_compute(cmd, patched.gpu, patched.gpu);
 
       /* Flush compute state after predication dispatch */
-      kk_flush_compute_state(cmd);
+      if (!kk_flush_compute_state(cmd))
+         return;
       mtl_dispatch_threadgroups_with_indirect_buffer(encoder, patched.gpu,
                                                      local_size);
    } else {
@@ -111,7 +119,8 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
          .z = groupCountZ * local_size.z,
       };
 
-      kk_flush_compute_state(cmd);
+      if (!kk_flush_compute_state(cmd))
+         return;
       mtl_dispatch_threads(encoder, grid_size, local_size);
    }
 }
@@ -145,11 +154,13 @@ kk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
       kk_predicate_compute(cmd, patched.gpu, pInfo->addressRange.address);
 
       /* Flush compute state after predication dispatch */
-      kk_flush_compute_state(cmd);
+      if (!kk_flush_compute_state(cmd))
+         return;
       mtl_dispatch_threadgroups_with_indirect_buffer(encoder, patched.gpu,
                                                      local_size);
    } else {
-      kk_flush_compute_state(cmd);
+      if (!kk_flush_compute_state(cmd))
+         return;
       mtl_dispatch_threadgroups_with_indirect_buffer(
          encoder, pInfo->addressRange.address, local_size);
    }

@@ -37,6 +37,11 @@ struct nir_to_msl_options {
 /* Assumes nir_shader_gather_info has been called beforehand. */
 char *nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options);
 
+/* True when the shader uses a 64-bit atomic operation MSL cannot express (see nir_to_msl.c). Such a
+ * shader has no MSL at all: a caller that compiles programs in the background has to reject it
+ * before it queues them, so that pipeline creation still fails where the application can see it. */
+bool nir_uses_unsupported_64bit_atomics(nir_shader *shader);
+
 /* Call this after all API-specific lowerings. It will bring the NIR out of SSA
  * at the end */
 bool msl_optimize_nir(struct nir_shader *nir);
