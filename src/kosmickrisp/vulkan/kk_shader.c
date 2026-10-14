@@ -123,6 +123,12 @@ kk_populate_vs_key(struct kk_vs_key *key,
    key->vi = *state->vi;
 }
 
+static bool kk_is_possible_both_depth_clip_clamp(
+   const struct vk_graphics_pipeline_state *state, bool enabled);
+static inline uint8_t
+kk_get_logical_color_att_index(const struct vk_graphics_pipeline_state *state,
+                               uint8_t i);
+
 struct kk_fs_key {
    VkFormat color_formats[MESA_VK_MAX_COLOR_ATTACHMENTS];
    struct vk_color_blend_state color_blend;
@@ -135,6 +141,16 @@ struct kk_fs_key {
    bool dynamic_input_attachment_map;
    uint8_t depth_input_att;
    uint8_t stencil_input_att;
+   /* The VS holding the pipeline is built from these too
+    * (gather_graphics_pipeline_create_info), so equal keys must mean equal
+    * attachments, not only "has depth" */
+   VkFormat depth_format;
+   VkFormat stencil_format;
+   uint32_t color_attachment_count;
+   uint8_t color_map[MESA_VK_MAX_COLOR_ATTACHMENTS];
+   /* msl_nir_lower_multisample_alpha bakes both into the fragment shader */
+   bool alpha_to_coverage_enable;
+   bool alpha_to_one_enable;
 };
 
 static void
@@ -159,6 +175,8 @@ kk_populate_fs_key(struct kk_fs_key *key,
       key->rasterization_samples = state->ms->rasterization_samples;
       key->static_sample_mask = state->ms->sample_mask;
       key->sample_shading_enable = state->ms->sample_shading_enable;
+      key->alpha_to_coverage_enable = state->ms->alpha_to_coverage_enable;
+      key->alpha_to_one_enable = state->ms->alpha_to_one_enable;
    }
 
    /* Depth writes are removed unless there's an actual attachment */
@@ -173,6 +191,12 @@ kk_populate_fs_key(struct kk_fs_key *key,
       state->ial ? state->ial->stencil_att : MESA_VK_ATTACHMENT_NO_INDEX;
    key->dynamic_input_attachment_map =
       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP);
+
+   key->depth_format = state->rp->depth_attachment_format;
+   key->stencil_format = state->rp->stencil_attachment_format;
+   key->color_attachment_count = state->rp->color_attachment_count;
+   for (uint32_t i = 0; i < MESA_VK_MAX_COLOR_ATTACHMENTS; i++)
+      key->color_map[i] = kk_get_logical_color_att_index(state, i);
 }
 
 enum kk_feature_key {
@@ -215,13 +239,30 @@ kk_hash_graphics_state(struct vk_physical_device *device,
       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
    }
 
-   if (stages & VK_SHADER_STAGE_FRAGMENT_BIT) {
+   /* The fragment state is part of every graphics stage's key, not only the
+    * fragment shader's: the VS that holds a KosmicKrisp pipeline (and the
+    * empty FS built next to it when the pipeline has none) is built from the
+    * attachment formats, the depth/stencil state and the sample count
+    * (gather_graphics_pipeline_create_info), so two depth-only pipelines with
+    * the same VS but D32 vs D16, GREATER vs LESS or 1 vs 4 samples must not
+    * share a shader. */
+   if (stages & VK_SHADER_STAGE_ALL_GRAPHICS) {
       struct kk_fs_key key;
       kk_populate_fs_key(&key, state);
       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
 
       _mesa_blake3_update(&blake3_ctx, &state->mv->view_mask,
                           sizeof(state->mv->view_mask));
+   }
+
+   /* kk_lower_hw_vs and kk_lower_fs lower depth clipping and clamping by what
+    * the rasterization state allows */
+   if (stages & VK_SHADER_STAGE_ALL_GRAPHICS) {
+      const bool clip_clamp[2] = {
+         kk_is_possible_both_depth_clip_clamp(state, false),
+         kk_is_possible_both_depth_clip_clamp(state, true),
+      };
+      _mesa_blake3_update(&blake3_ctx, clip_clamp, sizeof(clip_clamp));
    }
 
    enum kk_feature_key feature_key = kk_make_feature_key(enabled_features);
