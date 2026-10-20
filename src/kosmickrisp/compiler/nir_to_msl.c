@@ -2493,8 +2493,11 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       src_to_msl(ctx, coord);
       if (tex->is_array)
          P(ctx, ".%s", tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ? "xyz" : "xy");
-      P(ctx, ") + ");
-      src_to_msl(ctx, bias);
+      P(ctx, ")");
+      if (bias) {
+         P(ctx, " + ");
+         src_to_msl(ctx, bias);
+      }
       P(ctx, ", ");
       src_to_msl(ctx, min);
       P(ctx, ", ");
