@@ -78,30 +78,43 @@ struct kk_precompiled_cache {
    struct kk_precompiled_shader shaders[LIBKK_NUM_PROGRAMS];
 };
 
+/* A bounded table of compiled Metal objects (MSL libraries, pipeline states)
+ * shared by a device's pipelines, kept in kk_shader.c. Lookups and publishes
+ * take its lock, which is never held across a compile (that would serialize
+ * the compile pool); an entry without an object is a compile in flight that
+ * other callers wait for on cnd. */
+struct kk_metal_cache {
+   struct hash_table *table;
+   /* Entries by use, least recently used first; their count and the bound */
+   struct list_head lru;
+   uint32_t count;
+   uint32_t max;
+   void (*free_key)(void *key);
+   mtx_t lock;
+   cnd_t cnd;
+};
+
 struct kk_device {
    struct vk_device vk;
 
    mtl_device *mtl_handle;
    mtl_compiler *mtl_compiler_handle;
 
-   /* Compiled MSL libraries by source string. A title asks for the same program
-    * once per pipeline (Dragon's Dogma 2: ~100 times per program), and every
-    * request otherwise costs a Metal compile call plus the guest round trip to
-    * reach it (FEX -> vkd3d -> Venus -> virglrenderer -> here): Metal answers
-    * from its own cache in fractions of a millisecond, but the round trip is
-    * milliseconds each time. The libraries are retained here for the device's
-    * lifetime and their source strings are owned by the table. */
-   struct hash_table *msl_libraries;
-
-   /* Metal pipeline states by what the Metal pipeline is built from, so that
-    * two pipelines with the same programs and the same state share one. The
-    * compiler spends its time here, not in the library: a title that rebuilds
-    * its pipeline set every launch compiles the same program tens of times
-    * (Dragon's Dogma 2: 26,452 program compiles for 4,594 distinct programs in
-    * one run). Keys own their entry-point names; the states and the keys are
-    * held for the device's lifetime (kk_metal_pipelines_init). */
-   struct hash_table *metal_render_pipelines;
-   struct hash_table *metal_compute_pipelines;
+   /* Compiled Metal objects shared between a device's pipelines (kk_shader.c):
+    * MSL libraries by the blake3 digest of their source, and Metal pipeline
+    * states by what they are built from. A title asks for the same program once
+    * per pipeline (Dragon's Dogma 2: ~100 times per program, 26,452 program
+    * compiles for 4,594 distinct programs in one run), and every request
+    * otherwise costs a Metal compile call plus the guest round trip to reach it
+    * (FEX -> vkd3d -> Venus -> virglrenderer -> here); the compiler spends its
+    * time in the pipeline states. Each table is bounded (kk_metal_cache::max):
+    * past it the least recently used entries are dropped, so a title that
+    * creates and destroys pipelines for hours does not grow the process without
+    * bound. Set up before any pipeline is created and torn down after the
+    * compile pool (kk_metal_caches_init). */
+   struct kk_metal_cache msl_libraries;
+   struct kk_metal_cache metal_render_pipelines;
+   struct kk_metal_cache metal_compute_pipelines;
 
    /* Dispatch table exposed to the user. Required since we need to record all
     * commands due to Metal limitations */
@@ -148,17 +161,6 @@ struct kk_device {
    bool compile_shutdown;
    uint32_t compile_thread_count;
    thrd_t *compile_threads;
-
-   /* Serializes the compiled-library table (msl_libraries) and the Metal
-    * pipeline tables, which the compile pool shares. Not held across a
-    * compile: that would serialize the pool. */
-   mtx_t msl_libraries_lock;
-   mtx_t metal_pipelines_lock;
-   /* Signalled when a table entry stops being compiled: the pool has many
-    * workers asking for the same program at once, and only one of them should
-    * compile it (kk_get_msl_library, kk_find_metal_render_pipeline). */
-   cnd_t msl_libraries_cnd;
-   cnd_t metal_pipelines_cnd;
 
    /* os_time_get_nano() at creation (command queue error diagnostics) */
    int64_t created_ns;

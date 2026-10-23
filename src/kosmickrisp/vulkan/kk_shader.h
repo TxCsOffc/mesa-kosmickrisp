@@ -248,8 +248,10 @@ VkResult kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
                                struct kk_shader **shader_out);
 
 /* The device's shared Metal pipeline states (kk_shader.c) */
-void kk_metal_pipelines_init(struct kk_device *dev);
-void kk_metal_pipelines_finish(struct kk_device *dev);
+/* The device's tables of compiled Metal objects (kk_device::msl_libraries and
+ * the pipeline state tables); init returns false out of memory. */
+bool kk_metal_caches_init(struct kk_device *dev);
+void kk_metal_caches_finish(struct kk_device *dev);
 
 void kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd,
                                 struct kk_shader *shader);

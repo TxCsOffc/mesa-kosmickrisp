@@ -391,18 +391,13 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.command_buffer_ops = &kk_cmd_buffer_ops;
    dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
    dev->vk.get_timestamp = kk_get_timestamp;
-   mtx_init(&dev->msl_libraries_lock, mtx_plain);
-   cnd_init(&dev->msl_libraries_cnd);
-   dev->msl_libraries =
-      _mesa_hash_table_create(NULL /* ralloc context, not vk.alloc */, _mesa_hash_string,
-                              _mesa_key_string_equal);
-   if (dev->msl_libraries == NULL) {
+   /* Compiled MSL libraries and Metal pipeline states are shared between equal
+    * pipelines and the pool compiles into them: both are set up before any
+    * pipeline is created. */
+   if (!kk_metal_caches_init(dev)) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
       goto fail_device;
    }
-   /* Metal pipeline states are shared between equal pipelines and the pool
-    * compiles into them; both are set up before any pipeline is created. */
-   kk_metal_pipelines_init(dev);
    /* Programs are compiled by a pool of threads, not on the ring thread */
    kk_compile_pool_init(dev);
 
@@ -488,11 +483,8 @@ fail_compiler:
    kk_release_compiler(dev);
 fail_init:
    kk_compile_pool_finish(dev);
-   kk_metal_pipelines_finish(dev);
-   _mesa_hash_table_destroy(dev->msl_libraries, NULL);
+   kk_metal_caches_finish(dev);
 fail_device:
-   cnd_destroy(&dev->msl_libraries_cnd);
-   mtx_destroy(&dev->msl_libraries_lock);
    vk_device_finish(&dev->vk);
 fail_alloc:
    vk_free(&dev->vk.alloc, dev);
@@ -543,18 +535,10 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
     * afterwards either) and the compiler goes away last. */
    kk_compile_pool_finish(dev);
 
-   /* Compiled Metal pipeline states and MSL libraries are held for the
-    * device's lifetime. */
-   kk_metal_pipelines_finish(dev);
-   hash_table_foreach(dev->msl_libraries, entry) {
-      mtl_release(entry->data);
-      free((char *)entry->key);
-   }
-   _mesa_hash_table_destroy(dev->msl_libraries, NULL);
+   /* The compiled Metal objects the tables still hold go with the device */
+   kk_metal_caches_finish(dev);
 
    kk_release_compiler(dev);
-   cnd_destroy(&dev->msl_libraries_cnd);
-   mtx_destroy(&dev->msl_libraries_lock);
 
    vk_device_finish(&dev->vk);
 
