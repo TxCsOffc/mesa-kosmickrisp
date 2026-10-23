@@ -1852,6 +1852,18 @@ kk_compile_ds_state(struct kk_device *device, struct kk_shader_info *info)
    return state;
 }
 
+/* The depth/stencil state is independent of the selected program. Build it
+ * once on the plain VS at creation (kk_compile_shaders, kk_deserialize_shader),
+ * where binding reads it, even when only the minmax program is queued.
+ * Binding must not wait for Metal compilation under virglrenderer's shared
+ * submission lock, and pool threads must not write state that binding reads. */
+static void
+kk_create_ds_state(struct kk_device *dev, struct kk_shader *vs)
+{
+   if (vs->info.stage == MESA_SHADER_VERTEX && vs->info.vs.has_ds)
+      vs->pipeline.gfx.ds_handle = kk_compile_ds_state(dev, &vs->info);
+}
+
 static void
 kk_gather_ds_info(const struct vk_depth_stencil_state *ds, bool has_depth,
                   bool has_stencil, struct kk_shader_info *info)
@@ -2080,12 +2092,6 @@ kk_compile_graphics_pipeline(struct kk_device *device, mtl_compiler *compiler,
    if (fragment_library == NULL) {
       mtl_release(vertex_library);
       return VK_ERROR_INVALID_SHADER_NV;
-   }
-
-   /* A pipeline whose minmax program was compiled first has it already. The
-    * state is bound on its own, so it is needed on both paths below. */
-   if (vs->info.vs.has_ds && pipe->gfx.ds_handle == NULL) {
-      pipe->gfx.ds_handle = kk_compile_ds_state(device, &vs->info);
    }
 
    /* A render pipeline built from the same two programs and state is the same
@@ -2695,7 +2701,12 @@ kk_compile_wait(struct kk_device *dev, struct kk_shader *s)
       s->compile_done = true;
       dev->compile_pending--;
       cnd_broadcast(&dev->compile_cnd);
+      const bool orphaned = s->compile_orphaned;
       mtx_unlock(&dev->compile_mtx);
+      /* Destroyed while this thread compiled it (kk_shader_destroy): the
+       * thread that compiles a program frees it, as the worker does */
+      if (orphaned)
+         kk_shader_free(dev, s, &dev->vk.alloc);
       return result;
    }
    while (!s->compile_done && (s->compile_queued || s->compile_running))
@@ -2834,6 +2845,7 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
    /* Keep the unused variant out of the pool: descriptor heaps usually need
     * minmax first, ordinary sampler layouts need the cheaper plain program. */
    if (result == VK_SUCCESS) {
+      kk_create_ds_state(dev, s);
       const bool minmax_first =
          s->minmax != NULL &&
          kk_minmax_layouts_used(minmax_sets, infos[0].set_layout_count,
@@ -3027,6 +3039,7 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
    /* Without set layouts, predict minmax once any set got a reduction sampler.
     * The other program is never queued and compiles at its first use. */
    if (info.stage == MESA_SHADER_COMPUTE || info.stage == MESA_SHADER_VERTEX) {
+      kk_create_ds_state(dev, shader);
       const bool minmax_first =
          shader->minmax != NULL && p_atomic_read(&dev->reduction_sampler_sets);
       if (minmax_first && KK_DEBUG(MINMAX))
@@ -3142,13 +3155,12 @@ kk_cmd_bind_graphics_shader(struct kk_cmd_buffer *cmd,
    if (stage != MESA_SHADER_VERTEX)
       return;
 
-   /* The program (and with it its depth/stencil state) is compiled in the
-    * background (kk_compile_pool_init); binding is its first use. Waiting here
-    * keeps a pipeline with static depth/stencil state from being taken for a
-    * dynamic one, whose state the application never sets. */
-   if (unlikely(!p_atomic_read(&shader->pipeline_ready)))
-      (void) kk_compile_wait(kk_cmd_buffer_device(cmd), shader);
-
+   /* The program is compiled in the background (kk_compile_pool_init) and
+    * draws wait for it (kk_cmd_shader_pipeline); its depth/stencil state was
+    * built with the pipeline (kk_create_ds_state), so binding does not: that
+    * wait ran on the ring thread under virglrenderer's submission lock, and a
+    * pipeline with static depth/stencil state must not be taken for a dynamic
+    * one, whose state the application never sets. */
    bool requires_dynamic_depth_stencil = shader->pipeline.gfx.ds_handle == NULL;
    if (cmd->state.gfx.is_depth_stencil_dynamic) {
       /* If we are switching from dynamic to static, we need to clean up
