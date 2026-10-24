@@ -22,7 +22,11 @@
 #define KK_MAX_SAMPLES                   8
 #define KK_MIN_SSBO_ALIGNMENT            16
 #define KK_MIN_TEXEL_BUFFER_ALIGNMENT    16
-#define KK_MAX_TEXEL_BUFFER_ELEMENTS     (16384u * 16384u)
+/* Metal texture buffers have at most 2^28 texels. Reserve an alignment
+ * prefix (a sparse page) and three R32 texels per RGB32 Vulkan element. */
+#define KK_MTL_MAX_TEXEL_BUFFER_ELEMENTS (1u << 28)
+#define KK_MAX_TEXEL_BUFFER_ELEMENTS                                            \
+   ((KK_MTL_MAX_TEXEL_BUFFER_ELEMENTS - KK_SPARSE_PAGE_SIZE_B) / 3u)
 #define KK_MIN_UBO_ALIGNMENT             64
 #define KK_MAX_VIEWPORTS                 16
 #define KK_MAX_DESCRIPTOR_SIZE           64

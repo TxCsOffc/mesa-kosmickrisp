@@ -7,6 +7,8 @@
 
 #include "kk_buffer_view.h"
 
+#include <inttypes.h>
+
 #include "kk_buffer.h"
 #include "kk_descriptor_types.h"
 #include "kk_device.h"
@@ -98,6 +100,29 @@ kk_buffer_view_warn_unsupported(VkFormat format, bool sparse)
              vk_Format_to_str(format), sparse ? " in sparse buffers" : "");
 }
 
+/* Once per process each: the guest's own usage error, not a driver fault */
+static void
+kk_buffer_view_warn_zero_elements(VkFormat format)
+{
+   static atomic_bool warned;
+   if (atomic_exchange(&warned, true))
+      return;
+   mesa_logw("kk: a texel buffer view of %s has zero elements; it reads as a "
+             "null descriptor",
+             vk_Format_to_str(format));
+}
+
+static void
+kk_buffer_view_warn_oversized(VkFormat format, uint64_t elements, uint64_t limit)
+{
+   static atomic_bool warned;
+   if (atomic_exchange(&warned, true))
+      return;
+   mesa_logw("kk: a texel buffer view of %s has %" PRIu64 " elements, past "
+             "Metal's limit for this view (%" PRIu64 "); it is narrowed",
+             vk_Format_to_str(format), elements, limit);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
                     const VkAllocationCallbacks *pAllocator,
@@ -122,6 +147,24 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    if (!supported_format || !supported_format->texel_buffer.read ||
        (rgb32 && buffer->sparse)) {
       kk_buffer_view_warn_unsupported(view->vk.format, buffer->sparse);
+      *pBufferView = kk_buffer_view_to_handle(view);
+      return VK_SUCCESS;
+   }
+
+   /* VK_WHOLE_SIZE rounds down to complete texels; it can produce zero
+    * elements. The guest may also exceed maxTexelBufferElements (including
+    * with VK_WHOLE_SIZE, VUID 04059; vkd3d-proton makes typed views over a
+    * buffer's whole range without clamping). An unrepresentable width must
+    * not reach either Metal constructor, which aborts, and must not fail
+    * here: under Venus vkCreateBufferView is asynchronous
+    * (vn_async_vkCreateBufferView), so the guest never learns of an error and
+    * the first descriptor update that names the view is a command-stream
+    * error that kills the guest process (Dragon's Dogma 2 at the end of
+    * loading a save). A view of zero elements is a null descriptor, as an
+    * unsupported format is; a view past Metal's capacity for its format and
+    * alignment prefix is narrowed, and texels past it read out of bounds. */
+   if (view->vk.elements == 0) {
+      kk_buffer_view_warn_zero_elements(view->vk.format);
       *pBufferView = kk_buffer_view_to_handle(view);
       return VK_SUCCESS;
    }
@@ -156,13 +199,17 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       texture_offset = mtl_offset;
    }
    view->texel_offset = (mtl_offset - texture_offset) / texel_B;
-   uint64_t width_px = view->vk.elements + view->texel_offset;
-   if (rgb32) {
-      /* Texels past maxTexelBufferElements read as out of bounds */
-      width_px = MIN2(view->vk.elements * 3u + view->texel_offset,
-                      KK_MAX_TEXEL_BUFFER_ELEMENTS);
+   const uint64_t per_element = rgb32 ? 3u : 1u;
+   const uint64_t max_elements =
+      (KK_MTL_MAX_TEXEL_BUFFER_ELEMENTS - view->texel_offset) / per_element;
+   const uint64_t elements = MIN2(view->vk.elements, max_elements);
+   if (elements < view->vk.elements)
+      kk_buffer_view_warn_oversized(view->vk.format, view->vk.elements,
+                                    max_elements);
+   const uint64_t width_px = elements * per_element + view->texel_offset;
+   assert(width_px <= KK_MTL_MAX_TEXEL_BUFFER_ELEMENTS);
+   if (rgb32)
       view->texel_offset |= KK_TEXEL_BUFFER_RGB32;
-   }
 
    struct kk_image_layout layout = {
       .width_px = width_px,
@@ -183,7 +230,7 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
             .blue = supported_format->unswizzle.blue,
             .alpha = supported_format->unswizzle.alpha,
          },
-      .linear_stride_B = view->vk.range + (mtl_offset - texture_offset),
+      .linear_stride_B = width_px * texel_B,
    };
    if (buffer->sparse) {
       VkResult result = kk_buffer_view_sparse_init(
