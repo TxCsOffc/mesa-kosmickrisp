@@ -254,6 +254,14 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
       layout->usage |= MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW;
    }
 
+   /* Work around an M5 hardware bug where placement-sparse depth textures
+    * silently drop render-pass stores if ShaderWrite is enabled. This is safe
+    * to clear because depth formats lack storage-image support anyway.
+    */
+   if ((image->create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
+       util_format_is_depth_or_stencil(format))
+      layout->usage &= ~MTL_TEXTURE_USAGE_SHADER_WRITE;
+
    if (layout->linear) {
       kk_image_layout_calc_linear(dev, layout);
    } else {
