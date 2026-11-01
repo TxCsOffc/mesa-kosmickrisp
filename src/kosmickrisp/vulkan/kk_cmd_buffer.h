@@ -252,11 +252,12 @@ struct kk_uploader {
    uint32_t offset;
 };
 
-/* A pending resolve of one timestamp counter-heap entry into a query pool BO.
- * Recorded by vkCmdWriteTimestamp2 and flushed on the GPU timeline at cs_end. */
+/* A pending resolve of a range of count timestamp counter-heap entries into a
+ * query pool BO. Recorded by vkCmdWriteTimestamp2 and flushed at cs_end. */
 struct kk_ts_resolve {
    mtl_counter_heap *heap;
    uint32_t index;
+   uint32_t count;
    uint64_t dst_addr;
 };
 
@@ -279,6 +280,8 @@ struct kk_cmd_buffer {
       struct util_dynarray cmd_bufs;
       /* cmd_buf has an encoder */
       bool cmd_buf_used;
+      /* Timestamp writes outside render encoders in the current cmd_buf */
+      uint32_t ts_writes;
       /* The open render encoder is the first encoder of cmd_buf */
       bool render_first;
       mtl_render_encoder *render;
@@ -385,6 +388,7 @@ void cs_start_render(struct kk_cmd_buffer *cmd);
 mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
 mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd);
 mtl_compute_encoder *cs_get_pre_gfx(struct kk_cmd_buffer *cmd);
+void kk_cmd_count_ts_writes(struct kk_cmd_buffer *cmd, uint32_t writes);
 void cs_end(struct kk_cmd_buffer *cmd);
 void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
                                         uint64_t addr);

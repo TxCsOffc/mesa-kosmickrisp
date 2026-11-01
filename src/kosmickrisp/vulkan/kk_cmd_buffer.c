@@ -262,6 +262,7 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    kk_cmd_release_cmd_bufs(cmd);
    util_dynarray_append(&cmd->metal.cmd_bufs, cmd->metal.cmd_buf);
    cmd->metal.cmd_buf_used = false;
+   cmd->metal.ts_writes = 0;
    mtl_begin_command_buffer(cmd->metal.cmd_buf, cmd->metal.allocator);
 
    return VK_SUCCESS;
@@ -339,6 +340,35 @@ kk_cmd_next_cmd_buf_after_pre_gfx(struct kk_cmd_buffer *cmd)
    util_dynarray_append(&cmd->metal.cmd_bufs, next);
    cmd->metal.cmd_buf = next;
    cmd->metal.cmd_buf_used = false;
+   cmd->metal.ts_writes = 0;
+}
+
+/* About 4x below the M5 Pro's measured limit of 61,680 single-entry resolves.
+ * M1 Max survives 40,000 such writes but fails at 65,536. */
+#define KK_TS_WRITES_PER_CMD_BUF 16384u
+
+void
+kk_cmd_count_ts_writes(struct kk_cmd_buffer *cmd, uint32_t writes)
+{
+   assert(cmd->metal.render == NULL && cmd->metal.pre_gfx.cmd_buf == NULL);
+
+   cmd->metal.ts_writes += writes;
+   if (cmd->metal.ts_writes < KK_TS_WRITES_PER_CMD_BUF)
+      return;
+
+   mtl_command_buffer *next = kk_cmd_pool_get_cmd_buf(kk_cmd_buffer_pool(cmd));
+   if (next == NULL)
+      return;
+
+   cs_end(cmd);
+   mtl_end_command_buffer(cmd->metal.cmd_buf);
+   mtl_begin_command_buffer(next, cmd->metal.allocator);
+   if (cmd->vk.base.object_name)
+      mtl_command_buffer_set_label(next, cmd->vk.base.object_name);
+   util_dynarray_append(&cmd->metal.cmd_bufs, next);
+   cmd->metal.cmd_buf = next;
+   cmd->metal.cmd_buf_used = false;
+   cmd->metal.ts_writes = 0;
 }
 
 /* A Metal command buffer of its own for the pre_gfx pass of the open render
@@ -541,7 +571,7 @@ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
    /* Fold the pending timestamp counter-heap resolves into `cmd_buf` */
    util_dynarray_foreach(&cmd->ts_resolves, struct kk_ts_resolve, r) {
       mtl_command_resolve_counter_heap(cmd->metal.cmd_buf, r->heap, r->index,
-                                       1u, r->dst_addr);
+                                       r->count, r->dst_addr);
    }
 
    util_dynarray_clear(&cmd->ts_resolves);

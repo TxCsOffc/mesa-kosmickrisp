@@ -503,6 +503,7 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
          }
       }
    } else {
+      kk_cmd_count_ts_writes(cmd, count);
       heap = kk_cmd_ts_entry(cmd, &heap_index);
       if (heap != NULL) {
          /* compute encoder active or nothing active. If the latter, the write
@@ -539,10 +540,21 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    /* Resolve the Metal timestamp value to all multiview query indices so that
     * they all become available. */
    for (uint32_t i = 0; i < count; i++) {
+      const uint64_t dst_addr = kk_query_report_addr(dev, pool, query + i);
+      if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve)) {
+         struct kk_ts_resolve *last =
+            util_dynarray_top_ptr(&cmd->ts_resolves, struct kk_ts_resolve);
+         if (last->heap == heap && last->index + last->count == heap_index &&
+             last->dst_addr + last->count * sizeof(uint64_t) == dst_addr) {
+            last->count++;
+            continue;
+         }
+      }
       struct kk_ts_resolve resolve = {
          .heap = heap,
          .index = heap_index,
-         .dst_addr = kk_query_report_addr(dev, pool, query + i),
+         .count = 1,
+         .dst_addr = dst_addr,
       };
       util_dynarray_append(&cmd->ts_resolves, resolve);
    }
