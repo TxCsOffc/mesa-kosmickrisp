@@ -101,6 +101,7 @@ struct kk_queue_in_flight {
    double failed_start, failed_feedback;
    int64_t now;
    unsigned pending, lines, skipped, hangs;
+   unsigned pass;
    struct kk_cb_record hang[2];
 };
 
@@ -148,6 +149,13 @@ kk_queue_log_in_flight(struct kk_device *dev, void *data)
       const struct kk_queue_record *r =
          &queue->records[(queue->commit_seq + k) % KK_QUEUE_RECORDS];
       if (!kk_queue_record_in_flight(r, dev, s))
+         continue;
+      /* Faults must precede innocent victims and successful compositor work:
+       * otherwise the 24-line cap can hide the culprit and its shader excerpts. */
+      const bool culprit = r->done && strcmp(r->outcome, "ok") &&
+                           strcmp(r->outcome, "InnocentVictim");
+      const unsigned pass = culprit ? 0u : !r->done || strcmp(r->outcome, "ok") ? 1u : 2u;
+      if (pass != s->pass)
          continue;
       if (s->lines == KK_QUEUE_IN_FLIGHT_LINES) {
          s->skipped++;
@@ -275,7 +283,8 @@ kk_queue_log_failure(struct kk_queue *queue,
       os_time_sleep(5000);
    } while (os_time_get_nano() < deadline);
 
-   kk_device_foreach(kk_queue_log_in_flight, &s);
+   for (s.pass = 0u; s.pass < 3u; s.pass++)
+      kk_device_foreach(kk_queue_log_in_flight, &s);
    if (s.skipped)
       mesa_loge("kk: with it: %u more command buffers", s.skipped);
    else if (s.lines == 0u)
