@@ -214,11 +214,16 @@ copy_through_buffer(struct kk_cmd_buffer *cmd, struct kk_image *src,
       dst_size.z *= util_format_get_blockdepth(dst_format);
    }
 
-   /* After adjusting for compression, sanitize destination extents for 1D/2D */
-   if (dst_plane->layout.height_px == 1)
-      dst_size.y = 1;
-   if (dst_plane->layout.depth_px == 1)
-      dst_size.z = 1;
+   /* A block copied to a compressed mip tail can cover fewer texels than
+    * the block dimensions. Vulkan permits that edge copy; Metal requires
+    * sourceSize to stop at the destination mip's edge, not at the padded
+    * block boundary (e.g. one RG32 texel -> a 1x1 BC1 mip).
+    */
+   const VkExtent3D dst_extent =
+      vk_image_mip_level_extent(&dst->vk, region->dstSubresource.mipLevel);
+   dst_size.x = MIN2(dst_size.x, dst_extent.width - region->dstOffset.x);
+   dst_size.y = MIN2(dst_size.y, dst_extent.height - region->dstOffset.y);
+   dst_size.z = MIN2(dst_size.z, dst_extent.depth - region->dstOffset.z);
 
    struct mtl_origin src_origin =
       vk_offset_3d_to_mtl_origin(&region->srcOffset);
