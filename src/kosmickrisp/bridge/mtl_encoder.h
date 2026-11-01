@@ -12,6 +12,10 @@
 #include <stdint.h>
 
 /* Common encoder utils */
+/* MESA_KK_DEBUG=cbs logs every copy/render descriptor; otherwise only new
+ * shapes on Apple9+ are logged (M4 encoder crashes, STEAMAC-5E/5F/5H). */
+void mtl_encoder_set_log(bool enabled);
+
 void mtl_end_encoding(void *encoder);
 void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
                               enum mtl_stages before_queue_stages);

@@ -5,12 +5,204 @@
  */
 
 #include "mtl_encoder.h"
+#include "util/hash_table.h"
+
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <Metal/MTL4RenderPass.h>
+#include <Metal/MTLDevice.h>
 
 #include <Metal/MTL4CommandBuffer.h>
 #include <Metal/MTL4ComputeCommandEncoder.h>
 #include <Metal/MTL4Counters.h>
 #include <Metal/MTL4RenderCommandEncoder.h>
 #include <Metal/MTLRenderPass.h>
+
+/* The M4 reports abort in Apple's background/load program compiler without
+ * its reason reaching stderr. Keep the inputs before entering AGX, not only
+ * after it returns. A small per-thread shape cache bounds the bookkeeping
+ * and avoids logging the same alternating framebuffers every frame. cbs
+ * bypasses that cache for an exact call/return trace on any GPU.
+ */
+static bool encoder_log_all;
+
+void
+mtl_encoder_set_log(bool enabled)
+{
+   encoder_log_all = enabled;
+}
+
+static bool
+encoder_diagnostics_enabled(id<MTLDevice> device)
+{
+   static _Thread_local id<MTLDevice> last_device;
+   static _Thread_local bool enabled;
+   if (encoder_log_all)
+      return true;
+   if (device != last_device) {
+      last_device = device;
+      enabled = [device supportsFamily:MTLGPUFamilyApple9];
+   }
+   return enabled;
+}
+
+static bool
+encoder_log_shape(uint32_t hash)
+{
+   static _Thread_local uint32_t shapes[64];
+   static _Thread_local bool occupied[64];
+   const unsigned slot = hash % 64;
+   if (!encoder_log_all && occupied[slot] && shapes[slot] == hash)
+      return false;
+   shapes[slot] = hash;
+   occupied[slot] = true;
+   return true;
+}
+
+struct encoder_texture_shape {
+   uint64_t format, type, width, height, depth, levels, layers, samples;
+   uint64_t usage, storage, buffer_backed;
+};
+
+static struct encoder_texture_shape
+encoder_texture_shape(id<MTLTexture> texture)
+{
+   return (struct encoder_texture_shape) {
+      texture.pixelFormat, texture.textureType,
+      texture.width, texture.height, texture.depth,
+      texture.mipmapLevelCount, texture.arrayLength, texture.sampleCount,
+      texture.usage, texture.storageMode, texture.buffer != nil,
+   };
+}
+
+static void
+encoder_print_texture(const char *name, id<MTLTexture> texture,
+                      const struct encoder_texture_shape *s)
+{
+   fprintf(stderr, " %s=%p{fmt=%" PRIu64 " type=%" PRIu64
+           " size=%" PRIu64 "x%" PRIu64 "x%" PRIu64
+           " levels=%" PRIu64 " layers=%" PRIu64 " samples=%" PRIu64
+           " usage=0x%" PRIx64 " storage=%" PRIu64 " buffer_backed=%" PRIu64 "}",
+           name, (void *)texture, s->format, s->type, s->width, s->height,
+           s->depth, s->levels, s->layers, s->samples, s->usage,
+           s->storage, s->buffer_backed);
+}
+
+static uint64_t
+encoder_thread_id(void)
+{
+   uint64_t thread;
+   pthread_threadid_np(NULL, &thread);
+   return thread;
+}
+
+static bool
+encoder_log_buffer_texture(struct mtl_buffer_image_copy *data,
+                           bool to_texture, uint32_t *hash)
+{
+   id<MTLBuffer> buffer = (id<MTLBuffer>)data->buffer;
+   id<MTLTexture> texture = (id<MTLTexture>)data->image;
+   if (!encoder_diagnostics_enabled(texture.device ?: buffer.device) && buffer && texture)
+      return false;
+
+   /* Never hash pointers: new resources with the same layout are one shape. */
+   struct {
+      struct encoder_texture_shape texture;
+      uint64_t length, offset, row, image, x, y, z, w, h, d, level, slice;
+      uint64_t options, to_texture;
+   } shape = {
+      encoder_texture_shape(texture), buffer.length,
+      data->buffer_offset_B, data->buffer_stride_B,
+      data->buffer_2d_image_size_B,
+      data->image_origin.x, data->image_origin.y, data->image_origin.z,
+      data->image_size.x, data->image_size.y, data->image_size.z,
+      data->image_level, data->image_slice, data->options, to_texture,
+   };
+   *hash = _mesa_hash_data(&shape, sizeof(shape));
+   if (!encoder_log_shape(*hash))
+      return false;
+   flockfile(stderr);
+   fprintf(stderr, "kk: encoder copy shape=%08x thread=%" PRIu64
+           " %s buffer=%p length=%" PRIu64 " offset=%" PRIu64
+           " row=%" PRIu64 " image=%" PRIu64,
+           *hash, encoder_thread_id(), to_texture ? "buffer->texture" : "texture->buffer",
+           (void *)buffer, shape.length, shape.offset, shape.row, shape.image);
+   encoder_print_texture("texture", texture, &shape.texture);
+   fprintf(stderr, " origin=%" PRIu64 ",%" PRIu64 ",%" PRIu64
+           " extent=%" PRIu64 ",%" PRIu64 ",%" PRIu64
+           " level=%" PRIu64 " slice=%" PRIu64 " options=0x%" PRIx64 "\n",
+           shape.x, shape.y, shape.z, shape.w, shape.h, shape.d,
+           shape.level, shape.slice, shape.options);
+   funlockfile(stderr);
+   return true;
+}
+
+static bool
+encoder_log_render(id<MTL4CommandBuffer> command, MTL4RenderPassDescriptor *desc,
+                   uint32_t *hash)
+{
+   if (!encoder_diagnostics_enabled(command.device))
+      return false;
+   MTLRenderPassAttachmentDescriptor *attachments[10];
+   struct attachment_shape {
+      struct encoder_texture_shape texture, resolve;
+      uint64_t level, slice, plane, load, store, resolve_level, resolve_slice;
+      uint64_t resolve_plane;
+   };
+   struct {
+      uint64_t width, height, layers, samples;
+      struct attachment_shape attachments[10];
+   } shape = {0};
+   shape.width = desc.renderTargetWidth;
+   shape.height = desc.renderTargetHeight;
+   shape.layers = desc.renderTargetArrayLength;
+   shape.samples = desc.defaultRasterSampleCount;
+   for (unsigned i = 0; i < 10; ++i) {
+      MTLRenderPassAttachmentDescriptor *a =
+         i < 8 ? desc.colorAttachments[i] :
+         i == 8 ? desc.depthAttachment : desc.stencilAttachment;
+      attachments[i] = a;
+      shape.attachments[i] = (struct attachment_shape) {
+         encoder_texture_shape(a.texture), encoder_texture_shape(a.resolveTexture),
+         a.level, a.slice, a.depthPlane, a.loadAction, a.storeAction,
+         a.resolveLevel, a.resolveSlice, a.resolveDepthPlane,
+      };
+   }
+   *hash = _mesa_hash_data(&shape, sizeof(shape));
+   if (!encoder_log_shape(*hash))
+      return false;
+   flockfile(stderr);
+   fprintf(stderr, "kk: encoder render shape=%08x thread=%" PRIu64
+           " cmd=%p target=%" PRIu64 "x%" PRIu64 " layers=%" PRIu64
+           " default_samples=%" PRIu64 " clear_depth=%g clear_stencil=%" PRIu64 "\n",
+           *hash, encoder_thread_id(), (void *)command, shape.width, shape.height,
+           shape.layers, shape.samples, desc.depthAttachment.clearDepth,
+           (uint64_t)desc.stencilAttachment.clearStencil);
+   for (unsigned i = 0; i < 10; ++i) {
+      MTLRenderPassAttachmentDescriptor *a = attachments[i];
+      if (!a.texture && !a.resolveTexture)
+         continue;
+      const struct attachment_shape *s = &shape.attachments[i];
+      fprintf(stderr, "kk: encoder render shape=%08x attachment=%u", *hash, i);
+      encoder_print_texture("texture", a.texture, &s->texture);
+      encoder_print_texture("resolve", a.resolveTexture, &s->resolve);
+      fprintf(stderr, " level=%" PRIu64 " slice=%" PRIu64 " plane=%" PRIu64
+              " load=%" PRIu64 " store=%" PRIu64
+              " resolve_level=%" PRIu64 " resolve_slice=%" PRIu64
+              " resolve_plane=%" PRIu64,
+              s->level, s->slice, s->plane, s->load, s->store,
+              s->resolve_level, s->resolve_slice, s->resolve_plane);
+      if (i < 8) {
+         const MTLClearColor color = desc.colorAttachments[i].clearColor;
+         fprintf(stderr, " clear=%g,%g,%g,%g", color.red, color.green,
+                 color.blue, color.alpha);
+      }
+      fputc('\n', stderr);
+   }
+   funlockfile(stderr);
+   return true;
+}
 
 /* Common encoder utils */
 void
@@ -150,6 +342,8 @@ mtl_copy_from_buffer_to_texture(mtl_compute_encoder *encoder,
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       id<MTLBuffer> buffer = (id<MTLBuffer>)data->buffer;
       id<MTLTexture> image = (id<MTLTexture>)data->image;
+      uint32_t shape = 0;
+      const bool logged = encoder_log_buffer_texture(data, true, &shape);
       [enc copyFromBuffer:buffer
              sourceOffset:data->buffer_offset_B
         sourceBytesPerRow:data->buffer_stride_B
@@ -160,6 +354,9 @@ mtl_copy_from_buffer_to_texture(mtl_compute_encoder *encoder,
          destinationLevel:data->image_level
         destinationOrigin:origin
                   options:(MTLBlitOption)data->options];
+      if (logged)
+         fprintf(stderr, "kk: encoder copy ready shape=%08x thread=%" PRIu64 "\n",
+                 shape, encoder_thread_id());
    }
 }
 
@@ -173,6 +370,8 @@ mtl_copy_from_texture_to_buffer(mtl_compute_encoder *encoder,
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       id<MTLBuffer> buffer = (id<MTLBuffer>)data->buffer;
       id<MTLTexture> image = (id<MTLTexture>)data->image;
+      uint32_t shape = 0;
+      const bool logged = encoder_log_buffer_texture(data, false, &shape);
       [enc copyFromTexture:image
                sourceSlice:data->image_slice
                sourceLevel:data->image_level
@@ -183,6 +382,9 @@ mtl_copy_from_texture_to_buffer(mtl_compute_encoder *encoder,
     destinationBytesPerRow:data->buffer_stride_B
   destinationBytesPerImage:data->buffer_2d_image_size_B
                    options:(MTLBlitOption)data->options];
+      if (logged)
+         fprintf(stderr, "kk: encoder copy ready shape=%08x thread=%" PRIu64 "\n",
+                 shape, encoder_thread_id());
    }
 }
 
@@ -284,7 +486,13 @@ mtl_new_render_command_encoder_with_descriptor(
    @autoreleasepool {
       id<MTL4CommandBuffer> cmd = (id<MTL4CommandBuffer>)command_buffer;
       MTL4RenderPassDescriptor *desc = (MTL4RenderPassDescriptor *)descriptor;
-      return [[cmd renderCommandEncoderWithDescriptor:desc] retain];
+      uint32_t shape = 0;
+      const bool logged = encoder_log_render(cmd, desc, &shape);
+      id<MTL4RenderCommandEncoder> encoder = [cmd renderCommandEncoderWithDescriptor:desc];
+      if (logged)
+         fprintf(stderr, "kk: encoder render ready shape=%08x thread=%" PRIu64
+                 " encoder=%p\n", shape, encoder_thread_id(), (void *)encoder);
+      return [encoder retain];
    }
 }
 

@@ -8,6 +8,11 @@
 
 /* Common encoder utils */
 void
+mtl_encoder_set_log(bool enabled)
+{
+}
+
+void
 mtl_end_encoding(void *encoder)
 {
 }
