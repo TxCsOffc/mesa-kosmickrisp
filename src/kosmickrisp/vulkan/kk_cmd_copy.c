@@ -198,7 +198,9 @@ copy_through_buffer(struct kk_cmd_buffer *cmd, struct kk_image *src,
       src_plane->layout.depth_px == 1u ? 0u : buffer_size_2d_B;
    info.mtl_data.buffer_stride_B = buffer_stride_B;
    info.mtl_data.buffer = buffer;
-   info.buffer_slice_size_B = buffer_size_2d_B;
+   info.buffer_slice_size_B =
+      (size_t)buffer_size_2d_B *
+      util_format_get_nblocksz(src_format, region->extent.depth);
 
    struct mtl_size src_size = vk_extent_3d_to_mtl_size(&region->extent);
    struct mtl_size dst_size = vk_extent_3d_to_mtl_size(&region->extent);
@@ -388,13 +390,25 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
             src_format, buffer_stride_B, region->extent.height);
          const uint32_t layer_count =
             vk_image_subresource_layer_count(&src->vk, &region->srcSubresource);
-         buffer_size += buffer_size_2d_B * layer_count;
+         /* An array layer of a 3D copy contains every copied depth slice,
+          * not just the first 2D image. Keep this identical to the offset
+          * advanced by copy_through_buffer.
+          */
+         buffer_size += (size_t)buffer_size_2d_B * layer_count *
+                        util_format_get_nblocksz(src_format, region->extent.depth);
       }
    }
 
    /* Copy source image to buffer then to the destination image for those
     * regions that image to image was not possible. */
    if (buffer_size) {
+      /* kk_pool_alloc takes a 32-bit size. Never truncate a volume copy
+       * into a smaller scratch allocation.
+       */
+      if (buffer_size > UINT32_MAX) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
       struct kk_ptr buf = kk_pool_alloc(cmd, buffer_size, 8);
       if (unlikely(!buf.gpu))
          return;
