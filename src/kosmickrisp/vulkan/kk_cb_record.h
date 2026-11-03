@@ -59,6 +59,14 @@ struct kk_cb_program {
    bool pre_render;
 };
 
+struct kk_dispatch_record {
+   uint32_t hash;
+   uint32_t groups[3];
+   uint32_t local[3];
+   uint64_t indirect_addr;
+   bool indirect;
+};
+
 struct kk_cb_record {
    uint16_t render_passes;
    uint16_t msaa_render_passes;
@@ -76,6 +84,10 @@ struct kk_cb_record {
    uint32_t ops;     /* BITFIELD_BIT(enum kk_cb_op) */
    uint32_t precomp; /* BITFIELD_BIT(enum libkk_program) */
    struct kk_cb_program programs[KK_CB_RECORD_PROGRAMS];
+   /* Bounded workload evidence, independent of the first-eight program cap.
+    * Indirect group counts are GPU data: never read them back on the CPU. */
+   struct kk_dispatch_record largest_direct, last_indirect;
+   uint64_t largest_direct_groups;
 };
 
 static inline void
@@ -89,6 +101,25 @@ static inline void
 kk_cb_record_op(struct kk_cb_record *record, enum kk_cb_op op)
 {
    record->ops |= 1u << op;
+}
+
+static inline void
+kk_cb_record_dispatch(struct kk_cb_record *record,
+                       const struct kk_dispatch_record *dispatch)
+{
+   if (dispatch->indirect) {
+      record->last_indirect = *dispatch;
+      return;
+   }
+   uint64_t groups = (uint64_t)dispatch->groups[0] * dispatch->groups[1];
+   if (dispatch->groups[2] && groups > UINT64_MAX / dispatch->groups[2])
+      groups = UINT64_MAX;
+   else
+      groups *= dispatch->groups[2];
+   if (groups >= record->largest_direct_groups) {
+      record->largest_direct_groups = groups;
+      record->largest_direct = *dispatch;
+   }
 }
 
 void kk_cb_record_program(struct kk_cb_record *record,
@@ -110,5 +141,7 @@ void kk_cb_record_format(const struct kk_cb_record *record, char *out,
  * process, at most max_lines; returns the number logged. */
 unsigned kk_cb_record_log_excerpts(const struct kk_cb_record *record,
                                    unsigned max_lines);
+
+void kk_cb_record_log_dispatches(const struct kk_cb_record *record);
 
 #endif /* KK_CB_RECORD_H */

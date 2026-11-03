@@ -33,6 +33,21 @@ kk_cb_record_program(struct kk_cb_record *record,
       kk_cb_record_count(&record->programs_dropped);
 }
 
+void
+kk_cb_record_log_dispatches(const struct kk_cb_record *record)
+{
+   const struct kk_dispatch_record *d = &record->largest_direct;
+   if (record->largest_direct_groups)
+      mesa_loge("kk: largest direct dispatch requested c:%08x groups=%ux%ux%u local=%ux%ux%u",
+                d->hash, d->groups[0], d->groups[1], d->groups[2],
+                d->local[0], d->local[1], d->local[2]);
+   d = &record->last_indirect;
+   if (d->indirect)
+      mesa_loge("kk: last indirect dispatch c:%08x local=%ux%ux%u address=0x%llx (GPU group counts unknown)",
+                d->hash, d->local[0], d->local[1], d->local[2],
+                (unsigned long long)d->indirect_addr);
+}
+
 /* The patterns nir_to_msl emits for each feature; a loop is
  * "for (uint64_t no_crash ..." or, with KK_WORKAROUND_2 disabled,
  * "while (true)". */

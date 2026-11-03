@@ -21,7 +21,7 @@
  * nothing can be dispatched, and the command buffer carries the error
  * (kk_cmd_shader_pipeline). */
 static bool
-kk_flush_compute_state(struct kk_cmd_buffer *cmd)
+kk_flush_compute_state(struct kk_cmd_buffer *cmd, struct kk_dispatch_record *shape)
 {
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
 
@@ -45,6 +45,12 @@ kk_flush_compute_state(struct kk_cmd_buffer *cmd)
    mtl_compute_set_pipeline_state(encoder, pipe->cs);
    kk_cb_record_program(&cmd->record, &pipe->record);
    kk_cb_record_count(&cmd->record.dispatches);
+   const struct mtl_size local = cmd->state.shaders[MESA_SHADER_COMPUTE]->info.cs.local_size;
+   shape->hash = pipe->record.hash[0];
+   shape->local[0] = local.x;
+   shape->local[1] = local.y;
+   shape->local[2] = local.z;
+   kk_cb_record_dispatch(&cmd->record, shape);
    return true;
 }
 
@@ -90,6 +96,9 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
 
    struct kk_shader *cs = cmd->state.shaders[MESA_SHADER_COMPUTE];
    struct mtl_size local_size = cs->info.cs.local_size;
+   struct kk_dispatch_record shape = {
+      .groups = {groupCountX, groupCountY, groupCountZ},
+   };
 
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
    if (cmd->state.cond_render.enabled) {
@@ -108,7 +117,7 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
       kk_predicate_compute(cmd, patched.gpu, patched.gpu);
 
       /* Flush compute state after predication dispatch */
-      if (!kk_flush_compute_state(cmd))
+      if (!kk_flush_compute_state(cmd, &shape))
          return;
       mtl_dispatch_threadgroups_with_indirect_buffer(encoder, patched.gpu,
                                                      local_size);
@@ -119,7 +128,7 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
          .z = groupCountZ * local_size.z,
       };
 
-      if (!kk_flush_compute_state(cmd))
+      if (!kk_flush_compute_state(cmd, &shape))
          return;
       mtl_dispatch_threads(encoder, grid_size, local_size);
    }
@@ -141,6 +150,10 @@ kk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
 
    struct kk_shader *cs = cmd->state.shaders[MESA_SHADER_COMPUTE];
    struct mtl_size local_size = cs->info.cs.local_size;
+   struct kk_dispatch_record shape = {
+      .indirect = true,
+      .indirect_addr = pInfo->addressRange.address,
+   };
 
    kk_cb_record_count(&cmd->record.indirect_dispatches);
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
@@ -154,12 +167,12 @@ kk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
       kk_predicate_compute(cmd, patched.gpu, pInfo->addressRange.address);
 
       /* Flush compute state after predication dispatch */
-      if (!kk_flush_compute_state(cmd))
+      if (!kk_flush_compute_state(cmd, &shape))
          return;
       mtl_dispatch_threadgroups_with_indirect_buffer(encoder, patched.gpu,
                                                      local_size);
    } else {
-      if (!kk_flush_compute_state(cmd))
+      if (!kk_flush_compute_state(cmd, &shape))
          return;
       mtl_dispatch_threadgroups_with_indirect_buffer(
          encoder, pInfo->addressRange.address, local_size);

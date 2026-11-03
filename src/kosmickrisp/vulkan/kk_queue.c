@@ -175,6 +175,8 @@ kk_queue_log_in_flight(struct kk_device *dev, void *data)
                    "feedback, committed %.1f ms ago: %s",
                    r->seq, app, (s->now - r->commit_ns) / 1e6, text);
       }
+      if (culprit)
+         kk_cb_record_log_dispatches(&r->cb);
       if (!strcmp(r->outcome, "Hang") && s->hangs < ARRAY_SIZE(s->hang))
          s->hang[s->hangs++] = r->cb;
    }
@@ -234,6 +236,7 @@ kk_queue_log_failure(struct kk_queue *queue,
       char text[448];
       kk_cb_record_format(&cb, text, sizeof(text));
       mesa_loge("kk: it failed with %s and had %s", outcome, text);
+      kk_cb_record_log_dispatches(&cb);
    }
    if (data->error_info && !(recorded && strcmp(outcome, "ok") &&
                              strstr(data->error_info, outcome)))
