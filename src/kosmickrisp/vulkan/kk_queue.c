@@ -12,6 +12,7 @@
 #include "kk_descriptor_set.h"
 #include "kk_device.h"
 #include "kk_entrypoints.h"
+#include "kk_gpu_time.h"
 #include "kk_physical_device.h"
 #include "kk_sparse.h"
 #include "kk_sync.h"
@@ -216,17 +217,12 @@ kk_queue_log_failure(struct kk_queue *queue,
              data->tag, app,
              (data->feedback_time - data->commit_time) * 1000.0,
              (now - dev->created_ns) / 1e9, committed, awaiting);
-   if (data->gpu_start > 0.0) {
-      mesa_loge("kk: it started %.1f ms after its commit and ran %.1f ms on "
-                "the GPU (GPU start %.6f s, end %.6f s, commit %.6f s)",
-                (data->gpu_start - data->commit_time) * 1000.0,
-                (data->gpu_end - data->gpu_start) * 1000.0, data->gpu_start,
-                data->gpu_end, data->commit_time);
-   } else {
-      mesa_loge("kk: it never started on the GPU (GPU start %.6f s, end "
-                "%.6f s, commit %.6f s)",
-                data->gpu_start, data->gpu_end, data->commit_time);
-   }
+   char gpu_time[160];
+   kk_gpu_time_format(data->gpu_start, data->gpu_end, data->commit_time,
+                      data->feedback_time, gpu_time, sizeof(gpu_time));
+   mesa_loge("kk: it %s (GPU start %.6f s, end %.6f s, commit %.6f s, feedback %.6f s)",
+             gpu_time, data->gpu_start, data->gpu_end, data->commit_time,
+             data->feedback_time);
    if (last_gpu_end > 0.0) {
       mesa_loge("kk: the queue's last completed command buffer ended %.1f ms "
                 "after this commit",
