@@ -79,12 +79,11 @@ static void
 kk_queue_format_gpu_time(const struct kk_queue_record *r, double failed_start,
                          char *out, size_t size)
 {
-   if (r->gpu_start <= 0.0)
-      snprintf(out, size, "never started");
-   else if (failed_start <= 0.0)
-      snprintf(out, size, "ran %.1f ms", (r->gpu_end - r->gpu_start) * 1000.0);
-   else if (r->gpu_end < r->gpu_start || r->gpu_end - r->gpu_start > 1000.0)
-      snprintf(out, size, "started %+.1f ms, no end",
+   const double commit = r->commit_time;
+   if (!kk_gpu_time_valid_start(r->gpu_start, commit, r->feedback_time))
+      snprintf(out, size, "start unavailable or inconsistent");
+   else if (!kk_gpu_time_valid_end(r->gpu_start, r->gpu_end, r->feedback_time))
+      snprintf(out, size, "started %+.1f ms, end unavailable or inconsistent",
                (r->gpu_start - failed_start) * 1000.0);
    else
       snprintf(out, size, "%+.1f to %+.1f ms",
@@ -118,6 +117,10 @@ kk_queue_record_in_flight(const struct kk_queue_record *r,
       return false;
    if (!r->done || strcmp(r->outcome, "ok"))
       return true;
+   const double commit = r->commit_time;
+   if (!kk_gpu_time_valid_start(r->gpu_start, commit, r->feedback_time) ||
+       !kk_gpu_time_valid_end(r->gpu_start, r->gpu_end, r->feedback_time))
+      return commit >= s->failed_start && commit <= s->failed_feedback;
    return r->gpu_end >= s->failed_start && r->gpu_start <= s->failed_feedback;
 }
 
@@ -163,7 +166,7 @@ kk_queue_log_in_flight(struct kk_device *dev, void *data)
          continue;
       }
       s->lines++;
-      char text[448], gpu[48];
+      char text[448], gpu[96];
       kk_cb_record_format(&r->cb, text, sizeof(text));
       if (r->done) {
          kk_queue_format_gpu_time(r, s->failed_start, gpu, sizeof(gpu));
@@ -269,7 +272,8 @@ kk_queue_log_failure(struct kk_queue *queue,
    struct kk_queue_in_flight s = {
       .failed_dev = dev,
       .failed_seq = data->tag,
-      .failed_start = data->gpu_start,
+      .failed_start = kk_gpu_time_window_start(data->gpu_start, data->commit_time,
+                                              data->feedback_time),
       .failed_feedback = data->feedback_time,
       .now = now,
    };
@@ -333,6 +337,8 @@ kk_queue_note_feedback(struct kk_queue *queue,
       memcpy(record->outcome, outcome, sizeof(outcome));
       record->gpu_start = data->gpu_start;
       record->gpu_end = data->gpu_end;
+      record->commit_time = data->commit_time;
+      record->feedback_time = data->feedback_time;
       record->done = true;
    }
    const struct kk_cb_record cb = record->cb;

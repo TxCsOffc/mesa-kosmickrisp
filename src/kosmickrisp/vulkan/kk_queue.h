@@ -32,7 +32,7 @@ struct kk_queue_record {
    /* The IOGPU reason of its command queue error ("Hang", "InnocentVictim",
     * ...), "ok" when it completed */
    char outcome[32];
-   double gpu_start, gpu_end;
+   double gpu_start, gpu_end, commit_time, feedback_time;
    struct kk_cb_record cb;
 };
 
