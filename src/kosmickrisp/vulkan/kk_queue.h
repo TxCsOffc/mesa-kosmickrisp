@@ -104,4 +104,6 @@ VkResult kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
 
 void kk_queue_finish(struct kk_device *dev, struct kk_queue *queue);
 
+void kk_queue_log_sync_wait(struct kk_queue *queue);
+
 #endif

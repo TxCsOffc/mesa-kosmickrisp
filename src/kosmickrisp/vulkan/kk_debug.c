@@ -23,6 +23,7 @@ const struct debug_named_value debug_flags[] = {
    {"novertexsubgroups", KK_DEBUG_NO_VERTEX_SUBGROUPS},
    {"noimageint64atomics", KK_DEBUG_NO_IMAGE_INT64_ATOMICS},
    {"shapes", KK_DEBUG_SHAPES},
+   {"syncs", KK_DEBUG_SYNCS},
    {NULL, 0},
 };
 

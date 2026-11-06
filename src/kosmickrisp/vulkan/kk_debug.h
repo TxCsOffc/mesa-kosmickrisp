@@ -39,6 +39,8 @@ enum kk_debug {
    /* Log each new copy/render encoder descriptor shape once per thread on any
     * GPU (by default only Apple9+ logs them) */
    KK_DEBUG_SHAPES = 1ull << 10,
+   /* Trace queue waits/signals/commits and CPU waits exceeding one second */
+   KK_DEBUG_SYNCS = 1ull << 11,
 };
 
 extern enum kk_debug kk_mesa_debug_flags;

@@ -7,8 +7,10 @@
 #include "kk_sync.h"
 
 #include "kk_device.h"
+#include "kk_debug.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
+#include "util/log.h"
 
 static VkResult
 kk_timeline_init(struct vk_device *device, struct vk_sync *sync,
@@ -20,6 +22,9 @@ kk_timeline_init(struct vk_device *device, struct vk_sync *sync,
    struct kk_device *dev = container_of(device, struct kk_device, vk);
    timeline->mtl_handle = mtl_new_shared_event(dev->mtl_handle);
    mtl_shared_event_set_signaled_value(timeline->mtl_handle, initial_value);
+   if (KK_DEBUG(SYNCS))
+      mesa_logi("kk: sync create event=%p initial=%" PRIu64,
+                (void *)timeline->mtl_handle, initial_value);
 
    return VK_SUCCESS;
 }
@@ -29,6 +34,8 @@ kk_timeline_finish(struct vk_device *device, struct vk_sync *sync)
 {
    struct kk_sync_timeline *timeline =
       container_of(sync, struct kk_sync_timeline, base);
+   if (KK_DEBUG(SYNCS))
+      mesa_logi("kk: sync destroy event=%p", (void *)timeline->mtl_handle);
    mtl_release(timeline->mtl_handle);
 }
 
@@ -39,6 +46,9 @@ kk_timeline_signal(struct vk_device *device, struct vk_sync *sync,
    struct kk_sync_timeline *timeline =
       container_of(sync, struct kk_sync_timeline, base);
    mtl_shared_event_set_signaled_value(timeline->mtl_handle, value);
+   if (KK_DEBUG(SYNCS))
+      mesa_logi("kk: sync CPU signal event=%p value=%" PRIu64,
+                (void *)timeline->mtl_handle, value);
    return VK_SUCCESS;
 }
 
@@ -76,8 +86,38 @@ kk_timeline_wait(struct vk_device *device, struct vk_sync *sync,
       timeout_ms =
          (rel_timeout_ns / 1000000) + (rel_timeout_ns % 1000000 ? 1 : 0);
    }
+   /* Opt-in only: report an outstanding CPU wait before it can block forever.
+    * Keep the original absolute deadline, including finite waits. */
+   const bool trace = KK_DEBUG(SYNCS) && timeout_ms > 1000;
+   const uint64_t started = trace ? os_time_get_nano() : 0;
+   if (trace) {
+      if (mtl_shared_event_wait_until_signaled_value(
+             timeline->mtl_handle, wait_value, 1000))
+         return VK_SUCCESS;
+      char app[64];
+      struct kk_device *dev = container_of(device, struct kk_device, vk);
+      kk_device_app_name(dev, app, sizeof(app));
+      mesa_logi("kk: sync CPU wait of %s event=%p target=%" PRIu64
+                " current=%" PRIu64 " flags=0x%x deadline=%" PRIu64,
+                app, (void *)timeline->mtl_handle, wait_value,
+                mtl_shared_event_get_signaled_value(timeline->mtl_handle),
+                wait_flags, abs_timeout_ns);
+      if (dev->has_queue)
+         kk_queue_log_sync_wait(&dev->queue);
+      if (abs_timeout_ns != OS_TIMEOUT_INFINITE) {
+         const uint64_t now = os_time_get_nano();
+         const uint64_t remaining = abs_timeout_ns > now ? abs_timeout_ns - now : 0;
+         timeout_ms = remaining / 1000000 + (remaining % 1000000 != 0);
+      }
+   }
    int completed = mtl_shared_event_wait_until_signaled_value(
       timeline->mtl_handle, wait_value, timeout_ms);
+   if (trace)
+      mesa_logi("kk: sync CPU wait ended event=%p target=%" PRIu64
+                " current=%" PRIu64 " completed=%d elapsed-ms=%.1f",
+                (void *)timeline->mtl_handle, wait_value,
+                mtl_shared_event_get_signaled_value(timeline->mtl_handle),
+                completed, (os_time_get_nano() - started) / 1e6);
 
    return completed != 0 ? VK_SUCCESS : VK_TIMEOUT;
 }

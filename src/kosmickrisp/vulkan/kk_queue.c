@@ -303,6 +303,47 @@ kk_queue_log_failure(struct kk_queue *queue,
       kk_cb_record_log_excerpts(&cb, 3u - excerpts);
 }
 
+/* A CPU sync wait can stall the guest without a Metal error callback. */
+void
+kk_queue_log_sync_wait(struct kk_queue *queue)
+{
+   if (mtx_trylock(&queue->mutex) != thrd_success) {
+      mesa_logi("kk: sync queue=%p snapshot unavailable: queue mutex busy",
+                (void *)queue);
+      return;
+   }
+   const int64_t now = os_time_get_nano();
+   mesa_logi("kk: sync queue=%p committed=%" PRIu64 " awaiting=%u",
+             (void *)queue, queue->commit_seq, queue->feedbacks_pending);
+   unsigned retained = 0;
+   for (uint32_t i = 0; i < KK_QUEUE_RECORDS; i++) {
+      const struct kk_queue_record *r = &queue->records[i];
+      if (!r->seq || r->done)
+         continue;
+      retained++;
+      char text[448];
+      kk_cb_record_format(&r->cb, text, sizeof(text));
+      mesa_logi("kk: sync queue=%p pending=%" PRIu64 " age-ms=%.1f %s",
+                (void *)queue, r->seq, (now - r->commit_ns) / 1e6, text);
+   }
+   if (queue->feedbacks_pending > retained)
+      mesa_logi("kk: sync queue=%p pending records overwritten=%u",
+                (void *)queue, queue->feedbacks_pending - retained);
+   for (uint32_t i = 0; i < KK_QUEUE_PENDING_WAITS; i++) {
+      if (!queue->pending_waits[i].event)
+         continue;
+      const uint64_t current =
+         mtl_shared_event_get_signaled_value(queue->pending_waits[i].event);
+      if (current < queue->pending_waits[i].value)
+         mesa_logi("kk: sync queue=%p GPU wait event=%p target=%" PRIu64
+                   " current=%" PRIu64 " age-ms=%.1f",
+                   (void *)queue, (void *)queue->pending_waits[i].event,
+                   queue->pending_waits[i].value, current,
+                   (now - queue->pending_waits[i].submitted_ns) / 1e6);
+   }
+   mtx_unlock(&queue->mutex);
+}
+
 /* MESA_KK_DEBUG=commits */
 static void
 kk_queue_log_slow_commit(struct kk_queue *queue,
@@ -466,6 +507,12 @@ kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
    record->gpu_start = record->gpu_end = 0.0;
    record->cb = cmd->record;
    mtx_unlock(&queue->mutex);
+   if (KK_DEBUG(SYNCS)) {
+      char text[448];
+      kk_cb_record_format(&cmd->record, text, sizeof(text));
+      mesa_logi("kk: sync queue=%p commit=%" PRIu64 " %s",
+                (void *)queue, seq, text);
+   }
 
    mtl_commit_options *options = mtl_new_commit_options();
    mtl_commit_options_add_feedback_handler(options, callback, user_data, seq);
@@ -558,11 +605,23 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (vk_queue_is_lost(&queue->vk))
       return VK_ERROR_DEVICE_LOST;
 
+   if (KK_DEBUG(SYNCS)) {
+      char app[64];
+      kk_device_app_name(dev, app, sizeof(app));
+      mesa_logi("kk: sync queue=%p submit of %s begin waits=%u commands=%u signals=%u",
+                (void *)queue, app, submit->wait_count,
+                submit->command_buffer_count, submit->signal_count);
+   }
    for (struct vk_sync_wait *wait = submit->waits,
                             *end = submit->waits + submit->wait_count;
         wait != end; ++wait) {
       struct kk_sync_timeline *sync =
          container_of(wait->sync, struct kk_sync_timeline, base);
+      if (KK_DEBUG(SYNCS))
+         mesa_logi("kk: sync queue=%p GPU wait event=%p target=%" PRIu64
+                   " current=%" PRIu64,
+                   (void *)queue, (void *)sync->mtl_handle, wait->wait_value,
+                   mtl_shared_event_get_signaled_value(sync->mtl_handle));
       if (mtl_shared_event_get_signaled_value(sync->mtl_handle) <
           wait->wait_value) {
          mtx_lock(&queue->mutex);
@@ -623,9 +682,15 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       struct vk_sync_signal *signal = &submit->signals[i];
       struct kk_sync_timeline *sync =
          container_of(signal->sync, struct kk_sync_timeline, base);
+      if (KK_DEBUG(SYNCS))
+         mesa_logi("kk: sync queue=%p GPU signal event=%p value=%" PRIu64,
+                   (void *)queue, (void *)sync->mtl_handle,
+                   signal->signal_value);
       mtl_signal_event(queue->mtl_handle, sync->mtl_handle,
                        signal->signal_value);
    }
+   if (KK_DEBUG(SYNCS))
+      mesa_logi("kk: sync queue=%p submit end", (void *)queue);
 
    return VK_SUCCESS;
 }
