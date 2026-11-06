@@ -1307,11 +1307,9 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       P_IND(ctx, "t%d = ", instr->def.index);
    }
    switch (instr->intrinsic) {
-   case nir_intrinsic_decl_reg: {
-      const char *reg_type = msl_uint_type(nir_intrinsic_bit_size(instr),
-                                           nir_intrinsic_num_components(instr));
-      P_IND(ctx, "%s r%d = %s(0);\n", reg_type, instr->def.index, reg_type);
-   } break;
+   case nir_intrinsic_decl_reg:
+      /* Registers, like SSA temporaries, are declared at function scope. */
+      break;
    case nir_intrinsic_load_reg:
       // register loads get inlined into the uses
       break;
@@ -2635,6 +2633,64 @@ instr_to_msl(struct nir_to_msl_ctx *ctx, nir_instr *instr)
    }
 }
 
+static void cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node);
+
+static void
+guarded_cf_list_to_metal(struct nir_to_msl_ctx *ctx, struct exec_list *list,
+                         unsigned guard);
+
+/* ALU sources already name temporaries; it is structured control flow, not
+ * expression inlining, that can exceed Metal's 256-bracket parser limit.
+ * Beyond a conservative depth, snapshot the branch predicates and emit their
+ * blocks as guarded siblings. Keep loops intact so break/continue still target
+ * exactly the original loop, and never speculate an instruction or side effect.
+ */
+static void
+flatten_if_to_metal(struct nir_to_msl_ctx *ctx, nir_if *ifnode, unsigned guard)
+{
+   unsigned then_guard = ++ctx->next_cf_predicate;
+   P_IND(ctx, "bool cf%u = ", then_guard);
+   if (guard)
+      P(ctx, "cf%u && ", guard);
+   src_to_msl(ctx, &ifnode->condition);
+   P(ctx, ";\n");
+
+   bool has_else = !nir_cf_list_is_empty_block(&ifnode->else_list);
+   unsigned else_guard = 0;
+   if (has_else) {
+      else_guard = ++ctx->next_cf_predicate;
+      P_IND(ctx, "bool cf%u = ", else_guard);
+      if (guard)
+         P(ctx, "cf%u && ", guard);
+      P(ctx, "!cf%u;\n", then_guard);
+   }
+
+   guarded_cf_list_to_metal(ctx, &ifnode->then_list, then_guard);
+   if (has_else)
+      guarded_cf_list_to_metal(ctx, &ifnode->else_list, else_guard);
+}
+
+static void
+guarded_cf_list_to_metal(struct nir_to_msl_ctx *ctx, struct exec_list *list,
+                         unsigned guard)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_if) {
+         flatten_if_to_metal(ctx, nir_cf_node_as_if(node), guard);
+         continue;
+      }
+      if (node->type == nir_cf_node_block &&
+          exec_list_is_empty(&nir_cf_node_as_block(node)->instr_list))
+         continue;
+
+      P_IND(ctx, "if (cf%u) {\n", guard);
+      ctx->indentlevel++;
+      cf_node_to_metal(ctx, node);
+      ctx->indentlevel--;
+      P_IND(ctx, "}\n");
+   }
+}
+
 static void
 cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node)
 {
@@ -2648,6 +2704,10 @@ cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node)
    }
    case nir_cf_node_if: {
       nir_if *ifnode = nir_cf_node_as_if(node);
+      if (ctx->indentlevel >= 128) {
+         flatten_if_to_metal(ctx, ifnode, 0);
+         break;
+      }
       P_IND(ctx, "if (");
       src_to_msl(ctx, &ifnode->condition);
       P(ctx, ") {\n");
@@ -3105,6 +3165,12 @@ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
          }
          case nir_instr_type_intrinsic: {
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_decl_reg) {
+               const char *type = msl_uint_type(nir_intrinsic_bit_size(intr),
+                                               nir_intrinsic_num_components(intr));
+               P_IND(ctx, "%s r%u = %s(0);\n", type, intr->def.index, type);
+               continue;
+            }
             if (!instrinsic_needs_dest_type(intr))
                continue;
             def = &intr->def;

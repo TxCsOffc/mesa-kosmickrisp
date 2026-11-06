@@ -26,6 +26,7 @@ struct nir_to_msl_ctx {
    uint64_t disabled_workarounds;
    bool uses_per_draw_data;
    unsigned short indentlevel;
+   unsigned next_cf_predicate;
    struct io_slot_info inputs_info[NUM_TOTAL_VARYING_SLOTS];
    struct io_slot_info outputs_info[NUM_TOTAL_VARYING_SLOTS];
 };
