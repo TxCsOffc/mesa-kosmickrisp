@@ -17,6 +17,9 @@
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
 
 #include "util/format/u_format.h"
+#include "util/log.h"
+
+#include <stdatomic.h>
 
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
@@ -25,6 +28,23 @@ kk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_buffer, src, pCopyBufferInfo->srcBuffer);
    VK_FROM_HANDLE(kk_buffer, dst, pCopyBufferInfo->dstBuffer);
+   /* Both handles are required by VkCopyBufferInfo2, also for the legacy
+    * vkCmdCopyBuffer wrapper. A sparse buffer with no resident pages still
+    * has a valid handle and must not be skipped. */
+   if (unlikely(src == NULL || dst == NULL)) {
+      static atomic_uint warned;
+      const unsigned missing = (src == NULL ? 1u : 0u) |
+                               (dst == NULL ? 2u : 0u);
+      if ((atomic_fetch_or_explicit(&warned, missing, memory_order_relaxed) &
+           missing) != missing) {
+         mesa_logw("kk: skipping invalid vkCmdCopyBuffer2: NULL buffer handle "
+                   "(src=%p dst=%p regions=%u); further warnings for these "
+                   "missing operands are suppressed",
+                   (void *)src, (void *)dst, pCopyBufferInfo->regionCount);
+      }
+      return;
+   }
+
    kk_cb_record_op(&cmd->record, KK_CB_OP_COPY);
 
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
