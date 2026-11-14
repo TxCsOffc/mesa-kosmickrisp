@@ -54,6 +54,41 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
                    const VkImageViewCreateInfo *pCreateInfo)
 {
    VK_FROM_HANDLE(kk_image, image, pCreateInfo->image);
+   const VkImageSubresourceRange *range = &pCreateInfo->subresourceRange;
+
+   /* Mesa's common initializer resolves REMAINING_* but only asserts validity.
+    * In release builds an empty range (including base == size with REMAINING)
+    * reaches Metal, which aborts the entire host process. Validate before the
+    * initializer and before narrowing the range into kk_view_layout fields. */
+   uint32_t layers = image->vk.array_layers;
+   /* Meta clears/copies use a 3D view with layerCount equal to the depth. */
+   const bool internal =
+      pCreateInfo->flags & VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA;
+   if (image->vk.image_type == VK_IMAGE_TYPE_3D &&
+       (pCreateInfo->viewType != VK_IMAGE_VIEW_TYPE_3D || internal))
+      layers = u_minify(image->vk.extent.depth,
+                        MIN2(range->baseMipLevel, image->vk.mip_levels - 1));
+   if (range->baseMipLevel >= image->vk.mip_levels ||
+       range->levelCount == 0 ||
+       (range->levelCount != VK_REMAINING_MIP_LEVELS &&
+        range->levelCount > image->vk.mip_levels - range->baseMipLevel) ||
+       range->baseArrayLayer >= layers || range->layerCount == 0 ||
+       (range->layerCount != VK_REMAINING_ARRAY_LAYERS &&
+        range->layerCount > layers - range->baseArrayLayer)) {
+      return vk_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
+                       "kk: invalid image view range: type %u, format %u, "
+                       "mips %u+%u/%u, layers %u+%u/%u; image type %u, "
+                       "extent %ux%ux%u, flags 0x%llx, usage 0x%llx, tiling %u",
+                       pCreateInfo->viewType, pCreateInfo->format,
+                       range->baseMipLevel, range->levelCount,
+                       image->vk.mip_levels, range->baseArrayLayer,
+                       range->layerCount, layers, image->vk.image_type,
+                       image->vk.extent.width, image->vk.extent.height,
+                       image->vk.extent.depth,
+                       (unsigned long long)image->vk.create_flags,
+                       (unsigned long long)image->vk.usage, image->vk.tiling);
+   }
+
 
    memset(view, 0, sizeof(*view));
 
