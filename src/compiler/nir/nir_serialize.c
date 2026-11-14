@@ -29,7 +29,6 @@
 #include "nir_xfb_info.h"
 
 #define NIR_SERIALIZE_FUNC_HAS_IMPL ((void *)(intptr_t)1)
-#define MAX_OBJECT_IDS              (1 << 20)
 
 typedef struct {
    size_t blob_offset;
@@ -99,7 +98,6 @@ static void
 write_add_object(write_ctx *ctx, const void *obj)
 {
    uint32_t index = ctx->next_idx++;
-   assert(index != MAX_OBJECT_IDS);
    _mesa_hash_table_insert(&ctx->remap_table, obj, (void *)(uintptr_t)index);
 }
 
@@ -462,11 +460,19 @@ union packed_src {
    } tex;
 };
 
+/* packed_src.any.object_idx holds 20 bits, but large shaders have more
+ * objects, so the largest value means the index follows as a separate uint32.
+ */
+#define SRC_OBJECT_IDX_SEPARATE ((1u << 20) - 1)
+
 static void
 write_src_full(write_ctx *ctx, const nir_src *src, union packed_src header)
 {
-   header.any.object_idx = write_lookup_object(ctx, src->ssa);
+   uint32_t idx = write_lookup_object(ctx, src->ssa);
+   header.any.object_idx = MIN2(idx, SRC_OBJECT_IDX_SEPARATE);
    blob_write_uint32(ctx->blob, header.u32);
+   if (idx >= SRC_OBJECT_IDX_SEPARATE)
+      blob_write_uint32(ctx->blob, idx);
 }
 
 static void
@@ -483,7 +489,10 @@ read_src(read_ctx *ctx, nir_src *src)
    union packed_src header;
    header.u32 = blob_read_uint32(ctx->blob);
 
-   src->ssa = read_lookup_object(ctx, header.any.object_idx);
+   uint32_t idx = header.any.object_idx;
+   if (idx == SRC_OBJECT_IDX_SEPARATE)
+      idx = blob_read_uint32(ctx->blob);
+   src->ssa = read_lookup_object(ctx, idx);
    return header;
 }
 
