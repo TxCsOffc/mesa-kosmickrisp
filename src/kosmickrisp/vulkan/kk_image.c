@@ -381,6 +381,8 @@ kk_GetPhysicalDeviceImageFormatProperties2(
    default:
       UNREACHABLE("Invalid image type");
    }
+   /* Buffer-backed Metal textures cannot have mipmaps or array layers. These
+    * limits also apply to the LINEAR layout used for DRM modifier images. */
    if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR)
       maxArraySize = 1;
 
@@ -591,6 +593,23 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
               const VkImageCreateInfo *pCreateInfo)
 {
    vk_image_init(&dev->vk, &image->vk, pCreateInfo);
+
+   /* Match the non-optimal limits advertised by the image format query before
+    * calculating a linear layout (which only allocates level 0). Metal aborts,
+    * rather than returning nil, on a buffer-backed mipmapped/array/3D/MSAA
+    * descriptor. Optimal host imports still use tiled textures and a private
+    * heap; importing memory must not impose these restrictions on them. */
+   if (image->vk.tiling != VK_IMAGE_TILING_OPTIMAL &&
+       (image->vk.mip_levels != 1 || image->vk.array_layers != 1 ||
+        image->vk.image_type == VK_IMAGE_TYPE_3D ||
+        image->vk.samples != VK_SAMPLE_COUNT_1_BIT)) {
+      return vk_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
+                       "unsupported buffer-backed image: tiling %u, type %u, "
+                       "mips %u, layers %u, samples %u",
+                       image->vk.tiling, image->vk.image_type,
+                       image->vk.mip_levels, image->vk.array_layers,
+                       image->vk.samples);
+   }
 
    if ((image->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
