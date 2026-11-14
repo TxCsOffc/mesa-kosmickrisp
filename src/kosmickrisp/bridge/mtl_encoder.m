@@ -165,8 +165,8 @@ static bool
 encoder_log_render(id<MTL4CommandBuffer> command, MTL4RenderPassDescriptor *desc,
                    uint32_t *hash)
 {
-   if (!encoder_diagnostics_enabled(command.device))
-      return false;
+   /* STEAMAC-7Q aborts inside AGX render encoder creation on Apple7 too.
+    * Retain the bounded descriptor diagnostics on every supported GPU. */
    MTLRenderPassAttachmentDescriptor *attachments[10];
    struct attachment_shape {
       struct encoder_texture_shape texture, resolve;
@@ -202,6 +202,10 @@ encoder_log_render(id<MTL4CommandBuffer> command, MTL4RenderPassDescriptor *desc
            *hash, encoder_thread_id(), (void *)command, shape.width, shape.height,
            shape.layers, shape.samples, desc.depthAttachment.clearDepth,
            (uint64_t)desc.stencilAttachment.clearStencil);
+   fprintf(stderr, "kk: encoder render memory allocated=%" PRIu64
+           " recommended=%" PRIu64 "\n",
+           (uint64_t)command.device.currentAllocatedSize,
+           (uint64_t)command.device.recommendedMaxWorkingSetSize);
    for (unsigned i = 0; i < 10; ++i) {
       MTLRenderPassAttachmentDescriptor *a = attachments[i];
       if (!a.texture && !a.resolveTexture)

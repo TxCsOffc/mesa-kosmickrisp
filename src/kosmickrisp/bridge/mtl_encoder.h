@@ -13,8 +13,8 @@
 
 /* Common encoder utils */
 /* MESA_KK_DEBUG=cbs logs every copy/render descriptor; otherwise each new
- * shape is logged once per thread (at most 256) on Apple9+, or on any GPU with
- * MESA_KK_DEBUG=shapes (M4 encoder crashes, STEAMAC-5E/5F/5H). */
+ * shape is logged once per thread (at most 256): rendering on every GPU,
+ * copies on Apple9+ or with MESA_KK_DEBUG=shapes (STEAMAC-7Q/5E/5F/5H). */
 void mtl_encoder_set_log(bool every_call, bool new_shapes_any_gpu);
 
 void mtl_end_encoding(void *encoder);
