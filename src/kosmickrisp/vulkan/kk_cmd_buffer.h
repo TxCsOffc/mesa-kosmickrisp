@@ -180,6 +180,8 @@ struct kk_graphics_state {
        * (hardware constraint).
        */
       uint32_t index;
+      bool used;
+
       /* Chunk of the current occlusion query */
       uint32_t chunk;
       /* Chunk the render pass descriptor writes visibility results to */

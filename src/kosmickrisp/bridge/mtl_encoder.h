@@ -20,6 +20,9 @@ void mtl_encoder_set_log(bool every_call, bool new_shapes_any_gpu);
 void mtl_end_encoding(void *encoder);
 void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
                               enum mtl_stages before_queue_stages);
+void mtl_barrier_after_stages_device(void *encoder,
+                                     enum mtl_stages after_stages,
+                                     enum mtl_stages before_queue_stages);
 void mtl_barrier_after_encoder_stages(void *encoder,
                                       enum mtl_stages after_stages,
                                       enum mtl_stages before_queue_stages);

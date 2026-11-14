@@ -21,7 +21,7 @@
 #include "util/simple_mtx.h"
 
 #define KK_QUEUE_PENDING_WAITS 8u
-#define KK_QUEUE_RECORDS       16u
+#define KK_QUEUE_RECORDS       256u
 
 /* A commit's command buffer record and, once its feedback handler ran, its
  * outcome */

@@ -7,6 +7,9 @@
 
 #include "kk_shader.h"
 
+#include "util/u_debug.h"
+
+
 #include "kk_cmd_buffer.h"
 #include "kk_debug.h"
 #include "kk_descriptor_set.h"
@@ -165,13 +168,27 @@ static const struct vk_pipeline_robustness_state rs_all_supported = {
    .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2,
 };
 
+DEBUG_GET_ONCE_BOOL_OPTION(hb_no_ubo_robust, "HB_KK_NO_UBO_ROBUST", false)
+
+static struct vk_pipeline_robustness_state
+kk_hb_robustness(const struct vk_pipeline_robustness_state *rs)
+{
+   struct vk_pipeline_robustness_state out = *rs;
+   if (debug_get_option_hb_no_ubo_robust())
+      out.uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
+   return out;
+}
+
 static struct spirv_to_nir_options
 kk_get_spirv_options(struct vk_physical_device *vk_pdev,
                      UNUSED mesa_shader_stage stage,
-                     const struct vk_pipeline_robustness_state *rs)
+                     const struct vk_pipeline_robustness_state *in_rs)
 {
+   const struct vk_pipeline_robustness_state *rs = in_rs;
    if (KK_DEBUG(FORCE_ROBUSTNESS))
       rs = &rs_all_supported;
+   const struct vk_pipeline_robustness_state hb_rs = kk_hb_robustness(rs);
+   rs = &hb_rs;
    return (struct spirv_to_nir_options){
       .environment = NIR_SPIRV_VULKAN,
       .ssbo_addr_format = kk_buffer_addr_format(rs->storage_buffers),
@@ -860,6 +877,8 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
 
    if (KK_DEBUG(FORCE_ROBUSTNESS))
       rs = &rs_all_supported;
+   const struct vk_pipeline_robustness_state hb_rs = kk_hb_robustness(rs);
+   rs = &hb_rs;
 
    const nir_opt_access_options access_options = {
       .is_vulkan = true,

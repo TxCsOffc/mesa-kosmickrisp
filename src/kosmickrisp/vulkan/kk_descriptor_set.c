@@ -216,6 +216,16 @@ write_storage_image_view_desc(struct kk_descriptor_set *set,
    get_storage_image_view_desc(binding_layout, info, dst, dst_size);
 }
 
+static uint64_t
+kk_hb_buffer_addr(const struct kk_descriptor_set *set, uint64_t addr)
+{
+   if (addr != 0 || set->base.device == NULL)
+      return addr;
+   const struct kk_device *dev =
+      container_of(set->base.device, struct kk_device, vk);
+   return dev->null_ubo ? dev->null_ubo->gpu : 0;
+}
+
 static void
 write_buffer_desc(struct kk_descriptor_set *set,
                   const VkDescriptorBufferInfo *const info, uint32_t binding,
@@ -228,7 +238,7 @@ write_buffer_desc(struct kk_descriptor_set *set,
    assert(addr_range.range <= UINT32_MAX);
 
    const struct kk_buffer_address desc = {
-      .base_addr = addr_range.addr,
+      .base_addr = kk_hb_buffer_addr(set, addr_range.addr),
       .size = addr_range.range,
    };
    write_desc(set, binding, elem, &desc, sizeof(desc));
@@ -250,7 +260,7 @@ write_dynamic_buffer_desc(struct kk_descriptor_set *set,
    struct kk_buffer_address *desc =
       &set->dynamic_buffers[binding_layout->dynamic_buffer_index + elem];
    *desc = (struct kk_buffer_address){
-      .base_addr = addr_range.addr,
+      .base_addr = kk_hb_buffer_addr(set, addr_range.addr),
       .size = addr_range.range,
    };
 }

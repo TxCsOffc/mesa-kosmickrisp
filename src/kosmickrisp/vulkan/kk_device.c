@@ -434,6 +434,13 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_queue;
    }
 
+   if (debug_get_bool_option("HB_KK_NO_UBO_ROBUST", false)) {
+      result = kk_alloc_bo(dev, &dev->vk.base, 65536u, 256u, &dev->null_ubo);
+      if (result != VK_SUCCESS)
+         goto fail_mem_cache;
+      memset(dev->null_ubo->cpu, 0, 65536u);
+   }
+
    result = kk_device_init_meta(dev);
    if (result != VK_SUCCESS)
       goto fail_mem_cache;
@@ -516,6 +523,9 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    /* Its shaders wait for their compiles, so before the compile pool goes */
    vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
+
+   if (dev->null_ubo)
+      kk_destroy_bo(dev, dev->null_ubo);
 
    /* Geometry heap */
    if (dev->heap)

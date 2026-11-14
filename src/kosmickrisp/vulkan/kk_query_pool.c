@@ -582,6 +582,7 @@ kk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;
    cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
    uint32_t oq_index = kk_pool_index_ptr(pool)[query];
+   cmd->state.gfx.occlusion.used = true;
    cmd->state.gfx.occlusion.index = oq_index % KK_OQ_CHUNK_QUERIES;
    cmd->state.gfx.occlusion.chunk = oq_index / KK_OQ_CHUNK_QUERIES;
 }

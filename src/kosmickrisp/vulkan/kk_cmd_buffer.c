@@ -21,6 +21,8 @@
 #include "kosmickrisp/bridge/mtl_encoder.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
 
+#include "util/u_debug.h"
+
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
 #include "vk_format.h"
@@ -560,11 +562,20 @@ end_pre_gfx(struct kk_cmd_buffer *cmd)
    }
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(hb_alias_barriers, "HB_KK_ALIAS_BARRIERS", false)
+
 static void
 end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
 {
    /* TODO_KOSMICKRISP This is probably overkill */
-   mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+   const bool is_render = encoder == cmd->metal.render;
+   if ((is_render && cmd->state.gfx.occlusion.used) ||
+       debug_get_option_hb_alias_barriers())
+      mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+   else
+      mtl_barrier_after_stages_device(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+   if (is_render)
+      cmd->state.gfx.occlusion.used = false;
    mtl_end_encoding(encoder);
    mtl_release(encoder);
 

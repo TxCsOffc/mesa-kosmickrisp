@@ -134,6 +134,8 @@ struct kk_device {
 
    struct vk_meta_device meta;
 
+   struct kk_bo *null_ubo;
+
    /* Geomtry heap */
    struct kk_bo *heap;
    util_once_flag heap_init_once;
