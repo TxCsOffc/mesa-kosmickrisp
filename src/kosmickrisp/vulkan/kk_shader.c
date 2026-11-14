@@ -1318,6 +1318,45 @@ kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
    return VK_SUCCESS;
 }
 
+static bool
+kk_nir_source_present(nir_src *src, void *data)
+{
+   return src->ssa != NULL;
+}
+
+static bool
+kk_nir_check_varyings_input(nir_shader *nir, unsigned pass)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            const char *reason = NULL;
+            if (instr->type > nir_instr_type_cmat_call)
+               reason = "invalid instruction type";
+            else if (instr->type == nir_instr_type_intrinsic &&
+                     nir_instr_as_intrinsic(instr)->intrinsic >=
+                        nir_num_intrinsics)
+               reason = "invalid intrinsic opcode";
+            else if (instr->type == nir_instr_type_alu &&
+                     nir_instr_as_alu(instr)->op >= nir_num_opcodes)
+               reason = "invalid ALU opcode";
+            else if (!nir_foreach_src(instr, kk_nir_source_present, NULL))
+               reason = "NULL SSA source";
+            if (reason) {
+               char hash[BLAKE3_HEX_LEN];
+               _mesa_blake3_format(hash, nir->info.source_blake3);
+               fprintf(stderr, "kk: invalid NIR before varyings pass %u: "
+                               "stage=%s shader=%s instruction=%u: %s\n",
+                       pass, _mesa_shader_stage_to_string(nir->info.stage),
+                       hash, instr->type, reason);
+               return false;
+            }
+         }
+      }
+   }
+   return true;
+}
+
 static void
 nir_opts(nir_shader *nir, void *data)
 {
@@ -2438,13 +2477,18 @@ kk_build_shaders(struct kk_device *dev, uint32_t shader_count,
                                  nir_shaders[total_shaders - 1u]);
    }
 
-   nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
-                         UINT32_MAX, nir_opts, NULL);
-   /* Second pass is required because some dEQP-VK.glsl.matrix.sub.dynamic.*
-    * would fail otherwise due to vertex outputting vec4 while fragments reading
-    * vec3 when in reality only vec3 is needed. */
-   nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
-                         UINT32_MAX, nir_opts, NULL);
+   for (unsigned pass = 0; pass < 2; pass++) {
+      for (uint32_t i = 0; i < total_shaders; i++) {
+         if (!kk_nir_check_varyings_input(nir_shaders[i], pass)) {
+            for (uint32_t j = 0; j < total_shaders; j++)
+               ralloc_free(nir_shaders[j]);
+            return vk_error(dev, VK_ERROR_INVALID_SHADER_NV);
+         }
+      }
+      /* A second pass matches vec3/vec4 interfaces after matrix lowering. */
+      nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
+                            UINT32_MAX, nir_opts, NULL);
+   }
 
    /* After linking, so nir_opt_varyings leaves the new slot alone */
    if (total_shaders >= 3u &&
