@@ -89,6 +89,23 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
                        (unsigned long long)image->vk.usage, image->vk.tiling);
    }
 
+   /* A mutable color format still needs the same texel block size. In
+    * particular RGBA8 -> R8 is not a Metal pixel-format view, and aborts
+    * instead of returning nil. Depth/stencil and multi-planar aspect views
+    * select their actual plane format below and must not use this test. */
+   const VkFormat format = pCreateInfo->format == VK_FORMAT_UNDEFINED
+                              ? image->vk.format : pCreateInfo->format;
+   if (image->plane_count == 1 &&
+       range->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
+       vk_format_get_blocksize(format) !=
+          vk_format_get_blocksize(image->vk.format)) {
+      return vk_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
+                       "kk: incompatible image view format %u for image "
+                       "format %u, type %u, flags 0x%llx, usage 0x%llx",
+                       format, image->vk.format, pCreateInfo->viewType,
+                       (unsigned long long)image->vk.create_flags,
+                       (unsigned long long)image->vk.usage);
+   }
 
    memset(view, 0, sizeof(*view));
 
