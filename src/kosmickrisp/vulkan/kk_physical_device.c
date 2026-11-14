@@ -1030,6 +1030,9 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
 
    _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
                        sizeof(instance->driver_build_sha));
+   const uint32_t cache_format_version = 2;
+   _mesa_blake3_update(&blake3_ctx, &cache_format_version,
+                       sizeof(cache_format_version));
 
    /* The MSL a shader translates to depends on the GPU family, the MSL
     * version and the workarounds in effect (MESA_KK_DISABLE_WORKAROUNDS and
