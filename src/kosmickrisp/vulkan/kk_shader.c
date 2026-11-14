@@ -2334,7 +2334,8 @@ kk_build_shaders(struct kk_device *dev, uint32_t shader_count,
                  enum kk_feature_key features,
                  const VkAllocationCallbacks *pAllocator,
                  struct kk_shader **shaders, bool *generated,
-                 uint32_t *total_out, uint32_t *minmax_sets)
+                 uint32_t *total_out, uint32_t *minmax_sets,
+                 bool *reported_missing_descriptor)
 {
    VkResult result = VK_SUCCESS;
    struct kk_physical_device *pdev = kk_device_physical(dev);
@@ -2369,7 +2370,12 @@ kk_build_shaders(struct kk_device *dev, uint32_t shader_count,
          (xfb_gs && i == last_vtg);
 
       msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
-      kk_lower_nir(dev, nir, emulated_stage, info->robustness,
+      const struct vk_pipeline_robustness_state *robustness = info->robustness;
+      if (kk_nir_lower_missing_descriptors(
+             nir, info->set_layout_count, info->set_layouts,
+             reported_missing_descriptor))
+         robustness = &rs_all_supported;
+      kk_lower_nir(dev, nir, emulated_stage, robustness,
                    info->set_layout_count, info->set_layouts, state, features,
                    minmax_sets);
 
@@ -2801,10 +2807,11 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
    struct kk_shader *shaders[shader_count + 2u];
    bool generated[shader_count + 2u];
    uint32_t total_shaders = 0u, minmax_sets = 0u;
+   bool reported_missing_descriptor = false;
    VkResult result =
       kk_build_shaders(dev, shader_count, infos, nirs, state, features,
                        pAllocator, shaders, generated, &total_shaders,
-                       &minmax_sets);
+                       &minmax_sets, &reported_missing_descriptor);
    if (result != VK_SUCCESS || !minmax_sets) {
       for (uint32_t i = 0u; i < shader_count; ++i)
          ralloc_free(minmax_nirs[i]);
@@ -2831,7 +2838,8 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
       result = kk_build_shaders(
          dev, shader_count, infos, minmax_nirs, state,
          features | KK_FEAT_SAMPLER_MINMAX_DYNAMIC, pAllocator, minmax_shaders,
-         minmax_generated, &minmax_total, &unused_sets);
+         minmax_generated, &minmax_total, &unused_sets,
+         &reported_missing_descriptor);
       if (result == VK_SUCCESS) {
          if (s->vk.stage != MESA_SHADER_COMPUTE)
             kk_gather_program(dev, state, minmax_shaders, minmax_total);

@@ -23,6 +23,125 @@
 
 #include "vulkan/vulkan_core.h"
 
+static const struct kk_descriptor_set_binding_layout *
+lookup_binding(uint32_t set, uint32_t binding, uint32_t set_layout_count,
+               struct vk_descriptor_set_layout *const *set_layouts)
+{
+   if (set >= set_layout_count || set_layouts[set] == NULL)
+      return NULL;
+   const struct kk_descriptor_set_layout *layout =
+      vk_to_kk_descriptor_set_layout(set_layouts[set]);
+   if (binding >= layout->binding_count ||
+       layout->binding[binding].array_size == 0)
+      return NULL;
+   return &layout->binding[binding];
+}
+
+static bool
+missing_binding(nir_shader *nir, uint32_t set, uint32_t binding,
+                uint32_t set_layout_count,
+                struct vk_descriptor_set_layout *const *set_layouts,
+                bool *reported)
+{
+   if (lookup_binding(set, binding, set_layout_count, set_layouts))
+      return false;
+   if (!*reported) {
+      fprintf(stderr, "kk: %s shader uses set %u binding %u that the pipeline "
+                      "layout does not provide\n",
+              _mesa_shader_stage_to_string(nir->info.stage), set, binding);
+      *reported = true;
+   }
+   return true;
+}
+
+static bool
+missing_deref(nir_shader *nir, nir_deref_instr *deref,
+              uint32_t set_layout_count,
+              struct vk_descriptor_set_layout *const *set_layouts,
+              bool *reported)
+{
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   if (var)
+      return missing_binding(nir, var->data.descriptor_set, var->data.binding,
+                             set_layout_count, set_layouts, reported);
+
+   while (deref->deref_type != nir_deref_type_var &&
+          nir_src_is_deref(deref->parent))
+      deref = nir_deref_instr_parent(deref);
+   if (deref->deref_type != nir_deref_type_cast)
+      return false;
+   nir_intrinsic_instr *intr = nir_src_as_intrinsic(deref->parent);
+   if (!intr || intr->intrinsic != nir_intrinsic_load_vulkan_descriptor)
+      return false;
+   intr = nir_src_as_intrinsic(intr->src[0]);
+   while (intr && intr->intrinsic == nir_intrinsic_vulkan_resource_reindex)
+      intr = nir_src_as_intrinsic(intr->src[0]);
+   return intr && intr->intrinsic == nir_intrinsic_vulkan_resource_index &&
+          missing_binding(nir, nir_intrinsic_desc_set(intr),
+                          nir_intrinsic_binding(intr), set_layout_count,
+                          set_layouts, reported);
+}
+
+/* Unprovided resources are invalid Vulkan, but can reach us through Venus.
+ * Remove image operations before YCbCr/minmax lowering can inspect the layout.
+ * Buffers retain a zero-sized descriptor and use bounded address lowering. */
+bool
+kk_nir_lower_missing_descriptors(
+   nir_shader *nir, uint32_t set_layout_count,
+   struct vk_descriptor_set_layout *const *set_layouts, bool *reported)
+{
+   bool missing = false;
+   nir_builder b = nir_builder_create(nir_shader_get_entrypoint(nir));
+   nir_foreach_function_impl(impl, nir) {
+      b.impl = impl;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            bool drop = false;
+            nir_def *def = NULL;
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               for (unsigned i = 0; i < tex->num_srcs; i++) {
+                  if (tex->src[i].src_type != nir_tex_src_texture_deref &&
+                      tex->src[i].src_type != nir_tex_src_sampler_deref)
+                     continue;
+                  drop |= missing_deref(nir, nir_src_as_deref(tex->src[i].src),
+                                        set_layout_count, set_layouts, reported);
+               }
+               def = &tex->def;
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_vulkan_resource_index) {
+                  missing |= missing_binding(
+                     nir, nir_intrinsic_desc_set(intr),
+                     nir_intrinsic_binding(intr), set_layout_count, set_layouts,
+                     reported);
+               } else if (nir_intrinsic_infos[intr->intrinsic].num_srcs > 0 &&
+                          nir_src_is_deref(intr->src[0])) {
+                  nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+                  if (deref->modes & (nir_var_image | nir_var_mem_ubo |
+                                      nir_var_mem_ssbo)) {
+                     drop = missing_deref(nir, deref, set_layout_count,
+                                          set_layouts, reported);
+                     if (nir_intrinsic_infos[intr->intrinsic].has_dest)
+                        def = &intr->def;
+                  }
+               }
+            }
+            if (!drop)
+               continue;
+            missing = true;
+            b.cursor = nir_before_instr(instr);
+            if (def)
+               nir_def_rewrite_uses(def, nir_imm_zero(
+                  &b, def->num_components, def->bit_size));
+            nir_instr_remove(instr);
+         }
+      }
+      nir_progress(true, impl, nir_metadata_control_flow);
+   }
+   return missing;
+}
+
 struct lower_descriptors_ctx {
    const struct kk_descriptor_set_layout *set_layouts[KK_MAX_SETS];
 
@@ -35,12 +154,12 @@ static const struct kk_descriptor_set_binding_layout *
 get_binding_layout(uint32_t set, uint32_t binding,
                    const struct lower_descriptors_ctx *ctx)
 {
-   assert(set < KK_MAX_SETS);
-   assert(ctx->set_layouts[set] != NULL);
-
+   if (set >= KK_MAX_SETS || ctx->set_layouts[set] == NULL)
+      return NULL;
    const struct kk_descriptor_set_layout *set_layout = ctx->set_layouts[set];
-
-   assert(binding < set_layout->binding_count);
+   if (binding >= set_layout->binding_count ||
+       set_layout->binding[binding].array_size == 0)
+      return NULL;
    return &set_layout->binding[binding];
 }
 
@@ -126,6 +245,8 @@ load_descriptor(nir_builder *b, unsigned num_components, unsigned bit_size,
 {
    const struct kk_descriptor_set_binding_layout *binding_layout =
       get_binding_layout(set, binding, ctx);
+   if (binding_layout == NULL)
+      return nir_imm_zero(b, num_components, bit_size);
 
    if (ctx->clamp_desc_array_bounds)
       index =
@@ -1166,6 +1287,10 @@ lower_ssbo_resource_index(nir_builder *b, nir_intrinsic_instr *intrin,
 
    const struct kk_descriptor_set_binding_layout *binding_layout =
       get_binding_layout(set, binding, ctx);
+   if (binding_layout == NULL) {
+      nir_def_rewrite_uses(&intrin->def, nir_imm_zero(b, 4, 32));
+      return true;
+   }
 
    nir_def *binding_addr;
    uint8_t binding_stride;
