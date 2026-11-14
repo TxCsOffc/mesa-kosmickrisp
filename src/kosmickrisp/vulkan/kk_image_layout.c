@@ -234,6 +234,8 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
       pdev, image->usage, image->tiling, image->create_flags, format);
    layout->usage = vk_image_usage_flags_to_mtl_texture_usage(
       image->usage, image->create_flags, supported_format->atomic);
+   if (util_format_is_compressed(format))
+      layout->usage &= ~MTL_TEXTURE_USAGE_SHADER_WRITE;
    layout->create_flags = image->create_flags;
    layout->format.pipe = format;
    layout->format.mtl = supported_format->mtl_pixel_format;

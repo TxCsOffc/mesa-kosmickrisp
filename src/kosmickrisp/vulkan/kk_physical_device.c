@@ -1294,11 +1294,8 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    };
    pdev->host_visible_mem_types = BITFIELD_BIT(host_visible_idx);
 
-   /* Sparse resources map 64 KiB pages of placement heaps. Host-visible
-    * memory may be a host pointer import (virglrenderer imports all of it),
-    * which has no heap, so sparse resources only bind the device-local type. */
    if (pdev->info.placement_sparse)
-      pdev->sparse_mem_types = BITFIELD_BIT(0);
+      pdev->sparse_mem_types = BITFIELD_MASK(pdev->mem_type_count);
 
    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));

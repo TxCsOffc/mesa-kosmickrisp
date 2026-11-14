@@ -11,6 +11,20 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 
+#include <stdlib.h>
+
+static double
+wsi_metal_layer_min_present_duration(void)
+{
+   static double duration = -1.0;
+   if (duration < 0.0) {
+      const char *env = getenv("HB_PRESENT_PACE_FPS");
+      double fps = env ? atof(env) : 0.0;
+      duration = fps > 0.0 ? 1.0 / fps : 0.0;
+   }
+   return duration;
+}
+
 void
 wsi_metal_layer_size(const CAMetalLayer *metal_layer,
    uint32_t *width, uint32_t *height)
@@ -351,7 +365,11 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
          destinationLevel:0
          destinationOrigin:MTLOriginMake(0, 0, 0)];
       [commandEncoder endEncoding];
-      [commandBuffer presentDrawable:drawable];
+      double min_duration = wsi_metal_layer_min_present_duration();
+      if (min_duration > 0.0)
+         [commandBuffer presentDrawable:drawable afterMinimumDuration:min_duration];
+      else
+         [commandBuffer presentDrawable:drawable];
       [commandBuffer commit];
 
       *drawable_ptr = nil;
@@ -363,7 +381,11 @@ wsi_metal_layer_present(CAMetalDrawable **drawable_ptr)
 {
    @autoreleasepool {
       id<CAMetalDrawable> drawable = [(id<CAMetalDrawable>)*drawable_ptr autorelease];
-      [drawable present];
+      double min_duration = wsi_metal_layer_min_present_duration();
+      if (min_duration > 0.0)
+         [drawable presentAfterMinimumDuration:min_duration];
+      else
+         [drawable present];
 
       *drawable_ptr = nil;
    }

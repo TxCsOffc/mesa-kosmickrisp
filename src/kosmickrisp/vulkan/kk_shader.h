@@ -148,9 +148,12 @@ struct kk_pipeline_handles {
    struct kk_cb_program record;
 };
 
+struct kk_msl_source;
+
 struct msl_compile_data {
    char *code;
    char *entrypoint_name;
+   struct kk_msl_source *source;
 };
 
 struct kk_shader {
