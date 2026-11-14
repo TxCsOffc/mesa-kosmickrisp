@@ -21,16 +21,23 @@
 
 /* The M4 reports abort in Apple's background/load program compiler without
  * its reason reaching stderr. Keep the inputs before entering AGX, not only
- * after it returns. A small per-thread shape cache bounds the bookkeeping
- * and avoids logging the same alternating framebuffers every frame. cbs
- * bypasses that cache for an exact call/return trace on any GPU.
+ * after it returns. Each thread logs a shape once (a set, not a direct-mapped
+ * cache: Steam's eleven alternating framebuffers collided in 64 slots and
+ * logged every frame, ~1800 lines/s on M3/M5) and at most
+ * ENCODER_SHAPES_LOGGED shapes. cbs bypasses the set for an exact call/return
+ * trace on any GPU; shapes logs new shapes on any GPU, not only Apple9+.
  */
+#define ENCODER_SHAPES_LOGGED 256u
+#define ENCODER_SHAPE_SLOTS   (2u * ENCODER_SHAPES_LOGGED)
+
 static bool encoder_log_all;
+static bool encoder_log_shapes_any_gpu;
 
 void
-mtl_encoder_set_log(bool enabled)
+mtl_encoder_set_log(bool every_call, bool new_shapes_any_gpu)
 {
-   encoder_log_all = enabled;
+   encoder_log_all = every_call;
+   encoder_log_shapes_any_gpu = new_shapes_any_gpu;
 }
 
 static bool
@@ -38,7 +45,7 @@ encoder_diagnostics_enabled(id<MTLDevice> device)
 {
    static _Thread_local id<MTLDevice> last_device;
    static _Thread_local bool enabled;
-   if (encoder_log_all)
+   if (encoder_log_all || encoder_log_shapes_any_gpu)
       return true;
    if (device != last_device) {
       last_device = device;
@@ -47,16 +54,32 @@ encoder_diagnostics_enabled(id<MTLDevice> device)
    return enabled;
 }
 
+static uint64_t encoder_thread_id(void);
+
 static bool
 encoder_log_shape(uint32_t hash)
 {
-   static _Thread_local uint32_t shapes[64];
-   static _Thread_local bool occupied[64];
-   const unsigned slot = hash % 64;
-   if (!encoder_log_all && occupied[slot] && shapes[slot] == hash)
+   static _Thread_local uint32_t shapes[ENCODER_SHAPE_SLOTS];
+   static _Thread_local bool occupied[ENCODER_SHAPE_SLOTS];
+   static _Thread_local unsigned count;
+   if (encoder_log_all)
+      return true;
+   unsigned slot = hash % ENCODER_SHAPE_SLOTS;
+   while (occupied[slot]) {
+      if (shapes[slot] == hash)
+         return false;
+      slot = (slot + 1) % ENCODER_SHAPE_SLOTS;
+   }
+   if (count == ENCODER_SHAPES_LOGGED) {
+      fprintf(stderr, "kk: encoder shapes: %u logged on thread %" PRIu64
+              ", not logging new ones\n", count, encoder_thread_id());
+      count++;
+   }
+   if (count > ENCODER_SHAPES_LOGGED)
       return false;
    shapes[slot] = hash;
    occupied[slot] = true;
+   count++;
    return true;
 }
 

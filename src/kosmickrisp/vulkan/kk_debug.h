@@ -36,6 +36,9 @@ enum kk_debug {
     * atomics, lowered in nir_to_msl.c): A/B and a fallback if a title trips
     * over the lowering's racy fetch result */
    KK_DEBUG_NO_IMAGE_INT64_ATOMICS = 1ull << 9,
+   /* Log each new copy/render encoder descriptor shape once per thread on any
+    * GPU (by default only Apple9+ logs them) */
+   KK_DEBUG_SHAPES = 1ull << 10,
 };
 
 extern enum kk_debug kk_mesa_debug_flags;

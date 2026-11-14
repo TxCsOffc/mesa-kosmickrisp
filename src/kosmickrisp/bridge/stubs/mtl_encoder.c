@@ -8,7 +8,7 @@
 
 /* Common encoder utils */
 void
-mtl_encoder_set_log(bool enabled)
+mtl_encoder_set_log(bool every_call, bool new_shapes_any_gpu)
 {
 }
 

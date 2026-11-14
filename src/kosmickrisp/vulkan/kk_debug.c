@@ -21,6 +21,7 @@ const struct debug_named_value debug_flags[] = {
    {"noint64atomics", KK_DEBUG_NO_INT64_ATOMICS},
    {"novertexsubgroups", KK_DEBUG_NO_VERTEX_SUBGROUPS},
    {"noimageint64atomics", KK_DEBUG_NO_IMAGE_INT64_ATOMICS},
+   {"shapes", KK_DEBUG_SHAPES},
    {NULL, 0},
 };
 
@@ -44,5 +45,5 @@ kk_process_debug_variable(void)
    kk_mesa_debug_flags = debug_get_option_mesa_kk_debug();
    kk_mesa_experimental_flags = debug_get_option_mesa_kk_experimental();
    mtl_compiler_set_log(KK_DEBUG(COMPILES));
-   mtl_encoder_set_log(KK_DEBUG(CBS));
+   mtl_encoder_set_log(KK_DEBUG(CBS), KK_DEBUG(SHAPES));
 }

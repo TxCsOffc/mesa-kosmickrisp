@@ -12,9 +12,10 @@
 #include <stdint.h>
 
 /* Common encoder utils */
-/* MESA_KK_DEBUG=cbs logs every copy/render descriptor; otherwise only new
- * shapes on Apple9+ are logged (M4 encoder crashes, STEAMAC-5E/5F/5H). */
-void mtl_encoder_set_log(bool enabled);
+/* MESA_KK_DEBUG=cbs logs every copy/render descriptor; otherwise each new
+ * shape is logged once per thread (at most 256) on Apple9+, or on any GPU with
+ * MESA_KK_DEBUG=shapes (M4 encoder crashes, STEAMAC-5E/5F/5H). */
+void mtl_encoder_set_log(bool every_call, bool new_shapes_any_gpu);
 
 void mtl_end_encoding(void *encoder);
 void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
