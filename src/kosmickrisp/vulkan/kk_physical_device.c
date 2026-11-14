@@ -1,3 +1,4 @@
+#include "util/u_debug.h"
 /*
  * Copyright © 2022 Collabora Ltd. and Red Hat Inc.
  * Copyright 2025 LunarG, Inc.
@@ -1047,6 +1048,12 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
    const bool force_robustness = KK_DEBUG(FORCE_ROBUSTNESS);
    _mesa_blake3_update(&blake3_ctx, &force_robustness,
                        sizeof(force_robustness));
+   /* Highball: the robustness switches change SPIR-V translation as well. */
+   const uint8_t hb_robust[2] = {
+      debug_get_bool_option("HB_KK_NO_UBO_ROBUST", false),
+      debug_get_bool_option("HB_KK_NO_SSBO_ROBUST", false),
+   };
+   _mesa_blake3_update(&blake3_ctx, hb_robust, sizeof(hb_robust));
 
    unsigned char blake3[BLAKE3_KEY_LEN];
    _mesa_blake3_final(&blake3_ctx, blake3);
