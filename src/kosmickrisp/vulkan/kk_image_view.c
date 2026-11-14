@@ -75,18 +75,18 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
        range->baseArrayLayer >= layers || range->layerCount == 0 ||
        (range->layerCount != VK_REMAINING_ARRAY_LAYERS &&
         range->layerCount > layers - range->baseArrayLayer)) {
-      return vk_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
-                       "kk: invalid image view range: type %u, format %u, "
-                       "mips %u+%u/%u, layers %u+%u/%u; image type %u, "
-                       "extent %ux%ux%u, flags 0x%llx, usage 0x%llx, tiling %u",
-                       pCreateInfo->viewType, pCreateInfo->format,
-                       range->baseMipLevel, range->levelCount,
-                       image->vk.mip_levels, range->baseArrayLayer,
-                       range->layerCount, layers, image->vk.image_type,
-                       image->vk.extent.width, image->vk.extent.height,
-                       image->vk.extent.depth,
-                       (unsigned long long)image->vk.create_flags,
-                       (unsigned long long)image->vk.usage, image->vk.tiling);
+      mesa_loge("kk: invalid image view range: type %u, format %u, "
+                "mips %u+%u/%u, layers %u+%u/%u; image type %u, "
+                "extent %ux%ux%u, flags 0x%llx, usage 0x%llx, tiling %u",
+                pCreateInfo->viewType, pCreateInfo->format,
+                range->baseMipLevel, range->levelCount,
+                image->vk.mip_levels, range->baseArrayLayer,
+                range->layerCount, layers, image->vk.image_type,
+                image->vk.extent.width, image->vk.extent.height,
+                image->vk.extent.depth,
+                (unsigned long long)image->vk.create_flags,
+                (unsigned long long)image->vk.usage, image->vk.tiling);
+      return vk_error(dev, VK_ERROR_FORMAT_NOT_SUPPORTED);
    }
 
    /* A mutable color format still needs the same texel block size. In
@@ -99,12 +99,12 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
        range->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
        vk_format_get_blocksize(format) !=
           vk_format_get_blocksize(image->vk.format)) {
-      return vk_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
-                       "kk: incompatible image view format %u for image "
-                       "format %u, type %u, flags 0x%llx, usage 0x%llx",
-                       format, image->vk.format, pCreateInfo->viewType,
-                       (unsigned long long)image->vk.create_flags,
-                       (unsigned long long)image->vk.usage);
+      mesa_loge("kk: incompatible image view format %u for image "
+                "format %u, type %u, flags 0x%llx, usage 0x%llx",
+                format, image->vk.format, pCreateInfo->viewType,
+                (unsigned long long)image->vk.create_flags,
+                (unsigned long long)image->vk.usage);
+      return vk_error(dev, VK_ERROR_FORMAT_NOT_SUPPORTED);
    }
 
    memset(view, 0, sizeof(*view));
