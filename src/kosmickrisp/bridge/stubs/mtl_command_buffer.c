@@ -7,6 +7,11 @@
 #include "mtl_command_buffer.h"
 
 void
+mtl_command_buffer_set_log(bool every_call)
+{
+}
+
+void
 mtl_command_allocator_reset(mtl_command_allocator *allocator)
 {
 }

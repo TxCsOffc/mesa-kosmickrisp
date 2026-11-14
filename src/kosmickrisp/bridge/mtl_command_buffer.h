@@ -10,6 +10,9 @@
 #include "mtl_types.h"
 
 #include <stdint.h>
+#include <stdbool.h>
+
+void mtl_command_buffer_set_log(bool every_call);
 
 void mtl_command_allocator_reset(mtl_command_allocator *allocator);
 
