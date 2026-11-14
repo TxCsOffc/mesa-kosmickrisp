@@ -219,6 +219,7 @@ void util_barrier_init(util_barrier *barrier, unsigned count)
 {
    barrier->count = count;
    barrier->waiters = 0;
+   barrier->leaving = 0;
    barrier->sequence = 0;
    (void) mtx_init(&barrier->mutex, mtx_plain);
    cnd_init(&barrier->condvar);
@@ -226,11 +227,17 @@ void util_barrier_init(util_barrier *barrier, unsigned count)
 
 void util_barrier_destroy(util_barrier *barrier)
 {
-   assert(barrier->waiters == 0);
+   assert(barrier->waiters == 0 && barrier->leaving == 0);
    mtx_destroy(&barrier->mutex);
    cnd_destroy(&barrier->condvar);
 }
 
+/* Returns true for exactly one thread per round, like PTHREAD_BARRIER_SERIAL_THREAD: the last one to
+ * leave. util_queue_finish_execute destroys the barrier on true, so it must not be returned before
+ * every waiter has re-acquired and released the mutex: returning true everywhere let the first thread
+ * out destroy the mutex and condvar under the others, which then never left cnd_wait (macOS, no
+ * pthread barriers: util_queue_finish of disk_cache_destroy hung in kk_physical_device_destroy).
+ */
 bool util_barrier_wait(util_barrier *barrier)
 {
    mtx_lock(&barrier->mutex);
@@ -246,13 +253,15 @@ bool util_barrier_wait(util_barrier *barrier)
       } while (sequence == barrier->sequence);
    } else {
       barrier->waiters = 0;
+      barrier->leaving = barrier->count;
       barrier->sequence++;
       cnd_broadcast(&barrier->condvar);
    }
 
+   bool last = --barrier->leaving == 0;
    mtx_unlock(&barrier->mutex);
 
-   return true;
+   return last;
 }
 
 #endif
