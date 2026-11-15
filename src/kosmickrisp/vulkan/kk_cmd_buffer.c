@@ -400,6 +400,30 @@ kk_cmd_new_pre_gfx_cmd_buf(struct kk_cmd_buffer *cmd)
    return true;
 }
 
+static const char *const kk_hb_split_names[KK_HB_SPLIT_COUNT] = {
+   "begin", "resume", "barrier", "compute", "state", "other",
+};
+static uint64_t kk_hb_split_counts[KK_HB_SPLIT_COUNT];
+DEBUG_GET_ONCE_BOOL_OPTION(hb_splitstats, "HB_KK_SPLITSTATS", false)
+
+void
+kk_hb_split_note(enum kk_hb_split_reason reason)
+{
+   if (!debug_get_option_hb_splitstats())
+      return;
+   uint64_t n = __atomic_add_fetch(&kk_hb_split_counts[reason], 1, __ATOMIC_RELAXED);
+   (void)n;
+   static uint64_t total;
+   if (__atomic_add_fetch(&total, 1, __ATOMIC_RELAXED) % 20000 == 0) {
+      char line[256];
+      int len = snprintf(line, sizeof(line), "kk splitstats (render encoders started, cumulative):");
+      for (unsigned i = 0; i < KK_HB_SPLIT_COUNT; i++)
+         len += snprintf(line + len, sizeof(line) - len, " %s=%llu", kk_hb_split_names[i],
+                         (unsigned long long)__atomic_load_n(&kk_hb_split_counts[i], __ATOMIC_RELAXED));
+      fprintf(stderr, "%s\n", line);
+   }
+}
+
 void
 cs_start_render(struct kk_cmd_buffer *cmd)
 {
@@ -427,6 +451,11 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    kk_encoder_update_debug(cmd, cmd->metal.render);
    kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.render);
    kk_cb_record_count(&cmd->record.render_passes);
+   if (state->render.first_start)
+      kk_hb_split_note((state->render.flags & VK_RENDERING_RESUMING_BIT) ? KK_HB_SPLIT_RESUME : KK_HB_SPLIT_BEGIN);
+   else
+      kk_hb_split_note(cmd->hb_restart_reason);
+   cmd->hb_restart_reason = KK_HB_SPLIT_OTHER;
    if (state->render.samples > 1u) {
       kk_cb_record_count(&cmd->record.msaa_render_passes);
       cmd->record.max_samples =
@@ -490,6 +519,7 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
       cs_end(cmd);
       kk_cmd_buffer_dirty_all_gfx(cmd);
       cmd->state.gfx.need_to_start_render_pass = true;
+      cmd->hb_restart_reason = KK_HB_SPLIT_COMPUTE;
    }
 
    if (cmd->metal.compute == NULL) {
@@ -719,6 +749,7 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
           kk_barrier_requires_encoder_split(cmd, pDependencyInfo)) {
          kk_apply_attachment_store_ops(cmd, true);
          cs_end(cmd);
+         cmd->hb_restart_reason = KK_HB_SPLIT_BARRIER;
          cs_start_render(cmd);
       } else
          mtl_barrier_after_encoder_stages(cmd->metal.render, MTL_STAGE_VERTEX,

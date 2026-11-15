@@ -269,8 +269,21 @@ struct kk_ts_stage_entry {
    uint32_t index;
 };
 
+/* Highball: why a Metal render encoder started (HB_KK_SPLITSTATS=1 prints a summary). */
+enum kk_hb_split_reason {
+   KK_HB_SPLIT_BEGIN = 0,    /* first encoder of a vkCmdBeginRendering */
+   KK_HB_SPLIT_RESUME,       /* first encoder of a RESUMING rendering */
+   KK_HB_SPLIT_BARRIER,      /* vkCmdPipelineBarrier2 inside a render pass */
+   KK_HB_SPLIT_COMPUTE,      /* compute work (driver or app) broke the pass */
+   KK_HB_SPLIT_STATE,        /* sample locations / attachment map changed */
+   KK_HB_SPLIT_OTHER,
+   KK_HB_SPLIT_COUNT,
+};
+void kk_hb_split_note(enum kk_hb_split_reason reason);
+
 struct kk_cmd_buffer {
    struct vk_command_buffer vk;
+   enum kk_hb_split_reason hb_restart_reason;
 
    struct {
       mtl_command_allocator *allocator;

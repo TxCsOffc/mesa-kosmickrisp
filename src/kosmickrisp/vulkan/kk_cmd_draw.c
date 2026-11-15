@@ -1023,6 +1023,7 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
       cs_end(cmd);
       kk_cmd_buffer_dirty_all_gfx(cmd);
       cmd->state.gfx.need_to_start_render_pass = true;
+      cmd->hb_restart_reason = KK_HB_SPLIT_STATE;
    }
 }
 
