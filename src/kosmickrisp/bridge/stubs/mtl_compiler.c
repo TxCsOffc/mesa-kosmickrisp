@@ -104,3 +104,8 @@ mtl_new_render_pipeline(mtl_compiler *compiler,
 {
    return NULL;
 }
+
+void
+mtl_set_next_pipeline_label(const char *label)
+{
+}

@@ -1,3 +1,4 @@
+#include <stdlib.h>
 /*
  * Copyright 2025 LunarG, Inc.
  * Copyright 2025 Google LLC
@@ -260,8 +261,10 @@ mtl_barrier_after_stages_device(void *encoder, enum mtl_stages after_stages,
 {
    @autoreleasepool {
       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+      static int vis = -1;
+      if (vis < 0) { const char *e = getenv("HB_KK_EXP_END_VIS"); vis = e ? atoi(e) : MTL4VisibilityOptionDevice; }
       [enc barrierAfterStages:(MTLStages)after_stages beforeQueueStages:(MTLStages)before_queue_stages
-           visibilityOptions:MTL4VisibilityOptionDevice];
+           visibilityOptions:(MTL4VisibilityOptions)vis];
    }
 }
 

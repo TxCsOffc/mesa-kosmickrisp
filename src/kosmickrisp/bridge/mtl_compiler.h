@@ -39,6 +39,8 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
 
 /* Render pipeline descriptor */
 mtl_render_pipeline_descriptor *mtl_new_render_pipeline_descriptor(void);
+/* Highball: label of the next pipeline this thread creates (traces, captures) */
+void mtl_set_next_pipeline_label(const char *label);
 
 void mtl_render_pipeline_descriptor_set_vertex_shader(
    mtl_render_pipeline_descriptor *descriptor, mtl_function_descriptor *shader);

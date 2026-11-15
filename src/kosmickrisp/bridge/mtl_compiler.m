@@ -250,6 +250,24 @@ mtl_new_library_function_descriptor(mtl_library *library, const char *entry_poin
    }
 }
 
+static _Thread_local char mtl_next_pipeline_label[96];
+
+void
+mtl_set_next_pipeline_label(const char *label)
+{
+   snprintf(mtl_next_pipeline_label, sizeof(mtl_next_pipeline_label), "%s", label ? label : "");
+}
+
+static NSString *
+mtl_take_pipeline_label(void)
+{
+   if (!mtl_next_pipeline_label[0])
+      return nil;
+   NSString *l = [NSString stringWithUTF8String:mtl_next_pipeline_label];
+   mtl_next_pipeline_label[0] = '\0';
+   return l;
+}
+
 /* Compute pipeline */
 mtl_compute_pipeline_state *
 mtl_new_compute_pipeline_state(mtl_compiler *compiler,
@@ -262,6 +280,9 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
       MTL4ComputePipelineDescriptor *desc = [[MTL4ComputePipelineDescriptor new] autorelease];
       desc.computeFunctionDescriptor = (MTL4FunctionDescriptor *)function;
       desc.maxTotalThreadsPerThreadgroup = max_total_threads_per_threadgroup;
+      NSString *label = mtl_take_pipeline_label();
+      if (label)
+         desc.label = label;
 
       struct mtl_compile c;
       mtl_compile_begin(&c, compiler, "compute", 1u);
@@ -365,6 +386,9 @@ mtl_new_render_pipeline(mtl_compiler *compiler, mtl_render_pass_descriptor *desc
    @autoreleasepool {
       id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
       MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
+      NSString *label = mtl_take_pipeline_label();
+      if (label)
+         desc.label = label;
 
       struct mtl_compile c;
       mtl_compile_begin(&c, compiler, "render", 2u);

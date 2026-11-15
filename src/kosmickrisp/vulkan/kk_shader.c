@@ -1981,6 +1981,10 @@ kk_compile_compute_pipeline(struct kk_device *device, mtl_compiler *compiler,
    if (pipeline == NULL) {
       mtl_function_descriptor *function =
          mtl_new_library_function_descriptor(library, data->entrypoint_name);
+      char hb_label[64];
+      snprintf(hb_label, sizeof(hb_label), "kk cs %02x%02x%02x%02x%02x%02x%02x%02x",
+               source[0], source[1], source[2], source[3], source[4], source[5], source[6], source[7]);
+      mtl_set_next_pipeline_label(hb_label);
       pipeline = mtl_new_compute_pipeline_state(compiler, function,
                                                 local_size_threads);
       mtl_release(function);
@@ -2348,6 +2352,12 @@ kk_compile_graphics_pipeline(struct kk_device *device, mtl_compiler *compiler,
             pipeline_descriptor, vs->info.vs.sample_count);
       }
 
+      char hb_label[80];
+      snprintf(hb_label, sizeof(hb_label),
+               "kk vs %02x%02x%02x%02x%02x%02x%02x%02x fs %02x%02x%02x%02x%02x%02x%02x%02x",
+               vs_source[0], vs_source[1], vs_source[2], vs_source[3], vs_source[4], vs_source[5], vs_source[6], vs_source[7],
+               fs_source[0], fs_source[1], fs_source[2], fs_source[3], fs_source[4], fs_source[5], fs_source[6], fs_source[7]);
+      mtl_set_next_pipeline_label(hb_label);
       render = mtl_new_render_pipeline(compiler, pipeline_descriptor);
 
       mtl_release(pipeline_descriptor);
