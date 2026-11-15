@@ -1,3 +1,5 @@
+#include <stdlib.h>
+#include "util/os_time.h"
 /*
  * Copyright 2024 Valve Corporation
  * Copyright 2024 Alyssa Rosenzweig
@@ -62,6 +64,11 @@ kk_ts_take_chunk(struct kk_device *dev, uint16_t *chunk)
 
    simple_mtx_lock(&kk_ts_slots.mutex);
 
+   /* Highball: a capture session (HB_KK_CAPTURE_TRIGGER) creates no counter
+    * heap, since Metal 4 GPU captures refuse devices that have one; its
+    * timestamps fall back to CPU time below. */
+   if (getenv("HB_KK_CAPTURE_TRIGGER"))
+      goto unlock;
    if (kk_ts_slots.device == NULL)
       kk_ts_slots.device = dev->mtl_handle;
    if (kk_ts_slots.device != dev->mtl_handle)
@@ -529,10 +536,18 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
                    "of the process are held by recorded command buffers; "
                    "queries without one read 0",
                    KK_TS_HEAP_COUNT * KK_TS_HEAP_MAX_ENTRIES);
+      /* In a capture session the value is the CPU time at recording in
+       * timestamp ticks, so timestamps still increase. */
+      const float period =
+         kk_device_physical(dev)->vk.properties.timestampPeriod;
+      const uint64_t value =
+         getenv("HB_KK_CAPTURE_TRIGGER") && period > 0.0f
+            ? (uint64_t)((double)os_time_get_nano() / period)
+            : 0u;
       for (uint32_t i = 0; i < count; i++) {
          const uint64_t addr = kk_query_report_addr(dev, pool, query + i);
-         kk_cmd_write(cmd, (struct libkk_imm_write){addr, 0u});
-         kk_cmd_write(cmd, (struct libkk_imm_write){addr + 4u, 0u});
+         kk_cmd_write(cmd, (struct libkk_imm_write){addr, (uint32_t)value});
+         kk_cmd_write(cmd, (struct libkk_imm_write){addr + 4u, (uint32_t)(value >> 32)});
       }
       return;
    }
