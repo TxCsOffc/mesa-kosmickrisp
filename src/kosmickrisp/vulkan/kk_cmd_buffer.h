@@ -165,6 +165,10 @@ struct kk_graphics_state {
    bool is_depth_stencil_dynamic;
    bool is_cull_front_and_back;
    bool need_to_start_render_pass;
+   /* Highball: a SUSPENDING rendering ended with its render encoder left open
+    * (kk_CmdEndRendering2KHR); a RESUMING one with the same attachments goes on
+    * in it, anything else ends it first (kk_hb_unpark). */
+   bool hb_parked;
 
    enum kk_dirty dirty;
    uint32_t pipeline_sample_count;
@@ -278,10 +282,14 @@ enum kk_hb_split_reason {
    KK_HB_SPLIT_STATE,        /* sample locations / attachment map changed */
    KK_HB_SPLIT_OTHER,
    KK_HB_SPLIT_SKIPPED_EMPTY, /* not started: empty rendering that changes nothing */
+   KK_HB_SPLIT_MERGED_RESUME, /* not started: RESUMING rendering went on in the suspended one's encoder */
    KK_HB_SPLIT_COUNT,
 };
 void kk_hb_split_note(enum kk_hb_split_reason reason);
 bool kk_hb_keep_empty_passes(void);
+bool kk_hb_resume_merge(void);
+struct kk_cmd_buffer;
+void kk_hb_unpark(struct kk_cmd_buffer *cmd);
 
 struct kk_cmd_buffer {
    struct vk_command_buffer vk;

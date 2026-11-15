@@ -86,6 +86,7 @@ end_recording(struct kk_cmd_buffer *cmd)
    if (cmd->vk.state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
       return;
 
+   kk_hb_unpark(cmd);
    cs_end(cmd);
    cmd->record.metal_cmd_bufs = MIN2(
       util_dynarray_num_elements(&cmd->metal.cmd_bufs, mtl_command_buffer *),
@@ -401,7 +402,7 @@ kk_cmd_new_pre_gfx_cmd_buf(struct kk_cmd_buffer *cmd)
 }
 
 static const char *const kk_hb_split_names[KK_HB_SPLIT_COUNT] = {
-   "begin", "resume", "barrier", "compute", "state", "other", "skipped_empty",
+   "begin", "resume", "barrier", "compute", "state", "other", "skipped_empty", "merged_resume",
 };
 DEBUG_GET_ONCE_BOOL_OPTION(hb_keep_empty_passes, "HB_KK_KEEP_EMPTY_PASSES", false)
 bool
@@ -409,6 +410,31 @@ kk_hb_keep_empty_passes(void)
 {
    return debug_get_option_hb_keep_empty_passes();
 }
+DEBUG_GET_ONCE_BOOL_OPTION(hb_no_resume_merge, "HB_KK_NO_RESUME_MERGE", false)
+bool
+kk_hb_resume_merge(void)
+{
+   return !debug_get_option_hb_no_resume_merge();
+}
+
+/* Highball: end a rendering that kk_CmdEndRendering2KHR suspended with its
+ * render encoder left open, the way it would have ended there. Vulkan allows
+ * only state commands between a suspended rendering and its resumption in a
+ * command buffer, so this runs when the resumption does not follow (another
+ * rendering, the end of the command buffer) or as a guard before other work. */
+void
+kk_hb_unpark(struct kk_cmd_buffer *cmd)
+{
+   if (!cmd->state.gfx.hb_parked)
+      return;
+   cmd->state.gfx.hb_parked = false;
+   kk_apply_attachment_store_ops(cmd, false);
+   cs_end(cmd);
+   mtl_release(cmd->state.gfx.render_pass_descriptor);
+   cmd->state.gfx.render_pass_descriptor = NULL;
+   memset(&cmd->state.gfx.render, 0, sizeof(cmd->state.gfx.render));
+}
+
 static uint64_t kk_hb_split_counts[KK_HB_SPLIT_COUNT];
 DEBUG_GET_ONCE_BOOL_OPTION(hb_splitstats, "HB_KK_SPLITSTATS", false)
 
@@ -519,6 +545,8 @@ cs_get_render(struct kk_cmd_buffer *cmd)
 mtl_compute_encoder *
 cs_get_compute(struct kk_cmd_buffer *cmd)
 {
+   kk_hb_unpark(cmd);
+
    /* If we are inside render, we need to force a restart later */
    if (cmd->metal.render) {
       kk_apply_attachment_store_ops(cmd, true);
@@ -742,6 +770,8 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                        const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   kk_hb_unpark(cmd);
 
    /* TODO_KOSMICKRISP Lighten barriers according to the actual requested
     * barrier. To take advantage of this we need to remove the chaining of
@@ -1123,6 +1153,7 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
 void
 kk_cmd_write(struct kk_cmd_buffer *cmd, struct libkk_imm_write write)
 {
+   kk_hb_unpark(cmd);
    /* If we are mid render, queue the write for when we are done */
    if (cmd->metal.render)
       util_dynarray_append(&cmd->post_render_writes, write);

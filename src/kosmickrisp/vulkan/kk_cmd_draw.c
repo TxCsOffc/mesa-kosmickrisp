@@ -279,6 +279,35 @@ kk_render_pass_descriptor_load_attachments(struct kk_cmd_buffer *cmd)
    }
 }
 
+/* Highball: does a RESUMING rendering continue the one parked in its render
+ * encoder? Vulkan requires the same render area, attachments and views. */
+static bool
+kk_hb_resumes_parked(const struct kk_rendering_state *render,
+                     const VkRenderingInfo *info)
+{
+   if (!(info->flags & VK_RENDERING_RESUMING_BIT) ||
+       (info->flags & VK_RENDERING_CUSTOM_RESOLVE_BIT_EXT) ||
+       memcmp(&render->area, &info->renderArea, sizeof(render->area)) ||
+       render->view_mask != info->viewMask ||
+       render->layer_count != info->layerCount ||
+       render->color_att_count != info->colorAttachmentCount)
+      return false;
+   for (uint32_t i = 0; i < info->colorAttachmentCount; i++) {
+      VK_FROM_HANDLE(kk_image_view, iview, info->pColorAttachments[i].imageView);
+      if (render->color_att[i].iview != iview)
+         return false;
+   }
+   const VkRenderingAttachmentInfo *ds[2] = {info->pDepthAttachment,
+                                             info->pStencilAttachment};
+   const struct kk_attachment *att[2] = {&render->depth_att, &render->stencil_att};
+   for (uint32_t i = 0; i < 2; i++) {
+      VK_FROM_HANDLE(kk_image_view, iview, ds[i] ? ds[i]->imageView : VK_NULL_HANDLE);
+      if (att[i]->iview != iview)
+         return false;
+   }
+   return true;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                      const VkRenderingInfo *pRenderingInfo)
@@ -288,6 +317,23 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
 
    struct kk_rendering_state *render = &cmd->state.gfx.render;
+
+   /* Highball: go on in the render encoder of the rendering this one resumes
+    * instead of storing every tile at its suspension and loading it again
+    * here. HB_KK_NO_RESUME_MERGE=1 restores the split. */
+   if (cmd->state.gfx.hb_parked) {
+      if (kk_hb_resumes_parked(render, pRenderingInfo)) {
+         cmd->state.gfx.hb_parked = false;
+         render->flags = pRenderingInfo->flags;
+         render->force_attachment_store =
+            !render->rendering_to_whole_framebuffer ||
+            (render->flags & VK_RENDERING_SUSPENDING_BIT);
+         kk_hb_split_note(KK_HB_SPLIT_MERGED_RESUME);
+         kk_cmd_buffer_dirty_all_gfx(cmd);
+         return;
+      }
+      kk_hb_unpark(cmd);
+   }
 
    memset(render, 0, sizeof(*render));
 
@@ -666,6 +712,17 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       else
          cs_get_render(cmd);
    }
+
+   /* Highball: a suspended rendering keeps its render encoder open for the
+    * rendering that resumes it (kk_CmdBeginRendering); Vulkan allows only
+    * state commands in between, anything else ends it (kk_hb_unpark). */
+   if ((render->flags & VK_RENDERING_SUSPENDING_BIT) &&
+       !(render->flags & VK_RENDERING_CUSTOM_RESOLVE_BIT_EXT) &&
+       cmd->metal.render && kk_hb_resume_merge()) {
+      cmd->state.gfx.hb_parked = true;
+      return;
+   }
+
    kk_apply_attachment_store_ops(cmd, false);
 
    /* Clean up previous encoder */
