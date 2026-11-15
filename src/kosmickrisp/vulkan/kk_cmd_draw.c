@@ -279,23 +279,29 @@ kk_render_pass_descriptor_load_attachments(struct kk_cmd_buffer *cmd)
    }
 }
 
-/* Highball: does a RESUMING rendering continue the one parked in its render
- * encoder? Vulkan requires the same render area, attachments and views. */
-static bool
-kk_hb_resumes_parked(const struct kk_rendering_state *render,
-                     const VkRenderingInfo *info)
+/* Highball: may a rendering go on in the render encoder parked by the
+ * previous one (kk_CmdEndRendering2KHR)? */
+enum kk_hb_park_match {
+   KK_HB_PARK_OTHER,  /* other views or area */
+   KK_HB_PARK_SAME,   /* same views, cannot go on */
+   KK_HB_PARK_RESUME, /* resumes the suspended rendering */
+   KK_HB_PARK_BEGIN,  /* a new rendering to the same views */
+};
+
+static enum kk_hb_park_match
+kk_hb_park_match(const struct kk_cmd_buffer *cmd,
+                 const struct kk_rendering_state *render,
+                 const VkRenderingInfo *info)
 {
-   if (!(info->flags & VK_RENDERING_RESUMING_BIT) ||
-       (info->flags & VK_RENDERING_CUSTOM_RESOLVE_BIT_EXT) ||
-       memcmp(&render->area, &info->renderArea, sizeof(render->area)) ||
+   if (memcmp(&render->area, &info->renderArea, sizeof(render->area)) ||
        render->view_mask != info->viewMask ||
        render->layer_count != info->layerCount ||
        render->color_att_count != info->colorAttachmentCount)
-      return false;
+      return KK_HB_PARK_OTHER;
    for (uint32_t i = 0; i < info->colorAttachmentCount; i++) {
       VK_FROM_HANDLE(kk_image_view, iview, info->pColorAttachments[i].imageView);
       if (render->color_att[i].iview != iview)
-         return false;
+         return KK_HB_PARK_OTHER;
    }
    const VkRenderingAttachmentInfo *ds[2] = {info->pDepthAttachment,
                                              info->pStencilAttachment};
@@ -303,9 +309,33 @@ kk_hb_resumes_parked(const struct kk_rendering_state *render,
    for (uint32_t i = 0; i < 2; i++) {
       VK_FROM_HANDLE(kk_image_view, iview, ds[i] ? ds[i]->imageView : VK_NULL_HANDLE);
       if (att[i]->iview != iview)
-         return false;
+         return KK_HB_PARK_OTHER;
    }
-   return true;
+
+   if (info->flags & VK_RENDERING_CUSTOM_RESOLVE_BIT_EXT)
+      return KK_HB_PARK_SAME;
+   /* Vulkan requires a RESUMING rendering to repeat the suspended one */
+   if (info->flags & VK_RENDERING_RESUMING_BIT)
+      return cmd->state.gfx.hb_parked_suspended ? KK_HB_PARK_RESUME : KK_HB_PARK_SAME;
+   /* Metal orders a render encoder's draws only for their attachments, and a
+    * barrier in it cannot wait for fragment shaders; pre_gfx compute work of
+    * the next rendering's draws would also run ahead of the encoder */
+   if (cmd->state.gfx.hb_parked_suspended || !kk_hb_begin_merge() ||
+       render->samples > 1 || render->hb_wrote_memory ||
+       vk_find_struct_const(info->pNext,
+                            RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR))
+      return KK_HB_PARK_SAME;
+   /* Resolve attachments are part of the render pass descriptor */
+   for (uint32_t i = 0; i < info->colorAttachmentCount; i++) {
+      if (info->pColorAttachments[i].imageView &&
+          info->pColorAttachments[i].resolveMode != VK_RESOLVE_MODE_NONE)
+         return KK_HB_PARK_SAME;
+   }
+   for (uint32_t i = 0; i < 2; i++) {
+      if (ds[i] && ds[i]->imageView && ds[i]->resolveMode != VK_RESOLVE_MODE_NONE)
+         return KK_HB_PARK_SAME;
+   }
+   return KK_HB_PARK_BEGIN;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -322,8 +352,10 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
     * instead of storing every tile at its suspension and loading it again
     * here. HB_KK_NO_RESUME_MERGE=1 restores the split. */
    if (cmd->state.gfx.hb_parked) {
-      if (kk_hb_resumes_parked(render, pRenderingInfo)) {
+      enum kk_hb_park_match match = kk_hb_park_match(cmd, render, pRenderingInfo);
+      if (match == KK_HB_PARK_RESUME) {
          cmd->state.gfx.hb_parked = false;
+         cmd->state.gfx.hb_parked_suspended = false;
          render->flags = pRenderingInfo->flags;
          render->force_attachment_store =
             !render->rendering_to_whole_framebuffer ||
@@ -332,7 +364,34 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          kk_cmd_buffer_dirty_all_gfx(cmd);
          return;
       }
-      kk_hb_unpark(cmd);
+      if (match == KK_HB_PARK_BEGIN) {
+         /* A new rendering to the same views: what the previous one stored is
+          * still in the tiles, a LOAD (or DONT_CARE) needs nothing and a CLEAR
+          * is a clear draw below. Its own store ops apply at the end. The
+          * previous one wrote no memory (kk_hb_park_match), so there is
+          * nothing the end of its encoder would have had to order. */
+         cmd->state.gfx.hb_parked = false;
+         render->flags = pRenderingInfo->flags;
+         for (uint32_t i = 0; i < render->color_att_count; i++)
+            kk_attachment_init(&render->color_att[i],
+                               &pRenderingInfo->pColorAttachments[i]);
+         kk_attachment_init(&render->depth_att, pRenderingInfo->pDepthAttachment);
+         kk_attachment_init(&render->stencil_att, pRenderingInfo->pStencilAttachment);
+         render->force_attachment_store =
+            !render->rendering_to_whole_framebuffer ||
+            (render->flags & VK_RENDERING_SUSPENDING_BIT);
+         const VkRenderingAttachmentLocationInfoKHR merged_ral = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR,
+            .colorAttachmentCount = pRenderingInfo->colorAttachmentCount,
+         };
+         vk_cmd_set_rendering_attachment_locations(&cmd->vk, &merged_ral);
+         kk_cmd_buffer_dirty_render_pass(cmd);
+         kk_cmd_buffer_dirty_all_gfx(cmd);
+         kk_hb_split_note(KK_HB_SPLIT_MERGED_BEGIN);
+         goto clear_attachments;
+      }
+      kk_hb_unpark(cmd, match == KK_HB_PARK_SAME ? KK_HB_UNPARK_BEGIN_SAME
+                                                 : KK_HB_UNPARK_BEGIN_OTHER);
    }
 
    memset(render, 0, sizeof(*render));
@@ -538,6 +597,7 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    if (!force_attachment_load || !does_any_attachment_clear)
       return;
 
+clear_attachments:;
    uint32_t clear_count = 0;
    VkClearAttachment clear_att[KK_MAX_RTS + 1];
    for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
@@ -716,10 +776,26 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    /* Highball: a suspended rendering keeps its render encoder open for the
     * rendering that resumes it (kk_CmdBeginRendering); Vulkan allows only
     * state commands in between, anything else ends it (kk_hb_unpark). */
-   if ((render->flags & VK_RENDERING_SUSPENDING_BIT) &&
-       !(render->flags & VK_RENDERING_CUSTOM_RESOLVE_BIT_EXT) &&
-       cmd->metal.render && kk_hb_resume_merge()) {
+   bool park = false;
+   if (cmd->metal.render &&
+       !(render->flags & VK_RENDERING_CUSTOM_RESOLVE_BIT_EXT)) {
+      if (render->flags & VK_RENDERING_SUSPENDING_BIT) {
+         park = kk_hb_resume_merge();
+      } else if (kk_hb_begin_merge() && !need_meta_resolve &&
+                 render->samples <= 1 && !render->hb_wrote_memory) {
+         /* Highball: so does an ended one, for a next rendering to the same
+          * views (kk_hb_park_match); not with a resolve, which is done at the
+          * end of its render encoder. */
+         park = render->depth_att.resolve_mode == VK_RESOLVE_MODE_NONE &&
+                render->stencil_att.resolve_mode == VK_RESOLVE_MODE_NONE;
+         for (uint32_t i = 0; park && i < render->color_att_count; i++)
+            park = render->color_att[i].resolve_mode == VK_RESOLVE_MODE_NONE;
+      }
+   }
+   if (park) {
       cmd->state.gfx.hb_parked = true;
+      cmd->state.gfx.hb_parked_suspended =
+         (render->flags & VK_RENDERING_SUSPENDING_BIT) != 0;
       return;
    }
 
@@ -1710,6 +1786,19 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
 {
    struct kk_graphics_state *gfx = &cmd->state.gfx;
    struct kk_descriptor_state *desc = &gfx->descriptors;
+
+   const struct kk_shader *hb_vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   const struct kk_shader *hb_fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   if ((hb_vs && (hb_vs->info.writes_memory ||
+                  (hb_vs->info.vs.additional_stages_bits &
+                   (BITFIELD_BIT(MESA_SHADER_TESS_CTRL) |
+                    BITFIELD_BIT(MESA_SHADER_TESS_EVAL) |
+                    BITFIELD_BIT(MESA_SHADER_GEOMETRY))))) ||
+       (hb_fs && hb_fs->info.writes_memory) ||
+       cmd->state.shaders[MESA_SHADER_TESS_CTRL] ||
+       cmd->state.shaders[MESA_SHADER_TESS_EVAL] ||
+       cmd->state.shaders[MESA_SHADER_GEOMETRY])
+      gfx->render.hb_wrote_memory = true;
 
    /* The VS's program with or without sampler min/max emulation */
    const struct kk_pipeline_handles *pipe = kk_cmd_shader_pipeline(

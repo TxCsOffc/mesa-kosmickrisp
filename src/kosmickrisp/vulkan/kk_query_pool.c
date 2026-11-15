@@ -399,7 +399,7 @@ kk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
    kk_cb_record_op(&cmd->record, KK_CB_OP_QUERY_RESET);
-   kk_hb_unpark(cmd);
+   kk_hb_unpark(cmd, KK_HB_UNPARK_QUERY);
 
    assert(cmd->metal.render == NULL);
 
@@ -477,7 +477,7 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    kk_cb_record_op(&cmd->record, KK_CB_OP_TIMESTAMP);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    assert(kk_pool_is_ts(pool));
-   kk_hb_unpark(cmd);
+   kk_hb_unpark(cmd, KK_HB_UNPARK_QUERY);
 
    uint32_t count = kk_mv_query_count(cmd);
    enum mtl_render_stages mtl_stage =
@@ -586,7 +586,7 @@ kk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
    kk_cb_record_op(&cmd->record, KK_CB_OP_QUERY);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
-   kk_hb_unpark(cmd);
+   kk_hb_unpark(cmd, KK_HB_UNPARK_QUERY);
 
    /* GS emulation adds to this query until it ends. */
    if (pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
@@ -611,7 +611,7 @@ kk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
-   kk_hb_unpark(cmd);
+   kk_hb_unpark(cmd, KK_HB_UNPARK_QUERY);
 
    if (pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
       cmd->state.gfx.xfb.queries[index] = 0u;
@@ -747,7 +747,7 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
    kk_cb_record_op(&cmd->record, KK_CB_OP_QUERY_COPY);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
-   kk_hb_unpark(cmd);
+   kk_hb_unpark(cmd, KK_HB_UNPARK_QUERY);
 
    /* Timestamp results are resolved into the pool BO on a deferred command
     * buffer; make sure any pending resolve lands before this copy reads it.

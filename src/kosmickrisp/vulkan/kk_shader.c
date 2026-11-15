@@ -1168,6 +1168,16 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
 {
    shader->info.stage = nir->info.stage;
    shader->info.uses_per_draw_data = msl_gather_uses_per_draw_data(nir);
+   shader->info.writes_memory = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_intrinsic_writes_external_memory(nir_instr_as_intrinsic(instr)))
+               shader->info.writes_memory = true;
+         }
+      }
+   }
    shader->info.num_cull_distances = nir->info.cull_distance_array_size;
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       nir_shader_intrinsics_pass(nir, gather_vs_inputs, nir_metadata_all,

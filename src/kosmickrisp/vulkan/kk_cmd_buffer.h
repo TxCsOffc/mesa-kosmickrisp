@@ -131,6 +131,10 @@ struct kk_rendering_state {
    bool write_available;
    bool ds_write_available;
    bool storage_write_available;
+   /* Highball: a draw of it ran a shader that writes memory, or a GS or
+    * tessellation (compute passes ahead of the render encoder): the next
+    * rendering cannot go on in its render encoder (kk_hb_park_match). */
+   bool hb_wrote_memory;
    bool sample_locations_enable;
    uint32_t sample_locations_count;
    VkSampleLocationEXT sample_locations[KK_MAX_SAMPLES];
@@ -169,6 +173,7 @@ struct kk_graphics_state {
     * (kk_CmdEndRendering2KHR); a RESUMING one with the same attachments goes on
     * in it, anything else ends it first (kk_hb_unpark). */
    bool hb_parked;
+   bool hb_parked_suspended; /* parked by a SUSPENDING rendering */
 
    enum kk_dirty dirty;
    uint32_t pipeline_sample_count;
@@ -283,13 +288,24 @@ enum kk_hb_split_reason {
    KK_HB_SPLIT_OTHER,
    KK_HB_SPLIT_SKIPPED_EMPTY, /* not started: empty rendering that changes nothing */
    KK_HB_SPLIT_MERGED_RESUME, /* not started: RESUMING rendering went on in the suspended one's encoder */
+   KK_HB_SPLIT_MERGED_BEGIN, /* not started: rendering to the same views went on in the previous one's encoder */
+   KK_HB_SPLIT_PARKED_BARRIER, /* barrier between two renderings kept in one encoder */
+   /* why a parked render encoder ended (kk_hb_unpark) */
+   KK_HB_UNPARK_BEGIN_OTHER, /* next rendering has other views or area */
+   KK_HB_UNPARK_BEGIN_SAME,  /* same views, but resolve/MSAA/suspended */
+   KK_HB_UNPARK_BARRIER,
+   KK_HB_UNPARK_COMPUTE,     /* compute, copy or clear work */
+   KK_HB_UNPARK_WRITE,       /* immediate write (events, queries) */
+   KK_HB_UNPARK_QUERY,
+   KK_HB_UNPARK_END,         /* end of the command buffer */
    KK_HB_SPLIT_COUNT,
 };
 void kk_hb_split_note(enum kk_hb_split_reason reason);
 bool kk_hb_keep_empty_passes(void);
 bool kk_hb_resume_merge(void);
+bool kk_hb_begin_merge(void);
 struct kk_cmd_buffer;
-void kk_hb_unpark(struct kk_cmd_buffer *cmd);
+void kk_hb_unpark(struct kk_cmd_buffer *cmd, enum kk_hb_split_reason why);
 
 struct kk_cmd_buffer {
    struct vk_command_buffer vk;

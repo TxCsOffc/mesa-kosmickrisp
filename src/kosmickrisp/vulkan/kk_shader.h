@@ -60,6 +60,9 @@ struct kk_shader_info {
     * need it (kk_compile_programs) */
    uint32_t minmax_sets;
 
+   /* Highball: an instruction writes memory (buffers, images, global) */
+   bool writes_memory;
+
    union {
       /* Vertex shader is the pipeline, store all relevant data here. */
       struct {

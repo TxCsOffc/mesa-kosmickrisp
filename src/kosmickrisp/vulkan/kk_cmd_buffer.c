@@ -86,7 +86,7 @@ end_recording(struct kk_cmd_buffer *cmd)
    if (cmd->vk.state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
       return;
 
-   kk_hb_unpark(cmd);
+   kk_hb_unpark(cmd, KK_HB_UNPARK_END);
    cs_end(cmd);
    cmd->record.metal_cmd_bufs = MIN2(
       util_dynarray_num_elements(&cmd->metal.cmd_bufs, mtl_command_buffer *),
@@ -403,6 +403,8 @@ kk_cmd_new_pre_gfx_cmd_buf(struct kk_cmd_buffer *cmd)
 
 static const char *const kk_hb_split_names[KK_HB_SPLIT_COUNT] = {
    "begin", "resume", "barrier", "compute", "state", "other", "skipped_empty", "merged_resume",
+   "merged_begin", "parked_barrier", "unpark:begin_other", "unpark:begin_same", "unpark:barrier",
+   "unpark:compute", "unpark:write", "unpark:query", "unpark:end",
 };
 DEBUG_GET_ONCE_BOOL_OPTION(hb_keep_empty_passes, "HB_KK_KEEP_EMPTY_PASSES", false)
 bool
@@ -416,6 +418,12 @@ kk_hb_resume_merge(void)
 {
    return !debug_get_option_hb_no_resume_merge();
 }
+DEBUG_GET_ONCE_BOOL_OPTION(hb_no_begin_merge, "HB_KK_NO_BEGIN_MERGE", false)
+bool
+kk_hb_begin_merge(void)
+{
+   return kk_hb_resume_merge() && !debug_get_option_hb_no_begin_merge();
+}
 
 /* Highball: end a rendering that kk_CmdEndRendering2KHR suspended with its
  * render encoder left open, the way it would have ended there. Vulkan allows
@@ -423,11 +431,13 @@ kk_hb_resume_merge(void)
  * command buffer, so this runs when the resumption does not follow (another
  * rendering, the end of the command buffer) or as a guard before other work. */
 void
-kk_hb_unpark(struct kk_cmd_buffer *cmd)
+kk_hb_unpark(struct kk_cmd_buffer *cmd, enum kk_hb_split_reason why)
 {
    if (!cmd->state.gfx.hb_parked)
       return;
+   kk_hb_split_note(why);
    cmd->state.gfx.hb_parked = false;
+   cmd->state.gfx.hb_parked_suspended = false;
    kk_apply_attachment_store_ops(cmd, false);
    cs_end(cmd);
    mtl_release(cmd->state.gfx.render_pass_descriptor);
@@ -447,7 +457,7 @@ kk_hb_split_note(enum kk_hb_split_reason reason)
    (void)n;
    static uint64_t total;
    if (__atomic_add_fetch(&total, 1, __ATOMIC_RELAXED) % 20000 == 0) {
-      char line[256];
+      char line[640];
       int len = snprintf(line, sizeof(line), "kk splitstats (render encoders started, cumulative):");
       for (unsigned i = 0; i < KK_HB_SPLIT_COUNT; i++)
          len += snprintf(line + len, sizeof(line) - len, " %s=%llu", kk_hb_split_names[i],
@@ -545,7 +555,7 @@ cs_get_render(struct kk_cmd_buffer *cmd)
 mtl_compute_encoder *
 cs_get_compute(struct kk_cmd_buffer *cmd)
 {
-   kk_hb_unpark(cmd);
+   kk_hb_unpark(cmd, KK_HB_UNPARK_COMPUTE);
 
    /* If we are inside render, we need to force a restart later */
    if (cmd->metal.render) {
@@ -771,7 +781,31 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
 
-   kk_hb_unpark(cmd);
+   /* Highball: a barrier after a rendering whose render encoder is parked
+    * (kk_CmdEndRendering2KHR). Every encoder ends with a full barrier, so work
+    * before it is ordered already, and a rendering parked after it ended wrote
+    * no memory (hb_wrote_memory): there is nothing for the barrier to order
+    * in the encoder. A rendering that goes on in it renders to the same views,
+    * which Vulkan and D3D12 both forbid reading as textures there; anything
+    * else ends the encoder before it starts. Input attachment reads and a
+    * suspended rendering (no barrier is allowed before its resumption) end it. */
+   if (cmd->state.gfx.hb_parked) {
+      VkAccessFlags2 dst = 0;
+      for (uint32_t i = 0; i < pDependencyInfo->memoryBarrierCount; i++)
+         dst |= pDependencyInfo->pMemoryBarriers[i].dstAccessMask;
+      for (uint32_t i = 0; i < pDependencyInfo->bufferMemoryBarrierCount; i++)
+         dst |= pDependencyInfo->pBufferMemoryBarriers[i].dstAccessMask;
+      for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++)
+         dst |= pDependencyInfo->pImageMemoryBarriers[i].dstAccessMask;
+      if (cmd->state.gfx.hb_parked_suspended || cmd->state.gfx.render.samples > 1 ||
+          cmd->state.gfx.render.hb_wrote_memory ||
+          (dst & VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT)) {
+         kk_hb_unpark(cmd, KK_HB_UNPARK_BARRIER);
+      } else {
+         kk_hb_split_note(KK_HB_SPLIT_PARKED_BARRIER);
+         return;
+      }
+   }
 
    /* TODO_KOSMICKRISP Lighten barriers according to the actual requested
     * barrier. To take advantage of this we need to remove the chaining of
@@ -1153,7 +1187,7 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
 void
 kk_cmd_write(struct kk_cmd_buffer *cmd, struct libkk_imm_write write)
 {
-   kk_hb_unpark(cmd);
+   kk_hb_unpark(cmd, KK_HB_UNPARK_WRITE);
    /* If we are mid render, queue the write for when we are done */
    if (cmd->metal.render)
       util_dynarray_append(&cmd->post_render_writes, write);
