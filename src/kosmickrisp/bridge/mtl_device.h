@@ -22,6 +22,8 @@ mtl_device *mtl_device_create(void);
 /* Device operations */
 void mtl_start_gpu_capture(mtl_device *mtl_dev_handle, const char *directory);
 void mtl_stop_gpu_capture(void);
+/* Highball: start a capture of the device into the .gputrace document at path. Returns 0 on success. */
+int mtl_start_gpu_capture_to(mtl_device *mtl_dev_handle, const char *path);
 
 /* Device feature query */
 void mtl_device_get_name(mtl_device *dev, char buffer[256]);

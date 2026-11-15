@@ -63,6 +63,29 @@ mtl_start_gpu_capture(mtl_device *mtl_dev_handle, const char *directory)
    }
 }
 
+int
+mtl_start_gpu_capture_to(mtl_device *mtl_dev_handle, const char *path)
+{
+   @autoreleasepool {
+      MTLCaptureManager *captureMgr = [MTLCaptureManager sharedCaptureManager];
+      if (![captureMgr supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+         fprintf(stderr, "kk: hb capture: GPU trace documents not supported (set MTL_CAPTURE_ENABLED=1)\n");
+         return -1;
+      }
+      MTLCaptureDescriptor *captureDesc = [[MTLCaptureDescriptor new] autorelease];
+      captureDesc.captureObject = (id<MTLDevice>)mtl_dev_handle;
+      captureDesc.destination = MTLCaptureDestinationGPUTraceDocument;
+      captureDesc.outputURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+      NSError *err = nil;
+      if (![captureMgr startCaptureWithDescriptor:captureDesc error:&err]) {
+         fprintf(stderr, "kk: hb capture: start failed (%li): %s\n", (long)err.code,
+                 err.localizedDescription.UTF8String);
+         return -1;
+      }
+      return 0;
+   }
+}
+
 void
 mtl_stop_gpu_capture()
 {

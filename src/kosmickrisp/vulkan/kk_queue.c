@@ -1,3 +1,7 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 /*
  * Copyright © 2022 Collabora Ltd. and Red Hat Inc.
  * Copyright 2025 LunarG, Inc.
@@ -596,6 +600,46 @@ unlock:
    return result;
 }
 
+
+/* Highball: HB_KK_CAPTURE_TRIGGER=<file> starts a Metal GPU capture of the next
+ * HB_KK_CAPTURE_FRAMES (default 1) frames when <file> appears, at a present
+ * boundary, written to HB_KK_CAPTURE_DIR (default /tmp) as
+ * kk-<pid>-<time>.gputrace; the trigger file is removed. Needs
+ * MTL_CAPTURE_ENABLED=1. Off unless the variable is set. */
+static void
+kk_hb_capture_frame_boundary(struct kk_device *dev)
+{
+   static const char *trigger = NULL;
+   static bool checked = false;
+   static int frames_left = 0;
+   if (!checked) {
+      trigger = getenv("HB_KK_CAPTURE_TRIGGER");
+      checked = true;
+   }
+   if (!trigger)
+      return;
+   if (frames_left > 0) {
+      if (--frames_left == 0) {
+         mtl_stop_gpu_capture();
+         fprintf(stderr, "kk: hb capture: stopped\n");
+      }
+      return;
+   }
+   if (access(trigger, F_OK) != 0)
+      return;
+   unlink(trigger);
+   const char *dir = getenv("HB_KK_CAPTURE_DIR");
+   const char *nframes = getenv("HB_KK_CAPTURE_FRAMES");
+   int n = nframes ? atoi(nframes) : 1;
+   char path[1024];
+   snprintf(path, sizeof(path), "%s/kk-%d-%ld.gputrace", dir ? dir : "/tmp",
+            (int)getpid(), (long)time(NULL));
+   if (mtl_start_gpu_capture_to(dev->mtl_handle, path) == 0) {
+      frames_left = n > 0 ? n : 1;
+      fprintf(stderr, "kk: hb capture: capturing %d frame(s) to %s\n", frames_left, path);
+   }
+}
+
 static VkResult
 kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
@@ -675,6 +719,7 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
                                            cmd_buffer->drawable);
          mtl_release(cmd_buffer->drawable);
          cmd_buffer->drawable = NULL;
+         kk_hb_capture_frame_boundary(dev);
       }
    }
 
