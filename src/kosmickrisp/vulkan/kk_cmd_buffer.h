@@ -277,9 +277,11 @@ enum kk_hb_split_reason {
    KK_HB_SPLIT_COMPUTE,      /* compute work (driver or app) broke the pass */
    KK_HB_SPLIT_STATE,        /* sample locations / attachment map changed */
    KK_HB_SPLIT_OTHER,
+   KK_HB_SPLIT_SKIPPED_EMPTY, /* not started: empty rendering that changes nothing */
    KK_HB_SPLIT_COUNT,
 };
 void kk_hb_split_note(enum kk_hb_split_reason reason);
+bool kk_hb_keep_empty_passes(void);
 
 struct kk_cmd_buffer {
    struct vk_command_buffer vk;

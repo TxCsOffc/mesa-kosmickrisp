@@ -643,9 +643,29 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    };
 
    /* A rendering whose render encoder never started still loads or clears,
-    * stores and resolves its attachments */
-   if (render->first_start)
-      cs_get_render(cmd);
+    * stores and resolves its attachments -- unless that changes nothing.
+    * Highball: an empty rendering with no clear and no resolve (vkd3d-proton's
+    * suspend/resume fixups emit them) is a load-store round trip of every tile
+    * for nothing; skip it. HB_KK_KEEP_EMPTY_PASSES=1 keeps the old behaviour. */
+   if (render->first_start) {
+      bool noop = !need_meta_resolve && !kk_hb_keep_empty_passes();
+      for (uint32_t i = 0; noop && i < render->color_att_count; i++) {
+         if (render->color_att[i].iview &&
+             (render->color_att[i].load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ||
+              render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE))
+            noop = false;
+      }
+      const struct kk_attachment *ds[2] = {&render->depth_att, &render->stencil_att};
+      for (uint32_t i = 0; noop && i < 2; i++) {
+         if (ds[i]->iview && (ds[i]->load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ||
+                              ds[i]->resolve_mode != VK_RESOLVE_MODE_NONE))
+            noop = false;
+      }
+      if (noop)
+         kk_hb_split_note(KK_HB_SPLIT_SKIPPED_EMPTY);
+      else
+         cs_get_render(cmd);
+   }
    kk_apply_attachment_store_ops(cmd, false);
 
    /* Clean up previous encoder */

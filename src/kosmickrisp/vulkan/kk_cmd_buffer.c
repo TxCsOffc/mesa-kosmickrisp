@@ -401,8 +401,14 @@ kk_cmd_new_pre_gfx_cmd_buf(struct kk_cmd_buffer *cmd)
 }
 
 static const char *const kk_hb_split_names[KK_HB_SPLIT_COUNT] = {
-   "begin", "resume", "barrier", "compute", "state", "other",
+   "begin", "resume", "barrier", "compute", "state", "other", "skipped_empty",
 };
+DEBUG_GET_ONCE_BOOL_OPTION(hb_keep_empty_passes, "HB_KK_KEEP_EMPTY_PASSES", false)
+bool
+kk_hb_keep_empty_passes(void)
+{
+   return debug_get_option_hb_keep_empty_passes();
+}
 static uint64_t kk_hb_split_counts[KK_HB_SPLIT_COUNT];
 DEBUG_GET_ONCE_BOOL_OPTION(hb_splitstats, "HB_KK_SPLITSTATS", false)
 
