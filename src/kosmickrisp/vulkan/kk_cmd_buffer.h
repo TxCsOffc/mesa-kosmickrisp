@@ -301,6 +301,10 @@ enum kk_hb_split_reason {
    KK_HB_SPLIT_COUNT,
 };
 void kk_hb_split_note(enum kk_hb_split_reason reason);
+/* Highball (HB_KK_SPLITSTATS): vkCmdPipelineBarrier2 stage masks and whether a
+ * new Metal encoder follows a Vulkan barrier since the previous one */
+void kk_hb_barrier_note(VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst);
+void kk_hb_encoder_note(bool after_barrier, bool render);
 bool kk_hb_keep_empty_passes(void);
 bool kk_hb_resume_merge(void);
 bool kk_hb_begin_merge(void);
@@ -310,6 +314,7 @@ void kk_hb_unpark(struct kk_cmd_buffer *cmd, enum kk_hb_split_reason why);
 struct kk_cmd_buffer {
    struct vk_command_buffer vk;
    enum kk_hb_split_reason hb_restart_reason;
+   bool hb_barrier_since_encoder;
 
    struct {
       mtl_command_allocator *allocator;

@@ -6,6 +6,7 @@
  */
 
 #include "kk_cmd_buffer.h"
+#include "util/simple_mtx.h"
 
 #include "kk_buffer.h"
 #include "kk_cmd_pool.h"
@@ -446,7 +447,41 @@ kk_hb_unpark(struct kk_cmd_buffer *cmd, enum kk_hb_split_reason why)
 }
 
 static uint64_t kk_hb_split_counts[KK_HB_SPLIT_COUNT];
+
 DEBUG_GET_ONCE_BOOL_OPTION(hb_splitstats, "HB_KK_SPLITSTATS", false)
+
+#define KK_HB_BARRIER_SLOTS 12
+static struct { uint64_t src, dst, n; } kk_hb_barriers[KK_HB_BARRIER_SLOTS];
+static uint64_t kk_hb_barriers_other, kk_hb_enc[4];
+static simple_mtx_t kk_hb_barrier_lock = SIMPLE_MTX_INITIALIZER;
+
+void
+kk_hb_barrier_note(VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst)
+{
+   if (!debug_get_option_hb_splitstats())
+      return;
+   simple_mtx_lock(&kk_hb_barrier_lock);
+   unsigned i = 0;
+   while (i < KK_HB_BARRIER_SLOTS && kk_hb_barriers[i].n &&
+          (kk_hb_barriers[i].src != src || kk_hb_barriers[i].dst != dst))
+      i++;
+   if (i == KK_HB_BARRIER_SLOTS) {
+      kk_hb_barriers_other++;
+   } else {
+      kk_hb_barriers[i].src = src;
+      kk_hb_barriers[i].dst = dst;
+      kk_hb_barriers[i].n++;
+   }
+   simple_mtx_unlock(&kk_hb_barrier_lock);
+}
+
+void
+kk_hb_encoder_note(bool after_barrier, bool render)
+{
+   if (debug_get_option_hb_splitstats())
+      __atomic_add_fetch(&kk_hb_enc[(render ? 2 : 0) + after_barrier], 1, __ATOMIC_RELAXED);
+}
+
 
 void
 kk_hb_split_note(enum kk_hb_split_reason reason)
@@ -463,6 +498,15 @@ kk_hb_split_note(enum kk_hb_split_reason reason)
          len += snprintf(line + len, sizeof(line) - len, " %s=%llu", kk_hb_split_names[i],
                          (unsigned long long)__atomic_load_n(&kk_hb_split_counts[i], __ATOMIC_RELAXED));
       fprintf(stderr, "%s\n", line);
+      simple_mtx_lock(&kk_hb_barrier_lock);
+      fprintf(stderr, "kk barrierstats: encoders compute free=%llu after_barrier=%llu render free=%llu after_barrier=%llu; barriers src>dst:",
+              (unsigned long long)kk_hb_enc[0], (unsigned long long)kk_hb_enc[1],
+              (unsigned long long)kk_hb_enc[2], (unsigned long long)kk_hb_enc[3]);
+      for (unsigned i = 0; i < KK_HB_BARRIER_SLOTS && kk_hb_barriers[i].n; i++)
+         fprintf(stderr, " %llx>%llx=%llu", (unsigned long long)kk_hb_barriers[i].src,
+                 (unsigned long long)kk_hb_barriers[i].dst, (unsigned long long)kk_hb_barriers[i].n);
+      fprintf(stderr, " other=%llu\n", (unsigned long long)kk_hb_barriers_other);
+      simple_mtx_unlock(&kk_hb_barrier_lock);
    }
 }
 
@@ -489,6 +533,8 @@ cs_start_render(struct kk_cmd_buffer *cmd)
 
    cmd->metal.render = mtl_new_render_command_encoder_with_descriptor(
       cmd->metal.cmd_buf, state->render_pass_descriptor);
+   kk_hb_encoder_note(cmd->hb_barrier_since_encoder, true);
+   cmd->hb_barrier_since_encoder = false;
 
    kk_encoder_update_debug(cmd, cmd->metal.render);
    kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.render);
@@ -568,6 +614,8 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
 
    if (cmd->metal.compute == NULL) {
       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
+      kk_hb_encoder_note(cmd->hb_barrier_since_encoder, false);
+      cmd->hb_barrier_since_encoder = false;
       cmd->metal.cmd_buf_used = true;
       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
       kk_encoder_update_debug(cmd, cmd->metal.compute);
@@ -643,7 +691,10 @@ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
 {
    /* TODO_KOSMICKRISP This is probably overkill */
    const bool is_render = encoder == cmd->metal.render;
-   if ((is_render && cmd->state.gfx.occlusion.used) ||
+   /* Highball experiment (measurement only, unsafe): no barrier at the end */
+   if (getenv("HB_KK_EXP_NO_ENCODER_BARRIER") && !(is_render && cmd->state.gfx.occlusion.used))
+      ;
+   else if ((is_render && cmd->state.gfx.occlusion.used) ||
        debug_get_option_hb_alias_barriers())
       mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
    else
@@ -780,6 +831,24 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                        const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   {
+      VkPipelineStageFlags2 hb_src = 0, hb_dst = 0;
+      for (uint32_t i = 0; i < pDependencyInfo->memoryBarrierCount; i++) {
+         hb_src |= pDependencyInfo->pMemoryBarriers[i].srcStageMask;
+         hb_dst |= pDependencyInfo->pMemoryBarriers[i].dstStageMask;
+      }
+      for (uint32_t i = 0; i < pDependencyInfo->bufferMemoryBarrierCount; i++) {
+         hb_src |= pDependencyInfo->pBufferMemoryBarriers[i].srcStageMask;
+         hb_dst |= pDependencyInfo->pBufferMemoryBarriers[i].dstStageMask;
+      }
+      for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++) {
+         hb_src |= pDependencyInfo->pImageMemoryBarriers[i].srcStageMask;
+         hb_dst |= pDependencyInfo->pImageMemoryBarriers[i].dstStageMask;
+      }
+      kk_hb_barrier_note(hb_src, hb_dst);
+      cmd->hb_barrier_since_encoder = true;
+   }
 
    /* Highball: a barrier after a rendering whose render encoder is parked
     * (kk_CmdEndRendering2KHR). Every encoder ends with a full barrier, so work
