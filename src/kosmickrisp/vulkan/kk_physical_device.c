@@ -1049,9 +1049,10 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, &force_robustness,
                        sizeof(force_robustness));
    /* Highball: the robustness switches change SPIR-V translation as well. */
-   const uint8_t hb_robust[2] = {
+   const uint8_t hb_robust[3] = {
       debug_get_bool_option("HB_KK_NO_UBO_ROBUST", false),
       debug_get_bool_option("HB_KK_NO_SSBO_ROBUST", false),
+      debug_get_bool_option("HB_KK_NO_VERTEX_ROBUST", false),
    };
    _mesa_blake3_update(&blake3_ctx, hb_robust, sizeof(hb_robust));
 

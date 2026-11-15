@@ -172,6 +172,9 @@ DEBUG_GET_ONCE_BOOL_OPTION(hb_no_ubo_robust, "HB_KK_NO_UBO_ROBUST", false)
 /* Highball experiment: HB_KK_NO_SSBO_ROBUST=1 drops bounds checks on storage buffer access too. An out of bounds
  * read returns whatever memory follows instead of zero, an out of bounds write lands there. */
 DEBUG_GET_ONCE_BOOL_OPTION(hb_no_ssbo_robust, "HB_KK_NO_SSBO_ROBUST", false)
+/* HB_KK_NO_VERTEX_ROBUST=1 drops the bounds check on vertex attribute fetch: an attribute past its binding's range
+ * reads the memory after it instead of zero. */
+DEBUG_GET_ONCE_BOOL_OPTION(hb_no_vertex_robust, "HB_KK_NO_VERTEX_ROBUST", false)
 
 static struct vk_pipeline_robustness_state
 kk_hb_robustness(const struct vk_pipeline_robustness_state *rs)
@@ -181,6 +184,8 @@ kk_hb_robustness(const struct vk_pipeline_robustness_state *rs)
       out.uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
    if (debug_get_option_hb_no_ssbo_robust())
       out.storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
+   if (debug_get_option_hb_no_vertex_robust())
+      out.vertex_inputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
    return out;
 }
 
@@ -408,9 +413,10 @@ kk_hash_graphics_state(struct vk_physical_device *device,
    _mesa_blake3_update(&blake3_ctx, &force_robustness,
                        sizeof(force_robustness));
    /* Highball: the robustness switches change SPIR-V translation as well. */
-   const uint8_t hb_robust[2] = {
+   const uint8_t hb_robust[3] = {
       debug_get_bool_option("HB_KK_NO_UBO_ROBUST", false),
       debug_get_bool_option("HB_KK_NO_SSBO_ROBUST", false),
+      debug_get_bool_option("HB_KK_NO_VERTEX_ROBUST", false),
    };
    _mesa_blake3_update(&blake3_ctx, hb_robust, sizeof(hb_robust));
 
@@ -578,8 +584,9 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
       attributes[slot].instanced =
          binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
    }
+   const struct vk_pipeline_robustness_state hb_rs = kk_hb_robustness(rs);
    bool robustness2 =
-      rs->vertex_inputs ==
+      hb_rs.vertex_inputs ==
       VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2;
    NIR_PASS(_, nir, kk_nir_lower_vbo, attributes, robustness2);
 }
