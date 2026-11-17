@@ -28,6 +28,8 @@
 #include "vk_common_entrypoints.h"
 #include "vk_format.h"
 #include "vk_pipeline_layout.h"
+#include "kosmickrisp/bridge/mtl_metalfx.h"
+#include "mvk_metalfx.h"
 
 static void
 kk_descriptor_state_fini(struct kk_cmd_buffer *cmd,
@@ -309,7 +311,9 @@ static void
 kk_encoder_wait_for_sparse_binds(struct kk_cmd_buffer *cmd,
                                  mtl_command_encoder *encoder)
 {
-   if (kk_cmd_buffer_device(cmd)->vk.enabled_features.sparseBinding)
+   if (cmd->hb_metalfx_wait)
+      mtl_barrier_after_queue_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+   else if (kk_cmd_buffer_device(cmd)->vk.enabled_features.sparseBinding)
       mtl_barrier_after_queue_stages(encoder, MTL_STAGE_RESOURCE_STATE,
                                      MTL_STAGE_ALL);
 }
@@ -538,6 +542,7 @@ cs_start_render(struct kk_cmd_buffer *cmd)
 
    kk_encoder_update_debug(cmd, cmd->metal.render);
    kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.render);
+   cmd->hb_metalfx_wait = false;
    kk_cb_record_count(&cmd->record.render_passes);
    if (state->render.first_start)
       kk_hb_split_note((state->render.flags & VK_RENDERING_RESUMING_BIT) ? KK_HB_SPLIT_RESUME : KK_HB_SPLIT_BEGIN);
@@ -620,6 +625,7 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
       kk_encoder_update_debug(cmd, cmd->metal.compute);
       kk_encoder_wait_for_sparse_binds(cmd, cmd->metal.compute);
+      cmd->hb_metalfx_wait = false;
       kk_cb_record_count(&cmd->record.compute_encoders);
    }
 
@@ -826,11 +832,82 @@ kk_barrier_requires_encoder_split(struct kk_cmd_buffer *cmd,
           (dst & VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
 }
 
+static void
+kk_hb_metalfx_scale(struct kk_cmd_buffer *cmd, const VkMetalFXScaleInfoMVK *info)
+{
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+
+   if (info->releaseScalerIdCount && info->pReleaseScalerIds)
+      mtl_metalfx_release(dev->hb_metalfx, info->pReleaseScalerIds,
+                          info->releaseScalerIdCount);
+   if (info->scalerType != VK_METALFX_SCALER_TYPE_TEMPORAL_MVK &&
+       info->scalerType != VK_METALFX_SCALER_TYPE_DENOISED_MVK)
+      return;
+
+   struct mtl_metalfx_scale s = {
+      .scaler_id = info->scalerId,
+      .type = info->scalerType,
+      .auto_exposure = info->flags & VK_METALFX_SCALE_AUTO_EXPOSURE_BIT_MVK,
+      .reset = info->flags & VK_METALFX_SCALE_RESET_BIT_MVK,
+      .depth_reversed = info->flags & VK_METALFX_SCALE_DEPTH_REVERSED_BIT_MVK,
+      .jittered_motion = info->flags & VK_METALFX_SCALE_JITTERED_MOTION_BIT_MVK,
+      .motion_display_res = info->flags & VK_METALFX_SCALE_MOTION_DISPLAY_RES_BIT_MVK,
+      .input_content_width = info->inputContentWidth,
+      .input_content_height = info->inputContentHeight,
+      .motion_scale_x = info->motionVectorScaleX,
+      .motion_scale_y = info->motionVectorScaleY,
+      .jitter_x = info->jitterOffsetX,
+      .jitter_y = info->jitterOffsetY,
+      .pre_exposure = info->preExposure,
+   };
+   memcpy(s.world_to_view, info->worldToViewMatrix, sizeof(s.world_to_view));
+   memcpy(s.view_to_clip, info->viewToClipMatrix, sizeof(s.view_to_clip));
+   for (const VkBaseInStructure *n = info->pNext; n; n = n->pNext) {
+      if (n->sType == VK_STRUCTURE_TYPE_METALFX_CONTENT_OFFSETS_MVK) {
+         const VkMetalFXContentOffsetsMVK *o = (const void *)n;
+         s.has_offsets = true;
+         memcpy(s.offset_x, o->offsetX, sizeof(s.offset_x));
+         memcpy(s.offset_y, o->offsetY, sizeof(s.offset_y));
+      }
+   }
+   for (uint32_t i = 0; i < VK_METALFX_IMAGE_COUNT_MVK; i++) {
+      VK_FROM_HANDLE(kk_image, image, info->images[i]);
+      if (!image)
+         continue;
+      s.textures[i] = image->planes[0].mtl_handle;
+      if (info->formats[i] != VK_FORMAT_UNDEFINED)
+         s.formats[i] = vk_format_to_mtl_pixel_format(info->formats[i]);
+   }
+
+   kk_hb_unpark(cmd, KK_HB_UNPARK_BARRIER);
+   if (cmd->metal.render) {
+      kk_apply_attachment_store_ops(cmd, true);
+      cs_end(cmd);
+      kk_cmd_buffer_dirty_all_gfx(cmd);
+      cmd->state.gfx.need_to_start_render_pass = true;
+      cmd->hb_restart_reason = KK_HB_SPLIT_BARRIER;
+   }
+   cs_end(cmd);
+
+   if (mtl_metalfx_encode(dev->hb_metalfx, dev->mtl_handle, dev->mtl_compiler_handle,
+                          cmd->metal.cmd_buf, &s)) {
+      cmd->metal.cmd_buf_used = true;
+      cmd->hb_metalfx_wait = true;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                        const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   for (const VkBaseInStructure *n = pDependencyInfo->pNext; n; n = n->pNext) {
+      if (n->sType == VK_STRUCTURE_TYPE_METALFX_SCALE_INFO_MVK) {
+         kk_hb_metalfx_scale(cmd, (const VkMetalFXScaleInfoMVK *)n);
+         return;
+      }
+   }
 
    {
       VkPipelineStageFlags2 hb_src = 0, hb_dst = 0;

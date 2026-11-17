@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "kosmickrisp/bridge/mtl_metalfx.h"
 #include "kk_device.h"
 
 #include "kk_buffer.h"
@@ -407,6 +408,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
       result = VK_ERROR_INITIALIZATION_FAILED;
       goto fail_init;
    }
+   dev->hb_metalfx = mtl_metalfx_context_create();
 
    /* We need to initialize the device residency set before any bo is created. */
    simple_mtx_init(&dev->residency_set.mutex, mtx_plain);
@@ -514,6 +516,9 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (pdev->settings.gpu_capture_enabled) {
       mtl_stop_gpu_capture();
    }
+
+   mtl_metalfx_context_destroy(dev->hb_metalfx);
+   dev->hb_metalfx = NULL;
 
    /* Meta first since it may destroy Vulkan objects */
    kk_device_finish_meta(dev);

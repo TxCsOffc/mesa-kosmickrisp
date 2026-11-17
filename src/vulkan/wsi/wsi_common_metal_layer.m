@@ -188,7 +188,28 @@ wsi_metal_layer_configure(const CAMetalLayer *metal_layer,
       metal_layer.pixelFormat = metal_format;
 
       metal_layer.colorspace = cg_color_space;
-      metal_layer.wantsExtendedDynamicRangeContent = wants_edr && vk_format_is_float(format);
+      metal_layer.wantsExtendedDynamicRangeContent =
+         wants_edr && (vk_format_is_float(format) ||
+                       color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT ||
+                       color_space == VK_COLOR_SPACE_HDR10_HLG_EXT);
+      if (color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT ||
+          color_space == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
+         if (metal_layer.EDRMetadata == nil) {
+            const char *hb_nits = getenv("HB_HDR_MAX_NITS");
+            float max_nits = hb_nits ? strtof(hb_nits, NULL) : 1000.0f;
+            if (!(max_nits > 0.0f))
+               max_nits = 1000.0f;
+            float scale = color_space == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT ? 80.0f : 100.0f;
+            metal_layer.EDRMetadata =
+               [CAEDRMetadata HDR10MetadataWithMinLuminance:0.0005f
+                                               maxLuminance:max_nits
+                                         opticalOutputScale:scale];
+         }
+      } else if (color_space == VK_COLOR_SPACE_HDR10_HLG_EXT) {
+         metal_layer.EDRMetadata = [CAEDRMetadata HLGMetadata];
+      } else {
+         metal_layer.EDRMetadata = nil;
+      }
       /* Needs release: https://github.com/KhronosGroup/MoltenVK/issues/940 */
       CGColorSpaceRelease(cg_color_space);
    }
@@ -276,7 +297,7 @@ wsi_metal_layer_set_hdr_metadata(const CAMetalLayer *metal_layer,
                                             freeWhenDone:false];
       CAEDRMetadata* edr_metadata = [CAEDRMetadata HDR10MetadataWithDisplayInfo:display_info
                                                                     contentInfo:content_info
-                                                             opticalOutputScale:1];
+                                                             opticalOutputScale:100];
       metal_layer.EDRMetadata = edr_metadata;
    }
 }

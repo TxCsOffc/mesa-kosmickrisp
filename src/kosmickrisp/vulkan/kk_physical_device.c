@@ -1012,7 +1012,7 @@ kk_get_device_properties(
 
    snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "KosmicKrisp");
    snprintf(properties->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
-            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
+            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1 " metalfx metalfx-denoised");
 }
 
 static uint64_t
@@ -1124,13 +1124,8 @@ static uint64_t
 kk_get_sysmem_heap_budget(struct kk_physical_device *pdev)
 {
    uint64_t heap_size = kk_get_sysmem_heap_size(pdev);
-   uint64_t used = kk_get_sysmem_heap_used(pdev);
 
-   /* Budget is calculated using the default Mesa logic, based on available
-    * system memory. Available memory is reduced to 90% to avoid thrashing. */
-   const float available_percent = 0.9f;
-   return vk_physical_device_heap_budget_from_system(
-      &pdev->vk, available_percent, heap_size, used);
+   return heap_size / 10 * 9;
 }
 
 static void

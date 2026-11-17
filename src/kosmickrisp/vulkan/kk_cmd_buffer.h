@@ -315,6 +315,7 @@ struct kk_cmd_buffer {
    struct vk_command_buffer vk;
    enum kk_hb_split_reason hb_restart_reason;
    bool hb_barrier_since_encoder;
+   bool hb_metalfx_wait;
 
    struct {
       mtl_command_allocator *allocator;

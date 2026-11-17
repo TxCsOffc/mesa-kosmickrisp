@@ -100,6 +100,7 @@ struct kk_device {
 
    mtl_device *mtl_handle;
    mtl_compiler *mtl_compiler_handle;
+   void *hb_metalfx;
 
    /* Compiled Metal objects shared between a device's pipelines (kk_shader.c):
     * MSL libraries by the blake3 digest of their source, and Metal pipeline

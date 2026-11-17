@@ -19,6 +19,7 @@ if host_machine.system() == 'darwin'
     'mtl_device.m',
     'mtl_encoder.m',
     'mtl_heap.m',
+    'mtl_metalfx.m',
     'mtl_render_state.m',
     'mtl_residency_set.m',
     'mtl_sampler.m',
@@ -37,6 +38,7 @@ else
     'stubs/mtl_device.c',
     'stubs/mtl_encoder.c',
     'stubs/mtl_heap.c',
+    'stubs/mtl_metalfx.c',
     'stubs/mtl_render_state.c',
     'stubs/mtl_residency_set.c',
     'stubs/mtl_sampler.c',
@@ -54,7 +56,7 @@ mtl_bridge_dependencies = [
 if host_machine.system() == 'darwin'
   mtl_bridge_dependencies += dependency(
     'appleframeworks',
-    modules : ['Foundation']
+    modules : ['Foundation', 'MetalFX']
   )
 endif
 
