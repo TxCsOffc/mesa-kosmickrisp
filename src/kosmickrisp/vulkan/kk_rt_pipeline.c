@@ -667,6 +667,74 @@ kk_rt_inline_raygen(nir_builder *b, const struct kk_rt_kernel_vars *v,
    nir_index_ssa_defs(b->impl);
 }
 
+static void
+kk_rt_inline_callee(nir_builder *b, const struct kk_rt_stage *stage,
+                    enum kk_rt_role role, void *tmp_ctx)
+{
+   nir_shader *clone = nir_shader_clone(tmp_ctx, stage->nir);
+   struct kk_rt_role_ctx ctx = {.role = role};
+   nir_shader_intrinsics_pass(clone, kk_rt_lower_role_instr, nir_metadata_none,
+                              &ctx);
+   struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+   nir_inline_function_impl(b, nir_shader_get_entrypoint(clone), NULL, remap);
+   _mesa_hash_table_destroy(remap, NULL);
+   nir_index_ssa_defs(b->impl);
+}
+
+static void
+kk_rt_inline_misses(nir_builder *b, const struct kk_rt_pipeline *p,
+                    nir_def *handle, void *tmp_ctx)
+{
+   bool *done = calloc(MAX2(p->group_count, 1), sizeof(bool));
+   if (!done)
+      return;
+   for (uint32_t i = 0; i < p->group_count; i++) {
+      const struct kk_rt_group *g = &p->groups[i];
+      if (done[i] || g->type != VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR ||
+          g->general >= p->stage_count ||
+          p->stages[g->general].nir->info.stage != MESA_SHADER_MISS)
+         continue;
+      const struct kk_rt_stage *stage = &p->stages[g->general];
+      nir_def *cond = nir_ieq_imm(b, handle, g->handle);
+      for (uint32_t j = i + 1; j < p->group_count; j++) {
+         const struct kk_rt_group *h = &p->groups[j];
+         if (done[j] || h->type != VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR ||
+             h->general >= p->stage_count ||
+             memcmp(p->stages[h->general].hash, stage->hash, 32))
+            continue;
+         done[j] = true;
+         cond = nir_ior(b, cond, nir_ieq_imm(b, handle, h->handle));
+      }
+      nir_push_if(b, cond);
+      kk_rt_inline_callee(b, stage, KK_RT_ROLE_MISS, tmp_ctx);
+      nir_pop_if(b, NULL);
+   }
+   free(done);
+}
+
+static uint32_t
+kk_rt_unique_misses(const struct kk_rt_pipeline *p)
+{
+   uint32_t n = 0;
+   for (uint32_t i = 0; i < p->group_count; i++) {
+      const struct kk_rt_group *g = &p->groups[i];
+      if (g->type != VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR ||
+          g->general >= p->stage_count ||
+          p->stages[g->general].nir->info.stage != MESA_SHADER_MISS)
+         continue;
+      bool seen = false;
+      for (uint32_t j = 0; j < i && !seen; j++) {
+         const struct kk_rt_group *h = &p->groups[j];
+         seen = h->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR &&
+                h->general < p->stage_count &&
+                p->stages[h->general].nir->info.stage == MESA_SHADER_MISS &&
+                !memcmp(p->stages[h->general].hash, p->stages[g->general].hash, 32);
+      }
+      n += !seen;
+   }
+   return n;
+}
+
 static nir_def *
 kk_rt_rq_load(nir_builder *b, nir_variable *rq, nir_ray_query_value value,
               bool committed, unsigned comps, unsigned bit_size,
@@ -761,8 +829,11 @@ kk_rt_call(nir_builder *b, nir_def *fn)
    nir_pop_if(b, NULL);
 }
 
+static bool kk_rt_build_nocalls;
+
 static void
 kk_rt_lower_trace(nir_builder *b, const struct kk_rt_kernel_vars *v,
+                  const struct kk_rt_pipeline *p, void *tmp_ctx,
                   uint32_t ahit_needs, uint32_t chit_needs,
                   nir_intrinsic_instr *intr)
 {
@@ -827,6 +898,8 @@ kk_rt_lower_trace(nir_builder *b, const struct kk_rt_kernel_vars *v,
          nir_def *fn = nir_load_global(b, 1, 32, nir_iadd_imm(b, rec, 8),
                                        .align_mul = 4);
          fn = nir_bcsel(b, nir_test_mask(b, debug_flags, 2), nir_imm_int(b, 0), fn);
+         if (kk_rt_build_nocalls)
+            fn = nir_imm_int(b, 0);
 
          nir_variable *accept =
             nir_local_variable_create(b->impl, glsl_bool_type(), "accept");
@@ -886,6 +959,8 @@ kk_rt_lower_trace(nir_builder *b, const struct kk_rt_kernel_vars *v,
          nir_def *fn = nir_load_global(b, 1, 32, nir_iadd_imm(b, rec, 4),
                                        .align_mul = 4);
          fn = nir_bcsel(b, nir_test_mask(b, debug_flags, 4), nir_imm_int(b, 0), fn);
+         if (kk_rt_build_nocalls)
+            fn = nir_imm_int(b, 0);
          nir_push_if(b, nir_ine_imm(b, fn, 0));
          {
             kk_rt_write_hit(b, v->rq, true, chit_needs);
@@ -902,7 +977,11 @@ kk_rt_lower_trace(nir_builder *b, const struct kk_rt_kernel_vars *v,
          b, miss_addr, nir_u2u64(b, nir_imul(b, miss_index, miss_stride)));
       kk_rt_state_store(b, KK_RT_S_TMAX, tmax);
       nir_def *fn = kk_rt_set_record(b, rec, 3);
-      kk_rt_call(b, fn);
+      if (kk_rt_unique_misses(p) <= 4)
+         kk_rt_inline_misses(
+            b, p, nir_load_global(b, 1, 32, rec, .align_mul = 4), tmp_ctx);
+      else
+         kk_rt_call(b, fn);
    }
    nir_pop_if(b, NULL);
 
@@ -985,7 +1064,7 @@ kk_rt_build_shader(struct kk_device *dev, struct kk_rt_pipeline *p,
       }
    }
    util_dynarray_foreach(&traces, nir_intrinsic_instr *, it)
-      kk_rt_lower_trace(&b, &v, ahit_needs, chit_needs, *it);
+      kk_rt_lower_trace(&b, &v, p, tmp_ctx, ahit_needs, chit_needs, *it);
    util_dynarray_fini(&traces);
 
    nir_progress(true, impl, nir_metadata_none);
@@ -1105,6 +1184,7 @@ kk_rt_compile(struct kk_device *dev, struct kk_rt_pipeline *p,
       ahit_needs |= p->groups[i].needs[1];
    }
 
+   kk_rt_build_nocalls = (kk_hb_rt_live_flags() & 32u) != 0;
    struct kk_rt_link *link = kk_rt_make_link(dev, p);
    if (!link)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1139,9 +1219,10 @@ kk_rt_compile(struct kk_device *dev, struct kk_rt_pipeline *p,
    kk_rt_set_pending_link(NULL);
    fprintf(stderr,
            "kk rt: pipeline stages=%u groups=%u functions=%u table=%u "
-           "needs ahit=%x chit=%x result=%d\n",
+           "needs ahit=%x chit=%x%s result=%d\n",
            p->stage_count, p->group_count, link->count, link->table_size,
-           ahit_needs, chit_needs, result);
+           ahit_needs, chit_needs, kk_rt_build_nocalls ? " nocalls" : "",
+           result);
    kk_rt_link_unref(link);
    return result;
 }
