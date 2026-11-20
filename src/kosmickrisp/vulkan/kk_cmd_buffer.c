@@ -428,14 +428,18 @@ enum kk_hb_live_switch {
    KK_HB_LIVE_KEEP_EMPTY,
    KK_HB_LIVE_NO_RESUME_MERGE,
    KK_HB_LIVE_NO_BEGIN_MERGE,
+   KK_HB_LIVE_RT_SKIP,
+   KK_HB_LIVE_RT_NOAHIT,
+   KK_HB_LIVE_RT_NOCHIT,
    KK_HB_LIVE_COUNT,
 };
 
 static const char *const kk_hb_live_names[KK_HB_LIVE_COUNT] = {
    "keep_empty", "no_resume_merge", "no_begin_merge",
+   "rt_skip", "rt_noahit", "rt_nochit",
 };
 
-static int kk_hb_live_values[KK_HB_LIVE_COUNT] = {-1, -1, -1};
+static int kk_hb_live_values[KK_HB_LIVE_COUNT] = {-1, -1, -1, -1, -1, -1};
 static int kk_hb_live_forced;
 uint64_t kk_hb_ab_encoders[2];
 
@@ -475,7 +479,7 @@ kk_hb_live_refresh(void)
    if (stat(path, &st) == 0)
       mtime = (int64_t)st.st_mtimespec.tv_sec * 1000000000ll + st.st_mtimespec.tv_nsec;
    if (mtime != kk_hb_live_mtime) {
-      int values[KK_HB_LIVE_COUNT] = {-1, -1, -1};
+      int values[KK_HB_LIVE_COUNT] = {-1, -1, -1, -1, -1, -1};
       FILE *f = mtime >= 0 ? fopen(path, "r") : NULL;
       if (f) {
          char word[64];
@@ -494,8 +498,9 @@ kk_hb_live_refresh(void)
       for (unsigned i = 0; i < KK_HB_LIVE_COUNT; i++)
          p_atomic_set(&kk_hb_live_values[i], values[i]);
       kk_hb_live_mtime = mtime;
-      mesa_logi("kk: live switches keep_empty=%d no_resume_merge=%d no_begin_merge=%d",
-                values[0], values[1], values[2]);
+      mesa_logi("kk: live switches keep_empty=%d no_resume_merge=%d no_begin_merge=%d "
+                "rt_skip=%d rt_noahit=%d rt_nochit=%d",
+                values[0], values[1], values[2], values[3], values[4], values[5]);
    }
    p_atomic_set(&kk_hb_live_busy, 0);
 }
@@ -506,6 +511,14 @@ kk_hb_live(enum kk_hb_live_switch which, bool fallback)
    kk_hb_live_refresh();
    int v = p_atomic_read(&kk_hb_live_values[which]);
    return v < 0 ? fallback : v;
+}
+
+uint32_t
+kk_hb_rt_live_flags(void)
+{
+   return (kk_hb_live(KK_HB_LIVE_RT_SKIP, false) ? 1u : 0u) |
+          (kk_hb_live(KK_HB_LIVE_RT_NOAHIT, false) ? 2u : 0u) |
+          (kk_hb_live(KK_HB_LIVE_RT_NOCHIT, false) ? 4u : 0u);
 }
 
 bool

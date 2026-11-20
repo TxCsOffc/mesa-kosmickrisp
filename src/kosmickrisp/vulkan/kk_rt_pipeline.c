@@ -78,7 +78,7 @@ struct kk_rt_dispatch {
    uint32_t miss_stride;
    uint32_t hit_stride;
    uint32_t callable_stride;
-   uint32_t pad;
+   uint32_t debug_flags;
    uint32_t launch_size[3];
    uint32_t pad2;
 };
@@ -795,6 +795,8 @@ kk_rt_lower_trace(nir_builder *b, const struct kk_rt_kernel_vars *v,
       kk_rt_load_dispatch(b, offsetof(struct kk_rt_dispatch, miss_addr), 1, 64);
    nir_def *miss_stride = kk_rt_load_dispatch(
       b, offsetof(struct kk_rt_dispatch, miss_stride), 1, 32);
+   nir_def *debug_flags = kk_rt_load_dispatch(
+      b, offsetof(struct kk_rt_dispatch, debug_flags), 1, 32);
 
    nir_rq_initialize(b, &nir_build_deref_var(b, v->rq)->def, as, flags, cull,
                      origin, tmin, dir, tmax);
@@ -820,6 +822,7 @@ kk_rt_lower_trace(nir_builder *b, const struct kk_rt_kernel_vars *v,
             b, hit_addr, nir_u2u64(b, nir_imul(b, index, hit_stride)));
          nir_def *fn = nir_load_global(b, 1, 32, nir_iadd_imm(b, rec, 8),
                                        .align_mul = 4);
+         fn = nir_bcsel(b, nir_test_mask(b, debug_flags, 2), nir_imm_int(b, 0), fn);
 
          nir_variable *accept =
             nir_local_variable_create(b->impl, glsl_bool_type(), "accept");
@@ -878,6 +881,7 @@ kk_rt_lower_trace(nir_builder *b, const struct kk_rt_kernel_vars *v,
             b, hit_addr, nir_u2u64(b, nir_imul(b, index, hit_stride)));
          nir_def *fn = nir_load_global(b, 1, 32, nir_iadd_imm(b, rec, 4),
                                        .align_mul = 4);
+         fn = nir_bcsel(b, nir_test_mask(b, debug_flags, 4), nir_imm_int(b, 0), fn);
          nir_push_if(b, nir_ine_imm(b, fn, 0));
          {
             kk_rt_write_hit(b, v->rq, true, chit_needs);
@@ -1336,6 +1340,9 @@ kk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    struct kk_rt_pipeline *p = cmd->state.rt.pipeline;
    if (!p || !p->cs || !width || !height || !depth)
       return;
+   uint32_t live = kk_hb_rt_live_flags();
+   if (live & 1u)
+      return;
 
    struct kk_rt_dispatch d = {
       .raygen_addr = pRaygenShaderBindingTable->deviceAddress,
@@ -1345,6 +1352,7 @@ kk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
       .miss_stride = (uint32_t)pMissShaderBindingTable->stride,
       .hit_stride = (uint32_t)pHitShaderBindingTable->stride,
       .callable_stride = (uint32_t)pCallableShaderBindingTable->stride,
+      .debug_flags = live,
       .launch_size = {width, height, depth},
    };
    struct kk_ptr params = kk_pool_upload(cmd, &d, sizeof(d), 8u);
