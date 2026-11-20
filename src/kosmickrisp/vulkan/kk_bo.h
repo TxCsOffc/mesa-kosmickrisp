@@ -26,6 +26,7 @@ struct kk_bo {
    /* map was imported from a host pointer; mtl_handle, if set, is a private
     * heap that only backs tiled images */
    bool host_import;
+   bool private_storage;
 };
 
 struct kk_ptr {
@@ -43,6 +44,10 @@ VkResult kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
 VkResult kk_alloc_sparse_bo(struct kk_device *dev,
                             struct vk_object_base *log_obj, uint64_t size_B,
                             struct kk_bo **bo_out);
+VkResult kk_alloc_private_bo(struct kk_device *dev,
+                             struct vk_object_base *log_obj, uint64_t size_B,
+                             uint64_t align_B, bool sparse,
+                             struct kk_bo **bo_out);
 
 void kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo);
 

@@ -48,11 +48,13 @@ struct kk_device_info {
    VkSampleCountFlags supported_sample_counts;
    /* MTLDevice.supportsPlacementSparse: Vulkan sparse binding/residency */
    bool placement_sparse;
+   bool raytracing;
 };
 
 struct kk_env_settings {
    bool experimental_enabled;
    bool gpu_capture_enabled;
+   bool raytracing_enabled;
    const char *gpu_capture_dir;
    uint64_t disabled_workarounds;
 };
@@ -95,6 +97,12 @@ static inline bool
 kk_physical_device_has_int64_minmax_atomics(const struct kk_physical_device *pdev)
 {
    return pdev->info.gpu_apple_family >= 8;
+}
+
+static inline bool
+kk_physical_device_has_raytracing(const struct kk_physical_device *pdev)
+{
+   return pdev->settings.raytracing_enabled && pdev->info.raytracing;
 }
 
 static inline uint32_t

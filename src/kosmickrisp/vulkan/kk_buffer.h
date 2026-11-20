@@ -20,9 +20,11 @@ struct kk_buffer {
 
    struct {
       mtl_buffer *handle;
+      mtl_heap *heap;
       /* Offset within handle's base address. Don't use this directly, route all
        * offset calculations through kk_buffer_mtl_offset */
       uint64_t offset;
+      uint64_t heap_offset;
    } metal;
 
    /* Sparse buffers: page mappings for texel buffer views (kk_sparse.c) */

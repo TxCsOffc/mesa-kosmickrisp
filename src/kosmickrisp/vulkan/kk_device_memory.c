@@ -142,16 +142,22 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
 
       mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
       mem->bo->cpu = mtl_get_contents(mem->bo->map);
-   } else if (BITFIELD_BIT(pAllocateInfo->memoryTypeIndex) &
-              kk_device_physical(dev)->sparse_mem_types) {
-      /* Sparse resources only accept these types (never imported from a host
-       * pointer, so always a heap): their heaps must take 64 KiB pages. */
-      result = kk_alloc_sparse_bo(dev, &dev->vk.base, aligned_size, &mem->bo);
-      if (result != VK_SUCCESS)
-         goto fail_alloc;
    } else {
-      result =
-         kk_alloc_bo(dev, &dev->vk.base, aligned_size, alignment, &mem->bo);
+      struct kk_physical_device *pdev = kk_device_physical(dev);
+      bool sparse = BITFIELD_BIT(pAllocateInfo->memoryTypeIndex) &
+                    pdev->sparse_mem_types;
+      bool private_storage =
+         kk_physical_device_has_raytracing(pdev) &&
+         !(pdev->mem_types[pAllocateInfo->memoryTypeIndex].propertyFlags &
+           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+      if (private_storage)
+         result = kk_alloc_private_bo(dev, &dev->vk.base, aligned_size,
+                                      alignment, sparse, &mem->bo);
+      else if (sparse)
+         result = kk_alloc_sparse_bo(dev, &dev->vk.base, aligned_size, &mem->bo);
+      else
+         result =
+            kk_alloc_bo(dev, &dev->vk.base, aligned_size, alignment, &mem->bo);
       if (result != VK_SUCCESS)
          goto fail_alloc;
    }

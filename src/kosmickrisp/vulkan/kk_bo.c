@@ -23,7 +23,7 @@
 static VkResult
 kk_alloc_bo_heap(struct kk_device *dev, struct vk_object_base *log_obj,
                  uint64_t size_B, uint64_t align_B, bool sparse,
-                 struct kk_bo **bo_out)
+                 bool private_storage, struct kk_bo **bo_out)
 {
    VkResult result = VK_SUCCESS;
 
@@ -42,8 +42,12 @@ kk_alloc_bo_heap(struct kk_device *dev, struct vk_object_base *log_obj,
 #endif
 
    size_B = align64(size_B, minimum_alignment);
-   mtl_heap *handle =
-      mtl_new_heap(dev->mtl_handle, size_B, KK_MTL_RESOURCE_OPTIONS, sparse);
+   enum mtl_resource_options opts =
+      private_storage
+         ? (MTL_RESOURCE_STORAGE_MODE_PRIVATE |
+            MTL_RESOURCE_TRACKING_MODE_UNTRACKED)
+         : KK_MTL_RESOURCE_OPTIONS;
+   mtl_heap *handle = mtl_new_heap(dev->mtl_handle, size_B, opts, sparse);
    if (handle == NULL) {
       result = vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%m");
       goto fail_heap;
@@ -66,7 +70,8 @@ kk_alloc_bo_heap(struct kk_device *dev, struct vk_object_base *log_obj,
    bo->size_B = size_B;
    bo->map = map;
    bo->gpu = mtl_buffer_get_gpu_address(map);
-   bo->cpu = mtl_get_contents(map);
+   bo->cpu = private_storage ? NULL : mtl_get_contents(map);
+   bo->private_storage = private_storage;
 
    kk_device_add_heap_to_residency_set(dev, handle);
 
@@ -85,7 +90,7 @@ VkResult
 kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
             uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out)
 {
-   return kk_alloc_bo_heap(dev, log_obj, size_B, align_B, false, bo_out);
+   return kk_alloc_bo_heap(dev, log_obj, size_B, align_B, false, false, bo_out);
 }
 
 VkResult
@@ -93,7 +98,17 @@ kk_alloc_sparse_bo(struct kk_device *dev, struct vk_object_base *log_obj,
                    uint64_t size_B, struct kk_bo **bo_out)
 {
    return kk_alloc_bo_heap(dev, log_obj, size_B, KK_SPARSE_PAGE_SIZE_B, true,
-                           bo_out);
+                           false, bo_out);
+}
+
+VkResult
+kk_alloc_private_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+                    uint64_t size_B, uint64_t align_B, bool sparse,
+                    struct kk_bo **bo_out)
+{
+   return kk_alloc_bo_heap(dev, log_obj, size_B,
+                           sparse ? KK_SPARSE_PAGE_SIZE_B : align_B, sparse,
+                           true, bo_out);
 }
 
 void
@@ -117,6 +132,8 @@ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
 VkResult
 kk_bo_map_placed(struct kk_device *dev, struct kk_bo *bo, void **addr)
 {
+   if (bo->cpu == NULL)
+      return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
 #if DETECT_OS_APPLE
    mach_vm_address_t src_addr = (mach_vm_address_t)bo->cpu;
    mach_vm_address_t dst_addr = (mach_vm_address_t)*addr;

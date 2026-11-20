@@ -10,6 +10,7 @@
 
 #include "kk_private.h"
 
+#include "kk_acceleration_structure.h"
 #include "kk_query_table.h"
 #include "kk_queue.h"
 
@@ -124,6 +125,7 @@ struct kk_device {
 
    struct kk_sampler_heap samplers;
    struct kk_oq_heap occlusion_queries;
+   struct kk_rt_state rt;
 
    /* Track all heaps the user allocated so we can set them all as resident when
     * recording as required by Metal. */

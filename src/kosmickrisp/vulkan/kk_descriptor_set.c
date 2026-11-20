@@ -7,6 +7,7 @@
 
 #include "kk_descriptor_set.h"
 
+#include "kk_acceleration_structure.h"
 #include "kk_bo.h"
 #include "kk_buffer.h"
 #include "kk_buffer_view.h"
@@ -294,6 +295,16 @@ write_inline_uniform_data(struct kk_descriptor_set *set,
    write_desc(set, binding, offset, info->pData, info->dataSize);
 }
 
+static void
+write_acceleration_structure_desc(struct kk_descriptor_set *set,
+                                  VkAccelerationStructureKHR accel,
+                                  uint32_t binding, uint32_t elem)
+{
+   VK_FROM_HANDLE(kk_acceleration_structure, as, accel);
+   uint64_t id = as ? as->mtl_resource_id : 0ull;
+   write_desc(set, binding, elem, &id, sizeof(id));
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
                         const VkWriteDescriptorSet *pDescriptorWrites,
@@ -357,6 +368,20 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
          assert(write_inline->dataSize == write->descriptorCount);
          write_inline_uniform_data(set, write_inline, write->dstBinding,
                                    write->dstArrayElement);
+         break;
+      }
+
+      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
+         const VkWriteDescriptorSetAccelerationStructureKHR *write_as =
+            vk_find_struct_const(
+               write->pNext, WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR);
+         if (write_as) {
+            for (uint32_t j = 0; j < write_as->accelerationStructureCount; j++) {
+               write_acceleration_structure_desc(
+                  set, write_as->pAccelerationStructures[j], write->dstBinding,
+                  write->dstArrayElement + j);
+            }
+         }
          break;
       }
 
@@ -479,6 +504,20 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
                               write->dstArrayElement + j);
          }
          break;
+
+      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
+         const VkWriteDescriptorSetAccelerationStructureKHR *write_as =
+            vk_find_struct_const(
+               write->pNext, WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR);
+         if (write_as) {
+            for (uint32_t j = 0; j < write_as->accelerationStructureCount; j++) {
+               write_acceleration_structure_desc(
+                  &set, write_as->pAccelerationStructures[j], write->dstBinding,
+                  write->dstArrayElement + j);
+            }
+         }
+         break;
+      }
 
       default:
          break;
@@ -865,6 +904,15 @@ kk_descriptor_set_write_template(
       case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
          write_desc(set, entry->binding, entry->array_element,
                     data + entry->offset, entry->array_count);
+         break;
+
+      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+         for (uint32_t j = 0; j < entry->array_count; j++) {
+            const VkAccelerationStructureKHR *accel =
+               data + entry->offset + j * entry->stride;
+            write_acceleration_structure_desc(set, *accel, entry->binding,
+                                              entry->array_element + j);
+         }
          break;
 
       default:

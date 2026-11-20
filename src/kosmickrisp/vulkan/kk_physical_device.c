@@ -151,6 +151,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_vertex_attribute_divisor = true,
 
       /* Optional extensions */
+      .KHR_acceleration_structure = kk_physical_device_has_raytracing(pdev),
       .KHR_calibrated_timestamps = true,
       .KHR_deferred_host_operations = true,
       .KHR_maintenance7 = true,
@@ -558,6 +559,10 @@ kk_get_device_features(
 
       /* EXT_ycbcr_2plane_444_formats */
       .ycbcr2plane444Formats = true,
+
+      .accelerationStructure = supported_extensions->KHR_acceleration_structure,
+      .descriptorBindingAccelerationStructureUpdateAfterBind =
+         supported_extensions->KHR_acceleration_structure,
    };
 }
 
@@ -948,6 +953,17 @@ kk_get_device_properties(
 
       /* VK_KHR_fragment_shader_barycentric */
       .triStripVertexOrderIndependentOfProvokingVertex = false,
+
+      .maxGeometryCount = (1ull << 24) - 1,
+      .maxInstanceCount = (1ull << 24) - 1,
+      .maxPrimitiveCount = (1ull << 29) - 1,
+      .maxPerStageDescriptorAccelerationStructures = KK_MAX_DESCRIPTORS,
+      .maxPerStageDescriptorUpdateAfterBindAccelerationStructures =
+         KK_MAX_DESCRIPTORS,
+      .maxDescriptorSetAccelerationStructures = KK_MAX_DESCRIPTORS,
+      .maxDescriptorSetUpdateAfterBindAccelerationStructures =
+         KK_MAX_DESCRIPTORS,
+      .minAccelerationStructureScratchOffsetAlignment = 256,
    };
 
    char gpu_name[256u];
@@ -1149,6 +1165,8 @@ get_metal_limits(struct kk_physical_device *pdev)
       mtl_device_get_gpu_apple_family(pdev->mtl_dev_handle);
    pdev->info.placement_sparse =
       mtl_device_supports_placement_sparse(pdev->mtl_dev_handle);
+   pdev->info.raytracing =
+      mtl_device_supports_raytracing(pdev->mtl_dev_handle);
 
    /* Determine the supported MSL version based on the OS. The version used to
     * compile determines what features are available. */
@@ -1182,6 +1200,8 @@ kk_parse_environment_options(struct kk_physical_device *pdev)
 
    settings->gpu_capture_enabled =
       debug_get_bool_option("MESA_KK_GPU_CAPTURE", false);
+   settings->raytracing_enabled =
+      debug_get_bool_option("HB_KK_RAYTRACING", false);
 
    const char *list = debug_get_option("MESA_KK_DISABLE_WORKAROUNDS", "");
    const char *all_workarounds = "all";

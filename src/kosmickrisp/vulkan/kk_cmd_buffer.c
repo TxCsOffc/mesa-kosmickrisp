@@ -14,6 +14,7 @@
 #include "kk_entrypoints.h"
 #include "kk_format.h"
 #include "kk_image_view.h"
+#include "kk_physical_device.h"
 #include "kk_query_pool.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
@@ -1075,9 +1076,11 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       /* We chain encoders, so an intra-encoder barrier is enough here:
        * no need to tear down and recreate the encoder.
        */
-      mtl_barrier_after_encoder_stages(cmd->metal.compute,
-                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
-                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
+      enum mtl_stages stages = MTL_STAGE_DISPATCH | MTL_STAGE_BLIT;
+      if (kk_physical_device_has_raytracing(
+             kk_device_physical(kk_cmd_buffer_device(cmd))))
+         stages |= MTL_STAGE_ACCELERATION_STRUCTURE;
+      mtl_barrier_after_encoder_stages(cmd->metal.compute, stages, stages);
    }
 }
 

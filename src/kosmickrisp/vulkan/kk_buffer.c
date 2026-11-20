@@ -196,12 +196,16 @@ kk_bind_buffer_memory(struct kk_device *dev, const VkBindBufferMemoryInfo *info)
    if (!mem->bo->host_import) {
       buffer->metal.handle = mtl_new_buffer_with_length(
          mem->bo->mtl_handle, buffer->vk.size, info->memoryOffset);
+      buffer->metal.heap = mem->bo->mtl_handle;
       buffer->metal.offset = 0u;
+      buffer->metal.heap_offset = info->memoryOffset;
    } else {
       /* A host pointer import uses its mapped buffer directly, even once a
        * tiled image gave it a private heap, and retains a reference */
       buffer->metal.handle = mem->bo->map;
+      buffer->metal.heap = NULL;
       buffer->metal.offset = info->memoryOffset;
+      buffer->metal.heap_offset = 0u;
       mtl_retain(buffer->metal.handle);
    }
 
@@ -212,7 +216,8 @@ kk_bind_buffer_memory(struct kk_device *dev, const VkBindBufferMemoryInfo *info)
       mtl_buffer_get_gpu_address(buffer->metal.handle) + buffer->metal.offset;
    /* We need Metal to give us a CPU mapping so it correctly captures the
     * data in the GPU debugger... */
-   mtl_get_contents(buffer->metal.handle);
+   if (!mem->bo->private_storage)
+      mtl_get_contents(buffer->metal.handle);
 
    return VK_SUCCESS;
 }

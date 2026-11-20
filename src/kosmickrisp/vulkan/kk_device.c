@@ -459,6 +459,12 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_sampler_heap;
 
+   result = kk_rt_init(dev);
+   if (result != VK_SUCCESS) {
+      kk_device_finish_lib(dev);
+      goto fail_sampler_heap;
+   }
+
    if (pdev->settings.gpu_capture_enabled) {
       const char *capture_directory =
          debug_get_option("MESA_KK_GPU_CAPTURE_DIRECTORY", NULL);
@@ -522,6 +528,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    /* Meta first since it may destroy Vulkan objects */
    kk_device_finish_meta(dev);
+   kk_rt_finish(dev);
    kk_device_finish_lib(dev);
    kk_oq_heap_finish(dev, &dev->occlusion_queries);
    kk_destroy_sampler_heap(dev, &dev->samplers);

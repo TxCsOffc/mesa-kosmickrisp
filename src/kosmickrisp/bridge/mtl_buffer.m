@@ -35,6 +35,8 @@ mtl_get_contents(mtl_buffer *buffer)
 {
    @autoreleasepool {
       id<MTLBuffer> buf = (id<MTLBuffer>)buffer;
+      if (buf.storageMode == MTLStorageModePrivate)
+         return NULL;
       return [buf contents];
    }
 }
