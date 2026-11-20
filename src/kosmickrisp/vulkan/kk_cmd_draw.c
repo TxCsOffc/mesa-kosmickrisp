@@ -2851,6 +2851,19 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    if (!kk_flush_gfx_state(cmd))
       return;
 
+   {
+      const struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+      const uint32_t pre = vs->info.vs.additional_stages_bits &
+                           ~BITFIELD_BIT(MESA_SHADER_FRAGMENT);
+      const mesa_shader_stage vs_stage =
+         pre ? (mesa_shader_stage)(util_last_bit(pre) - 1u)
+             : MESA_SHADER_VERTEX;
+      if (kk_hb_skip_draw(&cmd->state.gfx.pipe->record,
+                          vs->msl_data[vs_stage].code,
+                          vs->msl_data[MESA_SHADER_FRAGMENT].code))
+         return;
+   }
+
    for (uint32_t i = 0; i < data->draw_count; i++) {
       struct kk_draw_data draw_data = build_draw_data(cmd, data, i);
 

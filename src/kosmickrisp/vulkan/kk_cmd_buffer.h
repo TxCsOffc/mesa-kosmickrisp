@@ -259,6 +259,9 @@ struct kk_conditional_rendering_state {
 struct kk_encoder;
 struct kk_rt_pipeline;
 uint32_t kk_hb_rt_live_flags(void);
+struct kk_cb_program;
+bool kk_hb_skip_draw(const struct kk_cb_program *record, const char *vs_msl,
+                     const char *fs_msl);
 
 #define KK_RT_STAGES                                                           \
    (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |         \

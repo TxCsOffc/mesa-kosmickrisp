@@ -6,6 +6,7 @@
  */
 
 #include "kk_cmd_buffer.h"
+#include "kk_cb_record.h"
 #include "util/simple_mtx.h"
 
 #include "kk_acceleration_structure.h"
@@ -456,6 +457,7 @@ kk_hb_live_force(int keep_empty, int no_resume_merge, int no_begin_merge)
    p_atomic_set(&kk_hb_live_values[KK_HB_LIVE_NO_RESUME_MERGE], no_resume_merge);
    p_atomic_set(&kk_hb_live_values[KK_HB_LIVE_NO_BEGIN_MERGE], no_begin_merge);
 }
+static uint32_t kk_hb_skip_mask, kk_hb_skip_value, kk_hb_skip_epoch;
 static int64_t kk_hb_live_next_check;
 static int64_t kk_hb_live_mtime = -1;
 static int kk_hb_live_busy;
@@ -485,6 +487,7 @@ kk_hb_live_refresh(void)
       mtime = (int64_t)st.st_mtimespec.tv_sec * 1000000000ll + st.st_mtimespec.tv_nsec;
    if (mtime != kk_hb_live_mtime) {
       int values[KK_HB_LIVE_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+      uint32_t skip_mask = 0u, skip_value = 0u;
       FILE *f = mtime >= 0 ? fopen(path, "r") : NULL;
       if (f) {
          char word[64];
@@ -497,11 +500,21 @@ kk_hb_live_refresh(void)
                if (!strcmp(word, kk_hb_live_names[i]))
                   values[i] = atoi(eq + 1) != 0;
             }
+            if (!strcmp(word, "skip_mask"))
+               skip_mask = strtoul(eq + 1, NULL, 0);
+            else if (!strcmp(word, "skip_value"))
+               skip_value = strtoul(eq + 1, NULL, 0);
          }
          fclose(f);
       }
       for (unsigned i = 0; i < KK_HB_LIVE_COUNT; i++)
          p_atomic_set(&kk_hb_live_values[i], values[i]);
+      p_atomic_set(&kk_hb_skip_value, skip_value);
+      p_atomic_set(&kk_hb_skip_mask, skip_mask);
+      p_atomic_inc(&kk_hb_skip_epoch);
+      if (skip_mask)
+         mesa_logi("kk: live skip of draws with program hash & 0x%08x == 0x%08x",
+                   skip_mask, skip_value);
       kk_hb_live_mtime = mtime;
       mesa_logi("kk: live switches keep_empty=%d no_resume_merge=%d no_begin_merge=%d "
                 "rt_skip=%d rt_noahit=%d rt_nochit=%d rt_notrace=%d rt_opaque=%d "
@@ -530,6 +543,46 @@ kk_hb_rt_live_flags(void)
           (kk_hb_live(KK_HB_LIVE_RT_OPAQUE, false) ? 16u : 0u) |
           (kk_hb_live(KK_HB_LIVE_RT_NOCALLS, false) ? 32u : 0u) |
           (kk_hb_live(KK_HB_LIVE_RT_LABEL, false) ? 64u : 0u);
+}
+
+/* Live draw bisection (HB_KK_LIVE file: skip_mask=0x.. skip_value=0x..):
+ * draws whose program hash (its Metal vertex function and FS MSL hashes)
+ * matches are dropped. The programs of dropped draws are logged once per
+ * skip setting, with their MSL while few of them match. */
+bool
+kk_hb_skip_draw(const struct kk_cb_program *record, const char *vs_msl,
+                const char *fs_msl)
+{
+   kk_hb_live_refresh();
+   const uint32_t mask = p_atomic_read(&kk_hb_skip_mask);
+   if (mask == 0u)
+      return false;
+   const uint32_t h = record->hash[0] * 0x9e3779b1u ^ record->hash[1];
+   if ((h & mask) != p_atomic_read(&kk_hb_skip_value))
+      return false;
+
+   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
+   static uint32_t seen[64], seen_count, seen_epoch;
+   simple_mtx_lock(&lock);
+   const uint32_t epoch = p_atomic_read(&kk_hb_skip_epoch);
+   if (epoch != seen_epoch) {
+      seen_epoch = epoch;
+      seen_count = 0u;
+   }
+   bool known = false;
+   for (uint32_t i = 0; i < seen_count; i++)
+      known |= seen[i] == h;
+   if (!known && seen_count < ARRAY_SIZE(seen)) {
+      seen[seen_count++] = h;
+      mesa_logi("kk: skip program %08x vs %08x fs %08x", h, record->hash[0],
+                record->hash[1]);
+      if (mask == ~0u) {
+         fprintf(stderr, "kk: skip program %08x VS MSL:\n%s\n", h, vs_msl ? vs_msl : "(none)");
+         fprintf(stderr, "kk: skip program %08x FS MSL:\n%s\n", h, fs_msl ? fs_msl : "(none)");
+      }
+   }
+   simple_mtx_unlock(&lock);
+   return true;
 }
 
 bool
