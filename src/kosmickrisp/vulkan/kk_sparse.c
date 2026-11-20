@@ -146,12 +146,19 @@ kk_image_sparse_init(struct kk_device *dev, struct kk_image *image)
     * HB_KK_SPARSE_SMALL_BC=1 turns this off. */
    const uint32_t block_w = util_format_get_blockwidth(layout->format.pipe);
    const char *keep_sparse = getenv("HB_KK_SPARSE_SMALL_BC");
-   sparse->backed = block_w > 1u && layout->width_px <= block_w &&
+   const char *all_backed = getenv("HB_KK_SPARSE_ALL_BACKED");
+   sparse->backed = (all_backed && all_backed[0] == '1') ||
+                    (block_w > 1u && layout->width_px <= block_w &&
                     layout->depth_px == 1u &&
                     util_format_get_2d_size(layout->format.pipe, 1u,
                                             layout->height_px) <=
                        KK_SPARSE_PAGE_SIZE_B &&
-                    !(keep_sparse && keep_sparse[0] == '1');
+                    !(keep_sparse && keep_sparse[0] == '1'));
+   if (all_backed && all_backed[0] == '1')
+      fprintf(stderr, "kk sparse: backed %ux%ux%u levels %u layers %u format %s\n",
+              layout->width_px, layout->height_px, layout->depth_px,
+              layout->levels, layout->layers,
+              util_format_short_name(layout->format.pipe));
 
    plane->mtl_handle =
       sparse->backed
@@ -834,6 +841,9 @@ kk_sparse_bind_image_opaque(struct kk_queue *queue,
    const struct kk_image_sparse *sparse = &image->sparse;
 
    if (sparse->backed) {
+      const char *all_backed = getenv("HB_KK_SPARSE_ALL_BACKED");
+      if (all_backed && all_backed[0] == '1')
+         return;
       for (uint32_t i = 0; i < info->bindCount; ++i) {
          if (info->pBinds[i].memory == VK_NULL_HANDLE) {
             kk_sparse_zero_backed_image(queue, image);
