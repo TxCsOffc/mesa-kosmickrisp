@@ -7,6 +7,9 @@
 #include "nir.h"
 #include "nir_builder.h"
 #include "nir_deref.h"
+#include "nir_serialize.h"
+#include "util/blob.h"
+#include "util/mesa-blake3.h"
 
 #include "util/hash_table.h"
 #include "util/u_debug.h"
@@ -17,6 +20,7 @@
 #include "vk_pipeline.h"
 #include "vk_pipeline_layout.h"
 #include "vk_shader.h"
+#include "vk_shader_module.h"
 
 #define KK_RT_HANDLE_SIZE  32u
 #define KK_RT_ATTRIB_SIZE  32u
@@ -267,7 +271,6 @@ kk_rt_process_stage(struct kk_device *dev, VkPipelineCreateFlags2KHR flags,
                                      pipeline_pnext, info->pNext);
 
    mesa_shader_stage stage = vk_to_mesa_shader_stage(info->stage);
-   vk_pipeline_hash_shader_stage(flags, info, &rs, out->hash);
    const struct nir_shader_compiler_options *nir_options =
       ops->get_nir_options(dev->vk.physical, stage, &rs);
    struct spirv_to_nir_options spirv_options =
@@ -304,6 +307,44 @@ kk_rt_process_stage(struct kk_device *dev, VkPipelineCreateFlags2KHR flags,
    NIR_PASS(_, nir, nir_opt_dce);
    NIR_PASS(_, nir, nir_remove_dead_variables,
             nir_var_shader_call_data | nir_var_ray_hit_attrib, NULL);
+
+   NIR_PASS(_, nir, nir_opt_dce);
+   memset(nir->info.source_blake3, 0, sizeof(nir->info.source_blake3));
+   struct blob blob;
+   blob_init(&blob);
+   nir_serialize(&blob, nir, true);
+   _mesa_blake3_compute(blob.data, blob.size, out->hash);
+   blob_finish(&blob);
+
+   const char *dump_dir = getenv("HB_KK_RT_DUMP_DIR");
+   if (dump_dir) {
+      const uint32_t *code = NULL;
+      size_t code_size = 0;
+      VK_FROM_HANDLE(vk_shader_module, module, info->module);
+      if (module) {
+         code = (const uint32_t *)module->data;
+         code_size = module->size;
+      } else {
+         const VkShaderModuleCreateInfo *mci =
+            vk_find_struct_const(info->pNext, SHADER_MODULE_CREATE_INFO);
+         if (mci) {
+            code = mci->pCode;
+            code_size = mci->codeSize;
+         }
+      }
+      if (code) {
+         char path[1024];
+         snprintf(path, sizeof(path), "%s/%s-%02x%02x%02x%02x%02x%02x%02x%02x-%s.spv",
+                  dump_dir, _mesa_shader_stage_to_abbrev(stage), out->hash[0],
+                  out->hash[1], out->hash[2], out->hash[3], out->hash[4],
+                  out->hash[5], out->hash[6], out->hash[7], info->pName);
+         FILE *f = fopen(path, "wb");
+         if (f) {
+            fwrite(code, 1, code_size, f);
+            fclose(f);
+         }
+      }
+   }
 
    out->nir = nir;
    return VK_SUCCESS;
