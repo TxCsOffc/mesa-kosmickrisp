@@ -15,6 +15,7 @@
 enum mtl_metalfx_type {
    MTL_METALFX_TEMPORAL = 1,
    MTL_METALFX_DENOISED = 2,
+   MTL_METALFX_INTERPOLATE = 3,
 };
 
 enum mtl_metalfx_image {
@@ -25,6 +26,7 @@ enum mtl_metalfx_image {
    MTL_METALFX_EXPOSURE = 4,
    MTL_METALFX_DIFFUSE_ALBEDO = 5,
    MTL_METALFX_REACTIVE = 5,
+   MTL_METALFX_UI = 5,
    MTL_METALFX_SPECULAR_ALBEDO = 6,
    MTL_METALFX_NORMALS = 7,
    MTL_METALFX_ROUGHNESS = 8,
@@ -48,6 +50,8 @@ struct mtl_metalfx_scale {
    float jitter_x, jitter_y;
    float pre_exposure;
    float world_to_view[16], view_to_clip[16];
+   float delta_time, near_plane, far_plane, field_of_view, aspect_ratio;
+   bool ui_composited;
 };
 
 void *mtl_metalfx_context_create(void);

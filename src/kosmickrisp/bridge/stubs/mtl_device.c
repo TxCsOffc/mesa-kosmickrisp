@@ -169,6 +169,18 @@ mtl_new_placement_sparse_texture(mtl_device *device,
    return NULL;
 }
 
+mtl_texture *
+mtl_new_private_texture(mtl_device *device, struct kk_image_layout *layout)
+{
+   return NULL;
+}
+
+mtl_buffer *
+mtl_new_private_buffer(mtl_device *device, uint64_t size_B)
+{
+   return NULL;
+}
+
 mtl_buffer *
 mtl_new_placement_sparse_buffer(mtl_device *device, uint64_t size_B)
 {

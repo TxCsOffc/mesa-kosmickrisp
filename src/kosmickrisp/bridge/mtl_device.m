@@ -394,6 +394,29 @@ mtl_new_placement_sparse_texture(mtl_device *device,
    }
 }
 
+mtl_texture *
+mtl_new_private_texture(mtl_device *device, struct kk_image_layout *layout)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      MTLTextureDescriptor *descriptor = [mtl_new_texture_descriptor(layout) autorelease];
+      descriptor.resourceOptions = MTLResourceStorageModePrivate |
+                                   MTLResourceHazardTrackingModeUntracked;
+      return [dev newTextureWithDescriptor:descriptor];
+   }
+}
+
+mtl_buffer *
+mtl_new_private_buffer(mtl_device *device, uint64_t size_B)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      return [dev newBufferWithLength:size_B
+                              options:MTLResourceStorageModePrivate |
+                                      MTLResourceHazardTrackingModeUntracked];
+   }
+}
+
 mtl_buffer *
 mtl_new_placement_sparse_buffer(mtl_device *device, uint64_t size_B)
 {

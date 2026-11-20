@@ -69,6 +69,9 @@ struct kk_image_sparse {
    /* Tiles of each level below mtl_tail_level */
    VkExtent3D level_tiles[KK_MAX_MIP_LEVELS];
    uint64_t layer_pages;
+   /* The Metal texture is an ordinary one with its own storage: binding it
+    * does nothing and unbinding it zeroes it (see kk_image_sparse_init) */
+   bool backed;
 };
 
 struct kk_image {

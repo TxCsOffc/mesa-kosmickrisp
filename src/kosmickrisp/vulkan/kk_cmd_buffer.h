@@ -306,6 +306,8 @@ void kk_hb_split_note(enum kk_hb_split_reason reason);
 void kk_hb_barrier_note(VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst);
 void kk_hb_encoder_note(bool after_barrier, bool render);
 bool kk_hb_keep_empty_passes(void);
+void kk_hb_live_force(int keep_empty, int no_resume_merge, int no_begin_merge);
+extern uint64_t kk_hb_ab_encoders[2];
 bool kk_hb_resume_merge(void);
 bool kk_hb_begin_merge(void);
 struct kk_cmd_buffer;

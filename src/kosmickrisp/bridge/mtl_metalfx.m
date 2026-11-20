@@ -33,6 +33,11 @@ struct mtl_metalfx_context {
    os_unfair_lock lock;
    NSMutableDictionary *scalers;
    NSMutableArray *retired;
+   float mask_scale;
+   id<MTLComputePipelineState> mask_pso;
+   id<MTL4ArgumentTable> mask_table;
+   id<MTLTexture> mask_tex;
+   id<MTLResidencySet> mask_residency;
 };
 
 void *
@@ -44,6 +49,8 @@ mtl_metalfx_context_create(void)
    ctx->lock = OS_UNFAIR_LOCK_INIT;
    ctx->scalers = [[NSMutableDictionary alloc] init];
    ctx->retired = [[NSMutableArray alloc] init];
+   const char *scale = getenv("HB_KK_REACTIVE_SCALE");
+   ctx->mask_scale = scale ? (float)atof(scale) : 1.0f;
    return ctx;
 }
 
@@ -56,6 +63,10 @@ mtl_metalfx_context_destroy(void *context)
    @autoreleasepool {
       [ctx->scalers release];
       [ctx->retired release];
+      [ctx->mask_pso release];
+      [ctx->mask_table release];
+      [ctx->mask_tex release];
+      [ctx->mask_residency release];
    }
    free(ctx);
 }
@@ -109,7 +120,9 @@ make_scaler(const struct mtl_metalfx_scale *s, id<MTLDevice> dev, id<MTL4Compile
       desc.autoExposureEnabled = s->auto_exposure;
       desc.inputContentPropertiesEnabled = YES;
       float min_scale = MAX(1.0f, [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:dev]);
-      float max_scale = MIN(3.0f, [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:dev]);
+      float device_max = MIN(3.0f, [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:dev]);
+      float needed = MAX((float)output.width / MAX(in_w, 1u), (float)output.height / MAX(in_h, 1u));
+      float max_scale = MIN(device_max, ceilf(needed * 100.0f) / 100.0f);
       if (max_scale < min_scale)
          max_scale = min_scale;
       desc.inputContentMinScale = min_scale;
@@ -159,11 +172,184 @@ make_scaler(const struct mtl_metalfx_scale *s, id<MTLDevice> dev, id<MTL4Compile
    return made;
 }
 
+
+static id<MTLTexture>
+scaled_reactive(struct mtl_metalfx_context *ctx, id<MTLDevice> dev, id<MTL4CommandBuffer> cb,
+                id<MTLTexture> mask)
+{
+   if (!(ctx->mask_scale >= 0.0f) || ctx->mask_scale == 1.0f)
+      return mask;
+
+   os_unfair_lock_lock(&ctx->lock);
+   if (!ctx->mask_pso) {
+      NSString *src = [NSString stringWithFormat:
+         @"#include <metal_stdlib>\nusing namespace metal;\n"
+          "kernel void hb_scale_mask(texture2d<float, access::read> src [[texture(0)]],\n"
+          "                          texture2d<float, access::write> dst [[texture(1)]],\n"
+          "                          uint2 gid [[thread_position_in_grid]])\n"
+          "{\n"
+          "   if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
+          "   dst.write(float4(saturate(src.read(gid).r * %f)), gid);\n"
+          "}\n", ctx->mask_scale];
+      NSError *err = nil;
+      id<MTLLibrary> lib = [[dev newLibraryWithSource:src options:nil error:&err] autorelease];
+      id<MTLFunction> fn = lib ? [[lib newFunctionWithName:@"hb_scale_mask"] autorelease] : nil;
+      ctx->mask_pso = fn ? [dev newComputePipelineStateWithFunction:fn error:&err] : nil;
+      MTL4ArgumentTableDescriptor *ad = [[MTL4ArgumentTableDescriptor new] autorelease];
+      ad.maxTextureBindCount = 2;
+      ctx->mask_table = [dev newArgumentTableWithDescriptor:ad error:&err];
+      MTLResidencySetDescriptor *rd = [[MTLResidencySetDescriptor new] autorelease];
+      ctx->mask_residency = [dev newResidencySetWithDescriptor:rd error:&err];
+      fprintf(stderr, "kk: MetalFX reactive mask scale %.3f: %s\n", ctx->mask_scale,
+              ctx->mask_pso && ctx->mask_table && ctx->mask_residency ? "ok" : "FAILED");
+   }
+   if (!ctx->mask_pso || !ctx->mask_table || !ctx->mask_residency) {
+      os_unfair_lock_unlock(&ctx->lock);
+      return mask;
+   }
+   if (!ctx->mask_tex || ctx->mask_tex.width != mask.width || ctx->mask_tex.height != mask.height ||
+       ctx->mask_tex.pixelFormat != mask.pixelFormat) {
+      if (ctx->mask_tex) {
+         [ctx->mask_residency removeAllocation:ctx->mask_tex];
+         [ctx->retired addObject:ctx->mask_tex];
+         [ctx->mask_tex release];
+      }
+      MTLTextureDescriptor *td =
+         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mask.pixelFormat width:mask.width
+                                                           height:mask.height mipmapped:NO];
+      td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+      td.storageMode = MTLStorageModePrivate;
+      ctx->mask_tex = [dev newTextureWithDescriptor:td];
+      if (ctx->mask_tex) {
+         [ctx->mask_residency addAllocation:ctx->mask_tex];
+         [ctx->mask_residency commit];
+      }
+   }
+   id<MTLTexture> out = ctx->mask_tex;
+   id<MTLComputePipelineState> pso = ctx->mask_pso;
+   id<MTL4ArgumentTable> table = ctx->mask_table;
+   id<MTLResidencySet> residency = ctx->mask_residency;
+   os_unfair_lock_unlock(&ctx->lock);
+   if (!out)
+      return mask;
+
+   [cb useResidencySet:residency];
+   id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+   [enc barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch
+              visibilityOptions:MTL4VisibilityOptionDevice];
+   [table setTexture:mask.gpuResourceID atIndex:0];
+   [table setTexture:out.gpuResourceID atIndex:1];
+   [enc setComputePipelineState:pso];
+   [enc setArgumentTable:table];
+   [enc dispatchThreads:MTLSizeMake(out.width, out.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+   [enc barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageAll
+         visibilityOptions:MTL4VisibilityOptionDevice];
+   [enc endEncoding];
+   return out;
+}
+
+static bool
+encode_interpolation(struct mtl_metalfx_context *ctx, mtl_device *device, mtl_compiler *compiler,
+                     mtl_command_buffer *command_buffer, const struct mtl_metalfx_scale *s)
+{
+   if (@available(macOS 27.0, *)) {
+   } else {
+      return false;
+   }
+
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      id<MTLTexture> color = (id<MTLTexture>)s->textures[MTL_METALFX_COLOR];
+      id<MTLTexture> depth = (id<MTLTexture>)s->textures[MTL_METALFX_DEPTH];
+      id<MTLTexture> motion = (id<MTLTexture>)s->textures[MTL_METALFX_MOTION];
+      id<MTLTexture> output = (id<MTLTexture>)s->textures[MTL_METALFX_OUTPUT];
+      id<MTLTexture> ui = (id<MTLTexture>)s->textures[MTL_METALFX_UI];
+      if (!color || !depth || !motion || !output)
+         return false;
+      if (![MTLFXFrameInterpolatorDescriptor supportsMetal4FX:dev])
+         return false;
+
+      uint32_t key_words[10] = {
+         MTL_METALFX_INTERPOLATE, (uint32_t)depth.width, (uint32_t)depth.height,
+         (uint32_t)output.width, (uint32_t)output.height, (uint32_t)color.pixelFormat,
+         (uint32_t)depth.pixelFormat, (uint32_t)motion.pixelFormat, (uint32_t)output.pixelFormat,
+         ui ? (uint32_t)ui.pixelFormat : 0u,
+      };
+      NSData *key = [NSData dataWithBytes:key_words length:sizeof(key_words)];
+      NSNumber *id_key = [NSNumber numberWithUnsignedLongLong:s->scaler_id];
+
+      id interpolator = nil;
+      bool fresh_history = false;
+      os_unfair_lock_lock(&ctx->lock);
+      HbMetalFXEntry *entry = ctx->scalers[id_key];
+      if (entry && [entry->key isEqualToData:key])
+         interpolator = [[entry->scaler retain] autorelease];
+      os_unfair_lock_unlock(&ctx->lock);
+
+      if (!interpolator) {
+         MTLFXFrameInterpolatorDescriptor *desc = [[MTLFXFrameInterpolatorDescriptor new] autorelease];
+         desc.colorTextureFormat = color.pixelFormat;
+         desc.outputTextureFormat = output.pixelFormat;
+         desc.depthTextureFormat = depth.pixelFormat;
+         desc.motionTextureFormat = motion.pixelFormat;
+         if (ui)
+            desc.uiTextureFormat = ui.pixelFormat;
+         desc.inputWidth = depth.width;
+         desc.inputHeight = depth.height;
+         desc.outputWidth = output.width;
+         desc.outputHeight = output.height;
+         desc.requiresPrevColorTexture = NO;
+         id made = [desc newFrameInterpolatorWithDevice:dev compiler:(id<MTL4Compiler>)compiler];
+         fprintf(stderr, "kk: MetalFX frame interpolation %lux%lu -> %lux%lu (color %lu depth %lu motion %lu output %lu ui %lu): %s\n",
+                 (unsigned long)depth.width, (unsigned long)depth.height, (unsigned long)output.width,
+                 (unsigned long)output.height, (unsigned long)color.pixelFormat, (unsigned long)depth.pixelFormat,
+                 (unsigned long)motion.pixelFormat, (unsigned long)output.pixelFormat,
+                 ui ? (unsigned long)ui.pixelFormat : 0ul, made ? "ok" : "FAILED");
+         if (!made)
+            return false;
+         HbMetalFXEntry *fresh = [[HbMetalFXEntry new] autorelease];
+         fresh->key = [key retain];
+         fresh->scaler = made;
+         os_unfair_lock_lock(&ctx->lock);
+         HbMetalFXEntry *old = ctx->scalers[id_key];
+         if (old)
+            retire_locked(ctx, old);
+         ctx->scalers[id_key] = fresh;
+         os_unfair_lock_unlock(&ctx->lock);
+         interpolator = [[made retain] autorelease];
+         fresh_history = true;
+      }
+
+      id<MTL4FXFrameInterpolator> f = (id<MTL4FXFrameInterpolator>)interpolator;
+      f.colorTexture = color;
+      f.depthTexture = depth;
+      f.motionTexture = motion;
+      f.outputTexture = output;
+      f.uiTexture = ui;
+      f.uiTextureComposited = s->ui_composited;
+      f.motionVectorScaleX = s->motion_scale_x;
+      f.motionVectorScaleY = s->motion_scale_y;
+      f.jitterOffsetX = s->jitter_x;
+      f.jitterOffsetY = s->jitter_y;
+      f.deltaTime = s->delta_time;
+      f.nearPlane = s->near_plane;
+      f.farPlane = s->far_plane;
+      f.fieldOfView = s->field_of_view;
+      f.aspectRatio = s->aspect_ratio;
+      f.depthReversed = s->depth_reversed;
+      f.shouldResetHistory = s->reset || fresh_history;
+      [f encodeToCommandBuffer:(id<MTL4CommandBuffer>)command_buffer];
+      return true;
+   }
+}
+
 bool
 mtl_metalfx_encode(void *context, mtl_device *device, mtl_compiler *compiler,
                    mtl_command_buffer *command_buffer, const struct mtl_metalfx_scale *s)
 {
    struct mtl_metalfx_context *ctx = context;
+   if (ctx && s->type == MTL_METALFX_INTERPOLATE)
+      return encode_interpolation(ctx, device, compiler, command_buffer, s);
    if (!ctx || (s->type != MTL_METALFX_TEMPORAL && s->type != MTL_METALFX_DENOISED))
       return false;
 
@@ -252,7 +438,7 @@ mtl_metalfx_encode(void *context, mtl_device *device, mtl_compiler *compiler,
          t.outputTexture = output;
          t.exposureTexture = tex[MTL_METALFX_EXPOSURE];
          if (reactive)
-            t.reactiveMaskTexture = reactive;
+            t.reactiveMaskTexture = scaled_reactive(ctx, dev, cb, reactive);
          t.inputContentWidth = in_w;
          t.inputContentHeight = in_h;
          t.reset = s->reset;

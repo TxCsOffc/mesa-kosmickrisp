@@ -1012,7 +1012,7 @@ kk_get_device_properties(
 
    snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "KosmicKrisp");
    snprintf(properties->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
-            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1 " metalfx metalfx-denoised");
+            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1 " metalfx metalfx-denoised metalfx-interpolation");
 }
 
 static uint64_t
@@ -1489,4 +1489,15 @@ kk_GetPhysicalDeviceMultisamplePropertiesEXT(
    } else {
       pMultisampleProperties->maxSampleLocationGridSize = (VkExtent2D){0, 0};
    }
+}
+
+__attribute__((constructor)) static void
+kk_hb_force_robust(void)
+{
+   const char *ubo = getenv("HB_KK_FORCE_UBO_ROBUST");
+   const char *ssbo = getenv("HB_KK_FORCE_SSBO_ROBUST");
+   if (ubo && ubo[0] == '1')
+      unsetenv("HB_KK_NO_UBO_ROBUST");
+   if (ssbo && ssbo[0] == '1')
+      unsetenv("HB_KK_NO_SSBO_ROBUST");
 }

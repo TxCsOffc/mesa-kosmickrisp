@@ -23,6 +23,10 @@
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
 
 #include "util/u_debug.h"
+#include "util/os_time.h"
+#include "util/u_atomic.h"
+#include "util/log.h"
+#include <sys/stat.h>
 
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
@@ -412,22 +416,108 @@ static const char *const kk_hb_split_names[KK_HB_SPLIT_COUNT] = {
    "unpark:compute", "unpark:write", "unpark:query", "unpark:end",
 };
 DEBUG_GET_ONCE_BOOL_OPTION(hb_keep_empty_passes, "HB_KK_KEEP_EMPTY_PASSES", false)
+DEBUG_GET_ONCE_BOOL_OPTION(hb_no_resume_merge, "HB_KK_NO_RESUME_MERGE", false)
+DEBUG_GET_ONCE_BOOL_OPTION(hb_no_begin_merge, "HB_KK_NO_BEGIN_MERGE", false)
+
+enum kk_hb_live_switch {
+   KK_HB_LIVE_KEEP_EMPTY,
+   KK_HB_LIVE_NO_RESUME_MERGE,
+   KK_HB_LIVE_NO_BEGIN_MERGE,
+   KK_HB_LIVE_COUNT,
+};
+
+static const char *const kk_hb_live_names[KK_HB_LIVE_COUNT] = {
+   "keep_empty", "no_resume_merge", "no_begin_merge",
+};
+
+static int kk_hb_live_values[KK_HB_LIVE_COUNT] = {-1, -1, -1};
+static int kk_hb_live_forced;
+uint64_t kk_hb_ab_encoders[2];
+
+void
+kk_hb_live_force(int keep_empty, int no_resume_merge, int no_begin_merge)
+{
+   p_atomic_set(&kk_hb_live_forced, 1);
+   p_atomic_set(&kk_hb_live_values[KK_HB_LIVE_KEEP_EMPTY], keep_empty);
+   p_atomic_set(&kk_hb_live_values[KK_HB_LIVE_NO_RESUME_MERGE], no_resume_merge);
+   p_atomic_set(&kk_hb_live_values[KK_HB_LIVE_NO_BEGIN_MERGE], no_begin_merge);
+}
+static int64_t kk_hb_live_next_check;
+static int64_t kk_hb_live_mtime = -1;
+static int kk_hb_live_busy;
+
+static void
+kk_hb_live_refresh(void)
+{
+   static const char *path;
+   static bool path_read;
+   if (!path_read) {
+      path = getenv("HB_KK_LIVE");
+      path_read = true;
+   }
+   if (!path || p_atomic_read(&kk_hb_live_forced))
+      return;
+
+   int64_t now = os_time_get_nano();
+   if (now < p_atomic_read(&kk_hb_live_next_check))
+      return;
+   if (p_atomic_cmpxchg(&kk_hb_live_busy, 0, 1) != 0)
+      return;
+   p_atomic_set(&kk_hb_live_next_check, now + 250000000ll);
+
+   struct stat st;
+   int64_t mtime = -1;
+   if (stat(path, &st) == 0)
+      mtime = (int64_t)st.st_mtimespec.tv_sec * 1000000000ll + st.st_mtimespec.tv_nsec;
+   if (mtime != kk_hb_live_mtime) {
+      int values[KK_HB_LIVE_COUNT] = {-1, -1, -1};
+      FILE *f = mtime >= 0 ? fopen(path, "r") : NULL;
+      if (f) {
+         char word[64];
+         while (fscanf(f, "%63s", word) == 1) {
+            char *eq = strchr(word, '=');
+            if (!eq)
+               continue;
+            *eq = 0;
+            for (unsigned i = 0; i < KK_HB_LIVE_COUNT; i++) {
+               if (!strcmp(word, kk_hb_live_names[i]))
+                  values[i] = atoi(eq + 1) != 0;
+            }
+         }
+         fclose(f);
+      }
+      for (unsigned i = 0; i < KK_HB_LIVE_COUNT; i++)
+         p_atomic_set(&kk_hb_live_values[i], values[i]);
+      kk_hb_live_mtime = mtime;
+      mesa_logi("kk: live switches keep_empty=%d no_resume_merge=%d no_begin_merge=%d",
+                values[0], values[1], values[2]);
+   }
+   p_atomic_set(&kk_hb_live_busy, 0);
+}
+
+static bool
+kk_hb_live(enum kk_hb_live_switch which, bool fallback)
+{
+   kk_hb_live_refresh();
+   int v = p_atomic_read(&kk_hb_live_values[which]);
+   return v < 0 ? fallback : v;
+}
+
 bool
 kk_hb_keep_empty_passes(void)
 {
-   return debug_get_option_hb_keep_empty_passes();
+   return kk_hb_live(KK_HB_LIVE_KEEP_EMPTY, debug_get_option_hb_keep_empty_passes());
 }
-DEBUG_GET_ONCE_BOOL_OPTION(hb_no_resume_merge, "HB_KK_NO_RESUME_MERGE", false)
 bool
 kk_hb_resume_merge(void)
 {
-   return !debug_get_option_hb_no_resume_merge();
+   return !kk_hb_live(KK_HB_LIVE_NO_RESUME_MERGE, debug_get_option_hb_no_resume_merge());
 }
-DEBUG_GET_ONCE_BOOL_OPTION(hb_no_begin_merge, "HB_KK_NO_BEGIN_MERGE", false)
 bool
 kk_hb_begin_merge(void)
 {
-   return kk_hb_resume_merge() && !debug_get_option_hb_no_begin_merge();
+   return kk_hb_resume_merge() &&
+          !kk_hb_live(KK_HB_LIVE_NO_BEGIN_MERGE, debug_get_option_hb_no_begin_merge());
 }
 
 /* Highball: end a rendering that kk_CmdEndRendering2KHR suspended with its
@@ -482,6 +572,7 @@ kk_hb_barrier_note(VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst)
 void
 kk_hb_encoder_note(bool after_barrier, bool render)
 {
+   __atomic_add_fetch(&kk_hb_ab_encoders[render], 1, __ATOMIC_RELAXED);
    if (debug_get_option_hb_splitstats())
       __atomic_add_fetch(&kk_hb_enc[(render ? 2 : 0) + after_barrier], 1, __ATOMIC_RELAXED);
 }
@@ -841,7 +932,8 @@ kk_hb_metalfx_scale(struct kk_cmd_buffer *cmd, const VkMetalFXScaleInfoMVK *info
       mtl_metalfx_release(dev->hb_metalfx, info->pReleaseScalerIds,
                           info->releaseScalerIdCount);
    if (info->scalerType != VK_METALFX_SCALER_TYPE_TEMPORAL_MVK &&
-       info->scalerType != VK_METALFX_SCALER_TYPE_DENOISED_MVK)
+       info->scalerType != VK_METALFX_SCALER_TYPE_DENOISED_MVK &&
+       info->scalerType != VK_METALFX_SCALER_TYPE_FRAME_INTERPOLATION_MVK)
       return;
 
    struct mtl_metalfx_scale s = {
@@ -863,6 +955,15 @@ kk_hb_metalfx_scale(struct kk_cmd_buffer *cmd, const VkMetalFXScaleInfoMVK *info
    memcpy(s.world_to_view, info->worldToViewMatrix, sizeof(s.world_to_view));
    memcpy(s.view_to_clip, info->viewToClipMatrix, sizeof(s.view_to_clip));
    for (const VkBaseInStructure *n = info->pNext; n; n = n->pNext) {
+      if (n->sType == VK_STRUCTURE_TYPE_METALFX_FRAME_INTERPOLATION_INFO_MVK) {
+         const VkMetalFXFrameInterpolationInfoMVK *fi = (const void *)n;
+         s.delta_time = fi->deltaTime;
+         s.near_plane = fi->nearPlane;
+         s.far_plane = fi->farPlane;
+         s.field_of_view = fi->fieldOfView;
+         s.aspect_ratio = fi->aspectRatio;
+         s.ui_composited = fi->uiComposited != 0;
+      }
       if (n->sType == VK_STRUCTURE_TYPE_METALFX_CONTENT_OFFSETS_MVK) {
          const VkMetalFXContentOffsetsMVK *o = (const void *)n;
          s.has_offsets = true;

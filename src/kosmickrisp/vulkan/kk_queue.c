@@ -27,6 +27,12 @@
 #include "vk_cmd_queue.h"
 
 #include <ctype.h>
+#include <mach/mach_time.h>
+#include "util/simple_mtx.h"
+#include "util/log.h"
+#include <inttypes.h>
+
+static void kk_hb_ab_gpu(double start, double end);
 #include <string.h>
 
 struct kk_commit_data {
@@ -407,6 +413,7 @@ kk_queue_check_feedback(struct kk_queue *queue, struct mtl_feedback_data *data)
    struct kk_device *dev = kk_queue_device(queue);
 
    kk_queue_note_feedback(queue, data);
+   kk_hb_ab_gpu(data->gpu_start, data->gpu_end);
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
       kk_queue_log_failure(queue, data);
       vk_device_set_lost(
@@ -606,9 +613,100 @@ unlock:
  * boundary, written to HB_KK_CAPTURE_DIR (default /tmp) as
  * kk-<pid>-<time>.gputrace; the trigger file is removed. Needs
  * MTL_CAPTURE_ENABLED=1. Off unless the variable is set. */
+static const int kk_hb_ab_modes[][3] = {
+   {0, 0, 0},
+   {1, 0, 0},
+   {0, 1, 1},
+};
+
+static struct {
+   simple_mtx_t lock;
+   double period;
+   double window_start;
+   double measure_start;
+   double busy;
+   double last_end;
+   uint64_t frames;
+   uint64_t encoders[2];
+   unsigned mode;
+   bool on;
+} kk_hb_ab = {.lock = SIMPLE_MTX_INITIALIZER, .period = -1.0};
+
+static double
+kk_hb_ab_now(void)
+{
+   static mach_timebase_info_data_t timebase;
+   if (timebase.denom == 0u)
+      mach_timebase_info(&timebase);
+   return (double)mach_absolute_time() * timebase.numer / timebase.denom / 1e9;
+}
+
+static void
+kk_hb_ab_gpu(double start, double end)
+{
+   if (!kk_hb_ab.on || end <= start)
+      return;
+   simple_mtx_lock(&kk_hb_ab.lock);
+   if (start >= kk_hb_ab.measure_start) {
+      double from = MAX2(start, kk_hb_ab.last_end);
+      if (end > from)
+         kk_hb_ab.busy += end - from;
+      kk_hb_ab.last_end = MAX2(kk_hb_ab.last_end, end);
+   }
+   simple_mtx_unlock(&kk_hb_ab.lock);
+}
+
+static void
+kk_hb_ab_frame(void)
+{
+   if (kk_hb_ab.period < 0.0) {
+      const char *p = getenv("HB_KK_AB");
+      kk_hb_ab.period = p ? atof(p) : 0.0;
+      kk_hb_ab.on = kk_hb_ab.period > 0.0;
+   }
+   if (!kk_hb_ab.on)
+      return;
+
+   const double now = kk_hb_ab_now();
+   simple_mtx_lock(&kk_hb_ab.lock);
+   if (kk_hb_ab.window_start == 0.0) {
+      kk_hb_ab.window_start = now;
+      kk_hb_ab.measure_start = now + 0.5;
+      kk_hb_live_force(kk_hb_ab_modes[0][0], kk_hb_ab_modes[0][1], kk_hb_ab_modes[0][2]);
+   } else if (now - kk_hb_ab.window_start >= kk_hb_ab.period) {
+      const double secs = now - kk_hb_ab.measure_start;
+      const uint64_t render = __atomic_load_n(&kk_hb_ab_encoders[1], __ATOMIC_RELAXED);
+      const uint64_t compute = __atomic_load_n(&kk_hb_ab_encoders[0], __ATOMIC_RELAXED);
+      if (secs > 0.0 && kk_hb_ab.frames) {
+         const double f = (double)kk_hb_ab.frames;
+         mesa_logi("kk: ab mode=%c secs=%.2f frames=%" PRIu64 " fps=%.1f gpu_ms=%.2f gpu_util=%.1f render_enc=%.1f compute_enc=%.1f",
+                   'A' + kk_hb_ab.mode, secs, kk_hb_ab.frames, f / secs,
+                   kk_hb_ab.busy * 1000.0 / f, kk_hb_ab.busy / secs * 100.0,
+                   (render - kk_hb_ab.encoders[1]) / f, (compute - kk_hb_ab.encoders[0]) / f);
+      }
+      kk_hb_ab.mode = (kk_hb_ab.mode + 1) % ARRAY_SIZE(kk_hb_ab_modes);
+      const int *m = kk_hb_ab_modes[kk_hb_ab.mode];
+      kk_hb_live_force(m[0], m[1], m[2]);
+      kk_hb_ab.window_start = now;
+      kk_hb_ab.measure_start = now + 0.5;
+      kk_hb_ab.busy = 0.0;
+      kk_hb_ab.frames = 0;
+      kk_hb_ab.encoders[0] = compute;
+      kk_hb_ab.encoders[1] = render;
+   } else if (now >= kk_hb_ab.measure_start) {
+      if (kk_hb_ab.frames == 0) {
+         kk_hb_ab.encoders[0] = __atomic_load_n(&kk_hb_ab_encoders[0], __ATOMIC_RELAXED);
+         kk_hb_ab.encoders[1] = __atomic_load_n(&kk_hb_ab_encoders[1], __ATOMIC_RELAXED);
+      }
+      kk_hb_ab.frames++;
+   }
+   simple_mtx_unlock(&kk_hb_ab.lock);
+}
+
 static void
 kk_hb_capture_frame_boundary(struct kk_device *dev)
 {
+   kk_hb_ab_frame();
    static const char *trigger = NULL;
    static bool checked = false;
    static int frames_left = 0;

@@ -71,6 +71,13 @@ struct mtl_size mtl_placement_sparse_tile_size(mtl_device *device,
                                                struct kk_image_layout *layout);
 mtl_texture *mtl_new_placement_sparse_texture(mtl_device *device,
                                               struct kk_image_layout *layout);
+
+/* An ordinary private texture with its own storage (no heap, not sparse) */
+mtl_texture *mtl_new_private_texture(mtl_device *device,
+                                     struct kk_image_layout *layout);
+
+/* An ordinary private buffer with its own storage, which Metal zero-fills */
+mtl_buffer *mtl_new_private_buffer(mtl_device *device, uint64_t size_B);
 mtl_buffer *mtl_new_placement_sparse_buffer(mtl_device *device,
                                             uint64_t size_B);
 

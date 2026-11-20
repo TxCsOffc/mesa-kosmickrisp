@@ -89,6 +89,9 @@ struct kk_queue {
       simple_mtx_t lock;
       bool texture_mapped;
       bool buffer_after_texture;
+      /* Zeroes a backed sparse image when it is unbound (kk_sparse.c) */
+      mtl_buffer *zero_buffer;
+      mtl_command_allocator *zero_allocator;
    } sparse;
 };
 

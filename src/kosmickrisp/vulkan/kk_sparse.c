@@ -134,7 +134,29 @@ kk_image_sparse_init(struct kk_device *dev, struct kk_image *image)
 
    assert(image->plane_count == 1);
 
-   plane->mtl_handle = mtl_new_placement_sparse_texture(dev->mtl_handle, layout);
+   /* Metal (macOS 27.3, M5) gives the first three levels of a placement
+    * sparse block-compressed texture overlapping storage when the base level
+    * is one block wide: whichever of them is written last is what all of them
+    * hold, and the others read back wrong or zero. Such a texture is tiny, so
+    * it gets an ordinary texture with its own storage. It still presents one
+    * page of mip tail to bind: binding it does nothing, and unbinding it
+    * zeroes the texture, as sparseResidencyNonResidentStrict promises. What
+    * it cannot do is share that page's contents with another image bound to
+    * the same memory (sparseResidencyAliased).
+    * HB_KK_SPARSE_SMALL_BC=1 turns this off. */
+   const uint32_t block_w = util_format_get_blockwidth(layout->format.pipe);
+   const char *keep_sparse = getenv("HB_KK_SPARSE_SMALL_BC");
+   sparse->backed = block_w > 1u && layout->width_px <= block_w &&
+                    layout->depth_px == 1u &&
+                    util_format_get_2d_size(layout->format.pipe, 1u,
+                                            layout->height_px) <=
+                       KK_SPARSE_PAGE_SIZE_B &&
+                    !(keep_sparse && keep_sparse[0] == '1');
+
+   plane->mtl_handle =
+      sparse->backed
+         ? mtl_new_private_texture(dev->mtl_handle, layout)
+         : mtl_new_placement_sparse_texture(dev->mtl_handle, layout);
    if (plane->mtl_handle == NULL)
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
@@ -143,12 +165,18 @@ kk_image_sparse_init(struct kk_device *dev, struct kk_image *image)
 
    const uint32_t levels = layout->levels;
    sparse->mtl_tail_level =
-      MIN2(mtl_texture_get_first_mipmap_in_tail(plane->mtl_handle), levels);
+      sparse->backed
+         ? 0u
+         : MIN2(mtl_texture_get_first_mipmap_in_tail(plane->mtl_handle),
+                levels);
    const uint64_t tail_pages =
-      sparse->mtl_tail_level < levels
-         ? DIV_ROUND_UP(mtl_texture_get_tail_size_in_bytes(plane->mtl_handle),
-                        KK_SPARSE_PAGE_SIZE_B)
-         : 0u;
+      sparse->backed
+         ? 1u
+         : sparse->mtl_tail_level < levels
+              ? DIV_ROUND_UP(
+                   mtl_texture_get_tail_size_in_bytes(plane->mtl_handle),
+                   KK_SPARSE_PAGE_SIZE_B)
+              : 0u;
 
    /* The Vulkan mip tail starts at the first level smaller than a tile in any
     * dimension (no ALIGNED_MIP_SIZE). Metal's tail starts at the first level
@@ -666,6 +694,13 @@ kk_queue_sparse_init(struct kk_device *dev, struct kk_queue *queue)
 void
 kk_queue_sparse_finish(struct kk_device *dev, struct kk_queue *queue)
 {
+   if (queue->sparse.zero_buffer) {
+      kk_device_remove_allocation_from_residency_set(
+         dev, queue->sparse.zero_buffer);
+      mtl_release(queue->sparse.zero_buffer);
+   }
+   if (queue->sparse.zero_allocator)
+      mtl_release(queue->sparse.zero_allocator);
    if (queue->sparse.flush_buffer) {
       kk_device_remove_allocation_from_residency_set(
          dev, queue->sparse.flush_buffer);
@@ -732,6 +767,64 @@ kk_sparse_opaque_page_mapping(const struct kk_image_sparse *sparse,
    };
 }
 
+/* Zeroes every level of a backed sparse image (kk_image_sparse_init) with
+ * copies from a zeroed buffer, in order with the queue's other work. */
+static void
+kk_sparse_zero_backed_image(struct kk_queue *queue, struct kk_image *image)
+{
+   struct kk_device *dev = kk_queue_device(queue);
+   const struct kk_image_layout *layout = &image->planes[0].layout;
+   const enum pipe_format format = layout->format.pipe;
+
+   simple_mtx_lock(&queue->sparse.lock);
+   if (queue->sparse.zero_buffer == NULL) {
+      queue->sparse.zero_buffer =
+         mtl_new_private_buffer(dev->mtl_handle, KK_SPARSE_PAGE_SIZE_B);
+      queue->sparse.zero_allocator = mtl_new_command_allocator(dev->mtl_handle);
+      if (queue->sparse.zero_buffer)
+         kk_device_add_allocation_to_residency_set(dev,
+                                                   queue->sparse.zero_buffer);
+      kk_device_make_resources_resident(dev);
+   }
+   if (queue->sparse.zero_buffer == NULL ||
+       queue->sparse.zero_allocator == NULL) {
+      simple_mtx_unlock(&queue->sparse.lock);
+      return;
+   }
+
+   mtl_command_buffer *cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
+   mtl_begin_command_buffer(cmd_buf, queue->sparse.zero_allocator);
+   mtl_compute_encoder *encoder = mtl_new_compute_command_encoder(cmd_buf);
+   for (uint32_t layer = 0u; layer < layout->layers; ++layer) {
+      for (uint32_t level = 0u; level < layout->levels; ++level) {
+         const uint32_t width = u_minify(layout->width_px, level);
+         const uint32_t height = u_minify(layout->height_px, level);
+         const size_t stride_B = util_format_get_stride(format, width);
+         struct mtl_buffer_image_copy copy = {
+            .image_size = {width, height, 1},
+            .buffer = queue->sparse.zero_buffer,
+            .image = image->planes[0].mtl_handle,
+            .buffer_stride_B = stride_B,
+            .buffer_2d_image_size_B =
+               stride_B * util_format_get_nblocksy(format, height),
+            .image_slice = layer,
+            .image_level = level,
+         };
+         mtl_copy_from_buffer_to_texture(encoder, &copy);
+      }
+   }
+   mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+   mtl_end_encoding(encoder);
+   mtl_release(encoder);
+   mtl_end_command_buffer(cmd_buf);
+
+   mtl_commit_options *options = mtl_new_commit_options();
+   mtl_command_queue_commit(queue->mtl_handle, &cmd_buf, 1u, options);
+   mtl_release(options);
+   mtl_release(cmd_buf);
+   simple_mtx_unlock(&queue->sparse.lock);
+}
+
 static void
 kk_sparse_bind_image_opaque(struct kk_queue *queue,
                             const VkSparseImageOpaqueMemoryBindInfo *info,
@@ -739,6 +832,16 @@ kk_sparse_bind_image_opaque(struct kk_queue *queue,
 {
    VK_FROM_HANDLE(kk_image, image, info->image);
    const struct kk_image_sparse *sparse = &image->sparse;
+
+   if (sparse->backed) {
+      for (uint32_t i = 0; i < info->bindCount; ++i) {
+         if (info->pBinds[i].memory == VK_NULL_HANDLE) {
+            kk_sparse_zero_backed_image(queue, image);
+            break;
+         }
+      }
+      return;
+   }
 
    for (uint32_t i = 0; i < info->bindCount; ++i) {
       const VkSparseMemoryBind *bind = &info->pBinds[i];
@@ -774,6 +877,9 @@ kk_sparse_bind_image(struct kk_queue *queue,
 {
    VK_FROM_HANDLE(kk_image, image, info->image);
    const VkExtent3D tile = image->sparse.tile;
+
+   if (image->sparse.backed)
+      return;
 
    for (uint32_t i = 0; i < info->bindCount; ++i) {
       const VkSparseImageMemoryBind *bind = &info->pBinds[i];
