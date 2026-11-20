@@ -32,6 +32,14 @@ mtl_visible_function_table_set(mtl_visible_function_table *table,
    return false;
 }
 
+void
+mtl_compute_pipeline_stats(mtl_compute_pipeline_state *pipeline,
+                           uint32_t *max_threads, uint32_t *execution_width)
+{
+   *max_threads = 0;
+   *execution_width = 0;
+}
+
 uint64_t
 mtl_visible_function_table_resource_id(mtl_visible_function_table *table)
 {

@@ -2079,9 +2079,22 @@ kk_compile_rt_kernel(struct kk_device *device, mtl_compiler *compiler,
    int64_t t0 = os_time_get_nano();
    mtl_compute_pipeline_state *pipeline = mtl_new_compute_pipeline_state_linked(
       compiler, function, local_size_threads, link->functions, link->count);
-   fprintf(stderr, "kk rt: linked kernel with %u functions in %.1f ms%s\n",
+   uint32_t max_threads = 0, width = 0;
+   if (pipeline)
+      mtl_compute_pipeline_stats(pipeline, &max_threads, &width);
+   if (pipeline && debug_get_bool_option("HB_KK_RT_PROBE_THREADS", false)) {
+      mtl_compute_pipeline_state *probe = mtl_new_compute_pipeline_state_linked(
+         compiler, function, 1024, link->functions, link->count);
+      if (probe) {
+         mtl_compute_pipeline_stats(probe, &max_threads, &width);
+         mtl_release(probe);
+      }
+   }
+   fprintf(stderr,
+           "kk rt: linked kernel with %u functions in %.1f ms%s, max threads "
+           "%u, simd %u, msl %zu bytes\n",
            link->count, (os_time_get_nano() - t0) / 1e6,
-           pipeline ? "" : " (failed)");
+           pipeline ? "" : " (failed)", max_threads, width, strlen(data->code));
    mtl_release(function);
    mtl_release(library);
    if (pipeline == NULL)

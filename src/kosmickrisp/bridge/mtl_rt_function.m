@@ -98,6 +98,15 @@ mtl_visible_function_table_set(mtl_visible_function_table *table,
    }
 }
 
+void
+mtl_compute_pipeline_stats(mtl_compute_pipeline_state *pipeline,
+                           uint32_t *max_threads, uint32_t *execution_width)
+{
+   id<MTLComputePipelineState> pso = (id<MTLComputePipelineState>)pipeline;
+   *max_threads = (uint32_t)pso.maxTotalThreadsPerThreadgroup;
+   *execution_width = (uint32_t)pso.threadExecutionWidth;
+}
+
 uint64_t
 mtl_visible_function_table_resource_id(mtl_visible_function_table *table)
 {

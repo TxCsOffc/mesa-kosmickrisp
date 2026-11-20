@@ -31,6 +31,10 @@ bool mtl_visible_function_table_set(mtl_visible_function_table *table,
 
 uint64_t mtl_visible_function_table_resource_id(mtl_visible_function_table *table);
 
+void mtl_compute_pipeline_stats(mtl_compute_pipeline_state *pipeline,
+                                uint32_t *max_threads,
+                                uint32_t *execution_width);
+
 void mtl_set_resource_id(mtl_argument_table *table, uint64_t resource_id,
                          uint32_t binding);
 
