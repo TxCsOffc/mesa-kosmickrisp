@@ -798,8 +798,12 @@ kk_rt_lower_trace(nir_builder *b, const struct kk_rt_kernel_vars *v,
    nir_def *debug_flags = kk_rt_load_dispatch(
       b, offsetof(struct kk_rt_dispatch, debug_flags), 1, 32);
 
-   nir_rq_initialize(b, &nir_build_deref_var(b, v->rq)->def, as, flags, cull,
-                     origin, tmin, dir, tmax);
+   nir_def *rq_flags = nir_bcsel(b, nir_test_mask(b, debug_flags, 16),
+                                 nir_ior_imm(b, flags, 0x1), flags);
+   nir_def *rq_tmax = nir_bcsel(b, nir_test_mask(b, debug_flags, 8),
+                                nir_fneg(b, nir_imm_float(b, 1.0f)), tmax);
+   nir_rq_initialize(b, &nir_build_deref_var(b, v->rq)->def, as, rq_flags,
+                     cull, origin, tmin, dir, rq_tmax);
 
    nir_push_loop(b);
    {
