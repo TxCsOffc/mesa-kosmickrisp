@@ -38,6 +38,7 @@ struct kk_rt_dispatch {
 struct kk_rt_stage {
    nir_shader *nir;
    uint32_t payload_size;
+   unsigned char hash[32];
 };
 
 struct kk_rt_group {
@@ -266,6 +267,7 @@ kk_rt_process_stage(struct kk_device *dev, VkPipelineCreateFlags2KHR flags,
                                      pipeline_pnext, info->pNext);
 
    mesa_shader_stage stage = vk_to_mesa_shader_stage(info->stage);
+   vk_pipeline_hash_shader_stage(flags, info, &rs, out->hash);
    const struct nir_shader_compiler_options *nir_options =
       ops->get_nir_options(dev->vk.physical, stage, &rs);
    struct spirv_to_nir_options spirv_options =
@@ -478,45 +480,90 @@ kk_rt_inline_stage(nir_builder *b, struct kk_rt_builder *rb,
    _mesa_hash_table_destroy(remap, NULL);
 }
 
+static uint32_t
+kk_rt_group_stage(const struct kk_rt_pipeline *p, const struct kk_rt_group *g,
+                  enum kk_rt_role role)
+{
+   uint32_t index = VK_SHADER_UNUSED_KHR;
+   mesa_shader_stage want = MESA_SHADER_NONE;
+   switch (role) {
+   case KK_RT_ROLE_RAYGEN:
+      index = g->general;
+      want = MESA_SHADER_RAYGEN;
+      break;
+   case KK_RT_ROLE_MISS:
+      index = g->general;
+      want = MESA_SHADER_MISS;
+      break;
+   case KK_RT_ROLE_ANY_HIT:
+      if (g->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
+         index = g->any_hit;
+      want = MESA_SHADER_ANY_HIT;
+      break;
+   case KK_RT_ROLE_CLOSEST_HIT:
+      if (g->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
+         index = g->closest_hit;
+      want = MESA_SHADER_CLOSEST_HIT;
+      break;
+   }
+   if (index == VK_SHADER_UNUSED_KHR || index >= p->stage_count ||
+       p->stages[index].nir->info.stage != want)
+      return VK_SHADER_UNUSED_KHR;
+   return index;
+}
+
+static uint32_t
+kk_rt_count_unique(const struct kk_rt_pipeline *p, enum kk_rt_role role)
+{
+   uint32_t n = 0;
+   for (uint32_t i = 0; i < p->group_count; i++) {
+      uint32_t si = kk_rt_group_stage(p, &p->groups[i], role);
+      if (si == VK_SHADER_UNUSED_KHR)
+         continue;
+      bool seen = false;
+      for (uint32_t j = 0; j < i && !seen; j++) {
+         uint32_t sj = kk_rt_group_stage(p, &p->groups[j], role);
+         seen = sj != VK_SHADER_UNUSED_KHR &&
+                !memcmp(p->stages[si].hash, p->stages[sj].hash, 32);
+      }
+      n += !seen;
+   }
+   return n;
+}
+
 static void
 kk_rt_dispatch_groups(nir_builder *b, struct kk_rt_builder *rb,
                       nir_def *handle, enum kk_rt_role role)
 {
    struct kk_rt_pipeline *p = rb->pipeline;
+   bool *done = calloc(MAX2(p->group_count, 1), sizeof(bool));
+   if (!done)
+      return;
+
    for (uint32_t i = 0; i < p->group_count; i++) {
-      const struct kk_rt_group *g = &p->groups[i];
-      uint32_t index = VK_SHADER_UNUSED_KHR;
-      mesa_shader_stage want = MESA_SHADER_NONE;
-      switch (role) {
-      case KK_RT_ROLE_RAYGEN:
-         index = g->general;
-         want = MESA_SHADER_RAYGEN;
-         break;
-      case KK_RT_ROLE_MISS:
-         index = g->general;
-         want = MESA_SHADER_MISS;
-         break;
-      case KK_RT_ROLE_ANY_HIT:
-         if (g->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
-            index = g->any_hit;
-         want = MESA_SHADER_ANY_HIT;
-         break;
-      case KK_RT_ROLE_CLOSEST_HIT:
-         if (g->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
-            index = g->closest_hit;
-         want = MESA_SHADER_CLOSEST_HIT;
-         break;
-      }
-      if (index == VK_SHADER_UNUSED_KHR || index >= p->stage_count)
+      if (done[i])
          continue;
-      const struct kk_rt_stage *stage = &p->stages[index];
-      if (stage->nir->info.stage != want)
+      uint32_t si = kk_rt_group_stage(p, &p->groups[i], role);
+      if (si == VK_SHADER_UNUSED_KHR)
          continue;
 
-      nir_push_if(b, nir_ieq_imm(b, handle, g->handle));
-      kk_rt_inline_stage(b, rb, stage, role);
+      nir_def *cond = nir_ieq_imm(b, handle, p->groups[i].handle);
+      for (uint32_t j = i + 1; j < p->group_count; j++) {
+         if (done[j])
+            continue;
+         uint32_t sj = kk_rt_group_stage(p, &p->groups[j], role);
+         if (sj == VK_SHADER_UNUSED_KHR ||
+             memcmp(p->stages[si].hash, p->stages[sj].hash, 32))
+            continue;
+         done[j] = true;
+         cond = nir_ior(b, cond, nir_ieq_imm(b, handle, p->groups[j].handle));
+      }
+
+      nir_push_if(b, cond);
+      kk_rt_inline_stage(b, rb, &p->stages[si], role);
       nir_pop_if(b, NULL);
    }
+   free(done);
 }
 
 static nir_def *
@@ -714,6 +761,15 @@ kk_rt_build_shader(struct kk_device *dev, struct kk_rt_pipeline *p,
             util_dynarray_append(&traces, nir_instr_as_intrinsic(instr));
       }
    }
+   fprintf(stderr,
+           "kk rt: pipeline stages=%u groups=%u traces=%u unique raygen=%u "
+           "miss=%u chit=%u ahit=%u payload=%u\n",
+           p->stage_count, p->group_count,
+           (unsigned)util_dynarray_num_elements(&traces, nir_intrinsic_instr *),
+           kk_rt_count_unique(p, KK_RT_ROLE_RAYGEN),
+           kk_rt_count_unique(p, KK_RT_ROLE_MISS),
+           kk_rt_count_unique(p, KK_RT_ROLE_CLOSEST_HIT),
+           kk_rt_count_unique(p, KK_RT_ROLE_ANY_HIT), payload);
    util_dynarray_foreach(&traces, nir_intrinsic_instr *, it)
       kk_rt_lower_trace(&b, &rb, *it);
    util_dynarray_fini(&traces);
@@ -860,6 +916,8 @@ kk_rt_pipeline_create(struct kk_device *dev,
          p->stages[stage_base + i].nir =
             nir_shader_clone(p->mem_ctx, lib->stages[i].nir);
          p->stages[stage_base + i].payload_size = lib->stages[i].payload_size;
+         memcpy(p->stages[stage_base + i].hash, lib->stages[i].hash,
+                sizeof(lib->stages[i].hash));
       }
       for (uint32_t i = 0; i < lib->group_count; i++) {
          struct kk_rt_group g = lib->groups[i];
