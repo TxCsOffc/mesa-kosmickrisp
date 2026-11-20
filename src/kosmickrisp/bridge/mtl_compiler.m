@@ -215,6 +215,7 @@ mtl_new_library(mtl_compiler *compiler, const char *src,
       opts.languageVersion = (MTLLanguageVersion)msl_version;
       opts.mathMode = (MTLMathMode)math_mode;
       opts.mathFloatingPointFunctions = (MTLMathFloatingPointFunctions)math_fp_fns;
+      opts.preserveInvariance = strstr(src, "[[position, invariant]]") != NULL;
 
       MTL4LibraryDescriptor *desc = [[MTL4LibraryDescriptor new] autorelease];
       desc.source = ns_src;

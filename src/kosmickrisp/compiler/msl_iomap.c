@@ -173,6 +173,9 @@ vs_output_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
 {
    P(ctx, "struct %s {\n", VERTEX_OUTPUT_TYPE);
    ctx->indentlevel++;
+   nir_variable *pos_var = nir_find_variable_with_location(
+      shader, nir_var_shader_out, VARYING_SLOT_POS);
+   const bool invariant_pos = pos_var && pos_var->data.invariant;
    u_foreach_bit64(location, shader->info.outputs_written) {
       struct io_slot_info info = ctx->outputs_info[location];
       bool scalarized = VARYING_SLOT_INFO[location].scalarized;
@@ -184,7 +187,11 @@ vs_output_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
          P_IND(ctx, "%s%s ", type, vector_suffix);
          varying_slot_name(ctx, location, c);
          P(ctx, " ");
-         varying_slot_semantic(ctx, location, c);
+         if (location == VARYING_SLOT_POS && invariant_pos) {
+            P(ctx, "[[position, invariant]]");
+         } else {
+            varying_slot_semantic(ctx, location, c);
+         }
          P(ctx, ";\n");
       }
    }

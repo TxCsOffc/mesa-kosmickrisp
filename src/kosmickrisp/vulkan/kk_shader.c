@@ -880,6 +880,13 @@ kk_fs_needs_forced_depth_write(const nir_shader *nir,
                                        indices_known);
 }
 
+static bool
+kk_can_remove_io_var(nir_variable *var, void *data)
+{
+   return !(var->data.mode == nir_var_shader_out &&
+            var->data.location == VARYING_SLOT_POS && var->data.invariant);
+}
+
 static void
 kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
              const struct vk_pipeline_robustness_state *rs,
@@ -976,9 +983,12 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
 
    NIR_PASS(_, nir, nir_opt_dce);
    NIR_PASS(_, nir, nir_lower_variable_initializers, ~nir_var_function_temp);
+   const nir_remove_dead_variables_options dead_io_options = {
+      .can_remove_var = kk_can_remove_io_var,
+   };
    NIR_PASS(_, nir, nir_remove_dead_variables,
             nir_var_shader_in | nir_var_shader_out | nir_var_system_value,
-            NULL);
+            &dead_io_options);
    nir->info.io_lowered = true;
 
    /* Required before kk_nir_lower_vbo so load_input intrinsics' parents are
