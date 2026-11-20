@@ -434,15 +434,17 @@ enum kk_hb_live_switch {
    KK_HB_LIVE_RT_NOTRACE,
    KK_HB_LIVE_RT_OPAQUE,
    KK_HB_LIVE_RT_NOCALLS,
+   KK_HB_LIVE_RT_LABEL,
    KK_HB_LIVE_COUNT,
 };
 
 static const char *const kk_hb_live_names[KK_HB_LIVE_COUNT] = {
    "keep_empty", "no_resume_merge", "no_begin_merge",
    "rt_skip", "rt_noahit", "rt_nochit", "rt_notrace", "rt_opaque", "rt_nocalls",
+   "rt_label",
 };
 
-static int kk_hb_live_values[KK_HB_LIVE_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+static int kk_hb_live_values[KK_HB_LIVE_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
 static int kk_hb_live_forced;
 uint64_t kk_hb_ab_encoders[2];
 
@@ -482,7 +484,7 @@ kk_hb_live_refresh(void)
    if (stat(path, &st) == 0)
       mtime = (int64_t)st.st_mtimespec.tv_sec * 1000000000ll + st.st_mtimespec.tv_nsec;
    if (mtime != kk_hb_live_mtime) {
-      int values[KK_HB_LIVE_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+      int values[KK_HB_LIVE_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
       FILE *f = mtime >= 0 ? fopen(path, "r") : NULL;
       if (f) {
          char word[64];
@@ -503,9 +505,9 @@ kk_hb_live_refresh(void)
       kk_hb_live_mtime = mtime;
       mesa_logi("kk: live switches keep_empty=%d no_resume_merge=%d no_begin_merge=%d "
                 "rt_skip=%d rt_noahit=%d rt_nochit=%d rt_notrace=%d rt_opaque=%d "
-                "rt_nocalls=%d",
+                "rt_nocalls=%d rt_label=%d",
                 values[0], values[1], values[2], values[3], values[4], values[5],
-                values[6], values[7], values[8]);
+                values[6], values[7], values[8], values[9]);
    }
    p_atomic_set(&kk_hb_live_busy, 0);
 }
@@ -526,7 +528,8 @@ kk_hb_rt_live_flags(void)
           (kk_hb_live(KK_HB_LIVE_RT_NOCHIT, false) ? 4u : 0u) |
           (kk_hb_live(KK_HB_LIVE_RT_NOTRACE, false) ? 8u : 0u) |
           (kk_hb_live(KK_HB_LIVE_RT_OPAQUE, false) ? 16u : 0u) |
-          (kk_hb_live(KK_HB_LIVE_RT_NOCALLS, false) ? 32u : 0u);
+          (kk_hb_live(KK_HB_LIVE_RT_NOCALLS, false) ? 32u : 0u) |
+          (kk_hb_live(KK_HB_LIVE_RT_LABEL, false) ? 64u : 0u);
 }
 
 bool

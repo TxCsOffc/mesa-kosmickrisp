@@ -1460,8 +1460,14 @@ kk_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
    desc->root.cs.rt_params = params.gpu;
    desc->root_dirty = true;
 
+   if (live & 64u) {
+      cs_end(cmd);
+      mtl_encoder_set_label(cs_get_compute(cmd), "kk rt trace");
+   }
    kk_CmdDispatchBase(commandBuffer, 0, 0, 0, DIV_ROUND_UP(width, 8),
                       DIV_ROUND_UP(height, 8), depth);
+   if (live & 64u)
+      cs_end(cmd);
 
    memcpy(&cmd->state.rt.descriptors, &cmd->state.cs.descriptors,
           sizeof(*saved));
