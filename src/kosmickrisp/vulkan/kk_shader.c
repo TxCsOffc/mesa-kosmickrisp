@@ -1997,6 +1997,32 @@ kk_metal_caches_finish(struct kk_device *dev)
    kk_metal_cache_finish(&dev->msl_libraries);
 }
 
+/* HB_KK_MATH=safe|relaxed|fast (default fast) and HB_KK_MATH_FUNCTIONS=precise
+ * pick the Metal math mode of graphics and compute libraries. */
+static enum mtl_math_mode
+kk_hb_math_mode(void)
+{
+   static int mode = -1;
+   if (mode < 0) {
+      const char *env = getenv("HB_KK_MATH");
+      mode = env && !strcmp(env, "safe")      ? MTL_MATH_MODE_SAFE
+             : env && !strcmp(env, "relaxed") ? MTL_MATH_MODE_RELAXED
+                                              : MTL_MATH_MODE_FAST;
+      if (env)
+         mesa_logi("kk: math mode %s", env);
+   }
+   return mode;
+}
+
+static enum mtl_math_floating_point_functions
+kk_hb_math_functions(void)
+{
+   const char *env = getenv("HB_KK_MATH_FUNCTIONS");
+   return env && !strcmp(env, "precise")
+             ? MTL_MATH_FLOATING_POINT_FUNCTIONS_PRECISE
+             : MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST;
+}
+
 /* The compiled library of an MSL source, from the device's table or compiled
  * into it (kk_device::msl_libraries): a title asks for the same program once
  * per pipeline, and while Metal's own cache answers each request in fractions
@@ -2020,8 +2046,8 @@ kk_get_msl_library(struct kk_device *device, const char *source,
 
    struct kk_physical_device *pdev = kk_device_physical(device);
    library = mtl_new_library(device->mtl_compiler_handle, source,
-                             pdev->info.msl_version, MTL_MATH_MODE_FAST,
-                             MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+                             pdev->info.msl_version, kk_hb_math_mode(),
+                             kk_hb_math_functions());
    /* Takes the key, which this caller no longer owns */
    kk_metal_cache_publish(&device->msl_libraries, key, library);
    return library;
