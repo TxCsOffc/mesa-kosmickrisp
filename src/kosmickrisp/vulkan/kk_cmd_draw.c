@@ -2858,7 +2858,9 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       const mesa_shader_stage vs_stage =
          pre ? (mesa_shader_stage)(util_last_bit(pre) - 1u)
              : MESA_SHADER_VERTEX;
-      if (kk_hb_skip_draw(&cmd->state.gfx.pipe->record,
+      if (cmd->vk.dynamic_graphics_state.ds.depth.test_enable &&
+          cmd->state.gfx.render.depth_att.iview != NULL &&
+          kk_hb_skip_draw(&cmd->state.gfx.pipe->record,
                           vs->msl_data[vs_stage].code,
                           vs->msl_data[MESA_SHADER_FRAGMENT].code))
          return;
