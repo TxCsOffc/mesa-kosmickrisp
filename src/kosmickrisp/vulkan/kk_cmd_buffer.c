@@ -457,7 +457,7 @@ kk_hb_live_force(int keep_empty, int no_resume_merge, int no_begin_merge)
    p_atomic_set(&kk_hb_live_values[KK_HB_LIVE_NO_RESUME_MERGE], no_resume_merge);
    p_atomic_set(&kk_hb_live_values[KK_HB_LIVE_NO_BEGIN_MERGE], no_begin_merge);
 }
-static uint32_t kk_hb_skip_mask, kk_hb_skip_value, kk_hb_skip_epoch;
+static uint32_t kk_hb_skip_mask, kk_hb_skip_value, kk_hb_skip_epoch, kk_hb_skip_filter_bits;
 static int64_t kk_hb_live_next_check;
 static int64_t kk_hb_live_mtime = -1;
 static int kk_hb_live_busy;
@@ -487,7 +487,7 @@ kk_hb_live_refresh(void)
       mtime = (int64_t)st.st_mtimespec.tv_sec * 1000000000ll + st.st_mtimespec.tv_nsec;
    if (mtime != kk_hb_live_mtime) {
       int values[KK_HB_LIVE_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-      uint32_t skip_mask = 0u, skip_value = 0u;
+      uint32_t skip_mask = 0u, skip_value = 0u, skip_filter = 1u;
       FILE *f = mtime >= 0 ? fopen(path, "r") : NULL;
       if (f) {
          char word[64];
@@ -504,17 +504,20 @@ kk_hb_live_refresh(void)
                skip_mask = strtoul(eq + 1, NULL, 0);
             else if (!strcmp(word, "skip_value"))
                skip_value = strtoul(eq + 1, NULL, 0);
+            else if (!strcmp(word, "skip_filter"))
+               skip_filter = strtoul(eq + 1, NULL, 0);
          }
          fclose(f);
       }
       for (unsigned i = 0; i < KK_HB_LIVE_COUNT; i++)
          p_atomic_set(&kk_hb_live_values[i], values[i]);
       p_atomic_set(&kk_hb_skip_value, skip_value);
+      p_atomic_set(&kk_hb_skip_filter_bits, skip_filter);
       p_atomic_set(&kk_hb_skip_mask, skip_mask);
       p_atomic_inc(&kk_hb_skip_epoch);
       if (skip_mask)
-         mesa_logi("kk: live skip of draws with program hash & 0x%08x == 0x%08x",
-                   skip_mask, skip_value);
+         mesa_logi("kk: live skip of draws with program hash & 0x%08x == 0x%08x, filter %u",
+                   skip_mask, skip_value, skip_filter);
       kk_hb_live_mtime = mtime;
       mesa_logi("kk: live switches keep_empty=%d no_resume_merge=%d no_begin_merge=%d "
                 "rt_skip=%d rt_noahit=%d rt_nochit=%d rt_notrace=%d rt_opaque=%d "
@@ -545,15 +548,24 @@ kk_hb_rt_live_flags(void)
           (kk_hb_live(KK_HB_LIVE_RT_LABEL, false) ? 64u : 0u);
 }
 
-/* Live draw bisection (HB_KK_LIVE file: skip_mask=0x.. skip_value=0x..):
+/* Live draw bisection (HB_KK_LIVE file: skip_mask=0x.. skip_value=0x..
+ * skip_filter=N, bits: 1 depth tested draws only, 2 no depth writes only,
+ * 4 depth writes only, 8 blending draws only; default 1):
  * draws whose program hash (its Metal vertex function and FS MSL hashes)
  * matches are dropped. The programs of dropped draws are logged once per
  * skip setting, with their MSL while few of them match. */
+uint32_t
+kk_hb_skip_filter(void)
+{
+   kk_hb_live_refresh();
+   return p_atomic_read(&kk_hb_skip_mask) ? p_atomic_read(&kk_hb_skip_filter_bits)
+                                           : ~0u;
+}
+
 bool
 kk_hb_skip_draw(const struct kk_cb_program *record, const char *vs_msl,
                 const char *fs_msl)
 {
-   kk_hb_live_refresh();
    const uint32_t mask = p_atomic_read(&kk_hb_skip_mask);
    if (mask == 0u)
       return false;

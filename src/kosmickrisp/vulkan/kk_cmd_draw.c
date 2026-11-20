@@ -2858,8 +2858,18 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       const mesa_shader_stage vs_stage =
          pre ? (mesa_shader_stage)(util_last_bit(pre) - 1u)
              : MESA_SHADER_VERTEX;
-      if (cmd->vk.dynamic_graphics_state.ds.depth.test_enable &&
-          cmd->state.gfx.render.depth_att.iview != NULL &&
+      const uint32_t filter = kk_hb_skip_filter();
+      const struct vk_dynamic_graphics_state *hb_dyn =
+         &cmd->vk.dynamic_graphics_state;
+      const bool depth = hb_dyn->ds.depth.test_enable &&
+                         cmd->state.gfx.render.depth_att.iview != NULL;
+      const bool zwrite = depth && hb_dyn->ds.depth.write_enable;
+      bool blend = false;
+      for (uint32_t a = 0; a < hb_dyn->cb.attachment_count; a++)
+         blend |= hb_dyn->cb.attachments[a].blend_enable;
+      if (filter != ~0u && (!(filter & 1u) || depth) &&
+          (!(filter & 2u) || !zwrite) && (!(filter & 4u) || zwrite) &&
+          (!(filter & 8u) || blend) &&
           kk_hb_skip_draw(&cmd->state.gfx.pipe->record,
                           vs->msl_data[vs_stage].code,
                           vs->msl_data[MESA_SHADER_FRAGMENT].code))

@@ -260,6 +260,7 @@ struct kk_encoder;
 struct kk_rt_pipeline;
 uint32_t kk_hb_rt_live_flags(void);
 struct kk_cb_program;
+uint32_t kk_hb_skip_filter(void);
 bool kk_hb_skip_draw(const struct kk_cb_program *record, const char *vs_msl,
                      const char *fs_msl);
 
