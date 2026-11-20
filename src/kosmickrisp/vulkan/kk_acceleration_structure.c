@@ -181,6 +181,7 @@ kk_rt_init(struct kk_device *dev)
    dev->rt.sidecars = _mesa_hash_table_create(NULL, kk_u64_key_hash,
                                               kk_u64_key_equal);
    util_dynarray_init(&dev->rt.sidecar_garbage, NULL);
+   kk_rt_functions_init(dev);
    if (!dev->rt.as_by_id) {
       simple_mtx_destroy(&dev->rt.lock);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -220,6 +221,7 @@ kk_rt_finish(struct kk_device *dev)
    util_dynarray_foreach(&dev->rt.sidecar_garbage, struct kk_bo *, bo)
       kk_destroy_bo(dev, *bo);
    util_dynarray_fini(&dev->rt.sidecar_garbage);
+   kk_rt_functions_finish(dev);
    simple_mtx_destroy(&dev->rt.lock);
 }
 

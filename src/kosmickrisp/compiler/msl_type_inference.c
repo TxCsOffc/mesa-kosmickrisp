@@ -170,6 +170,8 @@ update_instr_type(struct hash_table *types, nir_instr *instr, ti_type type)
       /* Scratch, shared and constant data are always UINT */
       case nir_intrinsic_load_scratch:
       case nir_intrinsic_store_scratch:
+      case nir_intrinsic_load_rt_kk:
+      case nir_intrinsic_store_rt_kk:
       case nir_intrinsic_load_shared:
       case nir_intrinsic_store_shared:
       case nir_intrinsic_load_constant:
@@ -378,12 +380,17 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
       set_type(types, &instr->def, TYPE_NONE);
       break;
    case nir_intrinsic_load_scratch:
+   case nir_intrinsic_load_rt_kk:
    case nir_intrinsic_load_shared:
    case nir_intrinsic_load_constant:
       set_type(types, &instr->def, TYPE_UINT);
       set_type(types, &instr->src[0], TYPE_UINT);
       break;
+   case nir_intrinsic_rt_call_kk:
+      set_type(types, &instr->src[0], TYPE_UINT);
+      break;
    case nir_intrinsic_store_scratch:
+   case nir_intrinsic_store_rt_kk:
    case nir_intrinsic_store_shared:
       set_type(types, &instr->src[0], TYPE_UINT);
       set_type(types, &instr->src[1], TYPE_UINT);

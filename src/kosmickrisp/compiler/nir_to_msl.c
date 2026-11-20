@@ -124,6 +124,10 @@ emit_inputs(struct nir_to_msl_ctx *ctx, nir_shader *shader)
    }
    P_IND(ctx, "constant Buffer &buf0 [[buffer(0)]],\n");
    P_IND(ctx, "constant SamplerTable &sampler_table [[buffer(1)]]");
+   if (ctx->rt_calls) {
+      P(ctx, ",\n");
+      P_IND(ctx, "visible_function_table<kk_rt_fn_t> kk_rt_fns [[buffer(3)]]");
+   }
    if (ctx->uses_per_draw_data) {
       P(ctx, ",\n");
       P_IND(ctx, "constant Buffer &per_draw [[buffer(2)]]\n");
@@ -483,6 +487,7 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
       alu_funclike_precise(ctx, instr, "floor");
       break;
    case nir_op_ffma:
+   case nir_op_ffma_weak:
       alu_funclike_precise(ctx, instr, "fma");
       break;
    case nir_op_ffract:
@@ -1941,6 +1946,31 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
         msl_type_for_def(ctx->types, &instr->def));
       src_to_msl(ctx, &instr->src[0]);
       P(ctx, "];\n");
+      break;
+   case nir_intrinsic_load_rt_kk:
+      P(ctx, "*(thread %s*)&kk_rt[",
+        msl_type_for_def(ctx->types, &instr->def));
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, "];\n");
+      break;
+   case nir_intrinsic_store_rt_kk:
+      P_IND(ctx, "(*(thread %s*)&kk_rt[",
+            msl_type_for_src(ctx->types, &instr->src[0]));
+      src_to_msl(ctx, &instr->src[1]);
+      P(ctx, "])");
+      writemask_to_msl(ctx, nir_intrinsic_write_mask(instr),
+                       instr->num_components);
+      P(ctx, " = ");
+      src_to_msl(ctx, &instr->src[0]);
+      if (instr->src[0].ssa->num_components > 1)
+         writemask_to_msl(ctx, nir_intrinsic_write_mask(instr),
+                          instr->num_components);
+      P(ctx, ";\n");
+      break;
+   case nir_intrinsic_rt_call_kk:
+      P_IND(ctx, "kk_rt_fns[");
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, "](kk_rt, buf0, sampler_table);\n");
       break;
    case nir_intrinsic_store_scratch:
       P_IND(ctx, "(*(thread %s*)&scratch[",
@@ -3473,18 +3503,43 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
    msl_emit_constant_data(&ctx, shader);
 
    msl_emit_io_blocks(&ctx, shader);
+   ctx.rt_function_name = options->rt_function_name;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_rt_call_kk)
+            ctx.rt_calls = true;
+         if (intr->intrinsic == nir_intrinsic_load_rt_kk ||
+             intr->intrinsic == nir_intrinsic_store_rt_kk)
+            ctx.rt_block_size =
+               MAX2(ctx.rt_block_size, nir_intrinsic_range(intr));
+      }
+   }
+   if (ctx.rt_calls || ctx.rt_block_size || ctx.rt_function_name)
+      P(&ctx, "typedef void kk_rt_fn_t(thread uchar *, constant Buffer &, "
+              "constant SamplerTable &);\n");
    if (shader->info.stage == MESA_SHADER_FRAGMENT &&
        shader->info.fs.early_fragment_tests)
       P(&ctx, "[[early_fragment_tests]]\n");
-   P(&ctx, "%s %s %s(\n", get_stage_string(shader->info.stage),
-     output_type(shader), get_entrypoint_name(shader));
-   ctx.indentlevel++;
-   emit_sysvals(&ctx, shader);
-   emit_inputs(&ctx, shader);
-   ctx.indentlevel--;
-   P(&ctx, ")\n");
+   if (ctx.rt_function_name) {
+      P(&ctx, "[[visible]] void %s(thread uchar *kk_rt, constant Buffer &buf0, "
+              "constant SamplerTable &sampler_table)\n",
+        ctx.rt_function_name);
+   } else {
+      P(&ctx, "%s %s %s(\n", get_stage_string(shader->info.stage),
+        output_type(shader), get_entrypoint_name(shader));
+      ctx.indentlevel++;
+      emit_sysvals(&ctx, shader);
+      emit_inputs(&ctx, shader);
+      ctx.indentlevel--;
+      P(&ctx, ")\n");
+   }
    P(&ctx, "{\n");
    ctx.indentlevel++;
+   if (!ctx.rt_function_name && ctx.rt_block_size)
+      P_IND(&ctx, "uchar kk_rt[%u];\n", ctx.rt_block_size);
    msl_emit_output_var(&ctx, shader);
    emit_local_vars(&ctx, shader);
    if (uses_ray_query)

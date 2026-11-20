@@ -32,6 +32,8 @@ struct nir_to_msl_options {
     * the render target has. This leads to an incorrect calculation of the
     * component count for the render target formats. */
    uint8_t rts_component_count[MAX_DRAW_BUFFERS];
+
+   const char *rt_function_name;
 };
 
 /* Assumes nir_shader_gather_info has been called beforehand. */

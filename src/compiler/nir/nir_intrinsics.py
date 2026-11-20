@@ -3333,6 +3333,9 @@ intrinsic("load_sampler_state_kk", [1], 0, [BASE],
           flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[16, 32])
 # Texture fence to ensure writes.
 image("fence_kk")
+load("rt_kk", [1], [RANGE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
+store("rt_kk", [1], [RANGE, ALIGN_MUL, ALIGN_OFFSET, WRITE_MASK])
+intrinsic("rt_call_kk", src_comp=[1])
 # Store clip distance to vertex output.
 store("clip_distance_kk", [], [BASE])
 # System value indicating whether to emulate depth clamp.

@@ -43,6 +43,8 @@ kk_flush_compute_state(struct kk_cmd_buffer *cmd, struct kk_dispatch_record *sha
       return false;
 
    mtl_compute_set_pipeline_state(encoder, pipe->cs);
+   if (pipe->rt_table)
+      mtl_set_resource_id(cmd->argument_table, pipe->rt_table_id, 3u);
    kk_cb_record_program(&cmd->record, &pipe->record);
    kk_cb_record_count(&cmd->record.dispatches);
    const struct mtl_size local = cmd->state.shaders[MESA_SHADER_COMPUTE]->info.cs.local_size;

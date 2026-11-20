@@ -11,6 +11,7 @@ mtl_bridge_files = files(
 if host_machine.system() == 'darwin'
   mtl_bridge_files += files(
     'mtl_acceleration_structure.m',
+    'mtl_rt_function.m',
     'mtl_argument_table.m',
     'mtl_bridge.m',
     'mtl_buffer.m',
@@ -31,6 +32,7 @@ if host_machine.system() == 'darwin'
 else
   mtl_bridge_files += files(
     'stubs/mtl_acceleration_structure.c',
+    'stubs/mtl_rt_function.c',
     'stubs/mtl_argument_table.c',
     'stubs/mtl_bridge.c',
     'stubs/mtl_buffer.c',

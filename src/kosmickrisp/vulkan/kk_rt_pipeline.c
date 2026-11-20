@@ -1,8 +1,12 @@
+#include "kk_acceleration_structure.h"
 #include "kk_cmd_buffer.h"
 #include "kk_device.h"
 #include "kk_entrypoints.h"
 #include "kk_physical_device.h"
+#include "kk_rt_link.h"
 #include "kk_shader.h"
+
+#include "kosmickrisp/bridge/mtl_bridge.h"
 
 #include "nir.h"
 #include "nir_builder.h"
@@ -12,19 +16,59 @@
 #include "util/mesa-blake3.h"
 
 #include "util/hash_table.h"
-#include "util/u_debug.h"
+#include "util/os_time.h"
 #include "util/ralloc.h"
 #include "util/u_atomic.h"
+#include "util/u_debug.h"
+#include "util/u_dynarray.h"
 
 #include "vk_alloc.h"
+#include "vk_descriptor_set_layout.h"
 #include "vk_pipeline.h"
 #include "vk_pipeline_layout.h"
 #include "vk_shader.h"
 #include "vk_shader_module.h"
 
 #define KK_RT_HANDLE_SIZE  32u
-#define KK_RT_ATTRIB_SIZE  32u
-#define KK_RT_PAYLOAD_BASE KK_RT_ATTRIB_SIZE
+#define KK_RT_STATE_BASE   32u
+#define KK_RT_STATE_SIZE   288u
+#define KK_RT_PAYLOAD_BASE (KK_RT_STATE_BASE + KK_RT_STATE_SIZE)
+
+enum kk_rt_state_offset {
+   KK_RT_S_LAUNCH_ID = 0,
+   KK_RT_S_LAUNCH_SIZE = 16,
+   KK_RT_S_FLAGS = 28,
+   KK_RT_S_CULL = 32,
+   KK_RT_S_TMIN = 36,
+   KK_RT_S_TMAX = 40,
+   KK_RT_S_PAYLOAD = 44,
+   KK_RT_S_RECORD = 48,
+   KK_RT_S_CUSTOM = 56,
+   KK_RT_S_INSTANCE = 60,
+   KK_RT_S_PRIMITIVE = 64,
+   KK_RT_S_GEOMETRY = 68,
+   KK_RT_S_HIT_KIND = 72,
+   KK_RT_S_ACCEPT = 76,
+   KK_RT_S_TERMINATE = 80,
+   KK_RT_S_WORLD_ORIGIN = 96,
+   KK_RT_S_WORLD_DIR = 112,
+   KK_RT_S_OBJECT_ORIGIN = 128,
+   KK_RT_S_OBJECT_DIR = 144,
+   KK_RT_S_O2W = 160,
+   KK_RT_S_W2O = 224,
+};
+
+enum kk_rt_needs {
+   KK_RT_NEED_CUSTOM = 1u << 0,
+   KK_RT_NEED_INSTANCE = 1u << 1,
+   KK_RT_NEED_PRIMITIVE = 1u << 2,
+   KK_RT_NEED_GEOMETRY = 1u << 3,
+   KK_RT_NEED_HIT_KIND = 1u << 4,
+   KK_RT_NEED_OBJECT_ORIGIN = 1u << 5,
+   KK_RT_NEED_OBJECT_DIR = 1u << 6,
+   KK_RT_NEED_O2W = 1u << 7,
+   KK_RT_NEED_W2O = 1u << 8,
+};
 
 struct kk_rt_dispatch {
    uint64_t raygen_addr;
@@ -45,6 +89,13 @@ struct kk_rt_stage {
    unsigned char hash[32];
 };
 
+enum kk_rt_role {
+   KK_RT_ROLE_RAYGEN,
+   KK_RT_ROLE_ANY_HIT,
+   KK_RT_ROLE_CLOSEST_HIT,
+   KK_RT_ROLE_MISS,
+};
+
 struct kk_rt_group {
    VkRayTracingShaderGroupTypeKHR type;
    uint32_t general;
@@ -52,6 +103,8 @@ struct kk_rt_group {
    uint32_t any_hit;
    uint32_t intersection;
    uint32_t handle;
+   uint32_t fn[3];
+   uint32_t needs[3];
 };
 
 struct kk_rt_pipeline {
@@ -65,74 +118,63 @@ struct kk_rt_pipeline {
    struct vk_shader *cs;
 };
 
-enum kk_rt_role {
-   KK_RT_ROLE_RAYGEN,
-   KK_RT_ROLE_ANY_HIT,
-   KK_RT_ROLE_CLOSEST_HIT,
-   KK_RT_ROLE_MISS,
-};
-
-struct kk_rt_vars {
-   nir_variable *rq;
-   nir_variable *flags;
-   nir_variable *cull_mask;
-   nir_variable *sbt_offset;
-   nir_variable *sbt_stride;
-   nir_variable *miss_index;
-   nir_variable *origin;
-   nir_variable *dir;
-   nir_variable *tmin;
-   nir_variable *tmax;
-   nir_variable *record;
-   nir_variable *payload_off;
-   nir_variable *accept;
-   nir_variable *terminate;
+struct kk_rt_function {
+   unsigned char key[32];
+   uint32_t index;
+   uint32_t needs;
+   mtl_binary_function *fn;
 };
 
 static uint32_t kk_rt_next_handle = 0;
+static __thread struct kk_rt_link *kk_rt_pending_link;
 
-static void
-kk_rt_create_vars(nir_shader *s, struct kk_rt_vars *v)
+void
+kk_rt_set_pending_link(struct kk_rt_link *link)
 {
-   v->rq = nir_variable_create(s, nir_var_shader_temp, glsl_uint64_t_type(),
-                               "kk_rt_rq");
-   v->rq->data.ray_query = true;
-   v->flags = nir_variable_create(s, nir_var_shader_temp, glsl_uint_type(),
-                                  "kk_rt_flags");
-   v->cull_mask = nir_variable_create(s, nir_var_shader_temp, glsl_uint_type(),
-                                      "kk_rt_cull_mask");
-   v->sbt_offset = nir_variable_create(s, nir_var_shader_temp,
-                                       glsl_uint_type(), "kk_rt_sbt_offset");
-   v->sbt_stride = nir_variable_create(s, nir_var_shader_temp,
-                                       glsl_uint_type(), "kk_rt_sbt_stride");
-   v->miss_index = nir_variable_create(s, nir_var_shader_temp,
-                                       glsl_uint_type(), "kk_rt_miss_index");
-   v->origin = nir_variable_create(s, nir_var_shader_temp, glsl_vec_type(3),
-                                   "kk_rt_origin");
-   v->dir = nir_variable_create(s, nir_var_shader_temp, glsl_vec_type(3),
-                                "kk_rt_dir");
-   v->tmin = nir_variable_create(s, nir_var_shader_temp, glsl_float_type(),
-                                 "kk_rt_tmin");
-   v->tmax = nir_variable_create(s, nir_var_shader_temp, glsl_float_type(),
-                                 "kk_rt_tmax");
-   v->record = nir_variable_create(s, nir_var_shader_temp,
-                                   glsl_uint64_t_type(), "kk_rt_record");
-   v->payload_off = nir_variable_create(s, nir_var_shader_temp,
-                                        glsl_uint_type(), "kk_rt_payload_off");
-   v->accept = nir_variable_create(s, nir_var_shader_temp, glsl_bool_type(),
-                                   "kk_rt_accept");
-   v->terminate = nir_variable_create(s, nir_var_shader_temp,
-                                      glsl_bool_type(), "kk_rt_terminate");
+   kk_rt_pending_link = link;
 }
 
-static void
-kk_rt_remap_vars(struct hash_table *remap, const struct kk_rt_vars *from,
-                 const struct kk_rt_vars *to)
+struct kk_rt_link *
+kk_rt_get_pending_link(void)
 {
-   const nir_variable *const *f = (const nir_variable *const *)from;
-   nir_variable *const *t = (nir_variable *const *)to;
-   for (unsigned i = 0; i < sizeof(*from) / sizeof(nir_variable *); i++)
-      _mesa_hash_table_insert(remap, f[i], t[i]);
+   return kk_rt_pending_link;
+}
+
+static uint32_t
+kk_rt_key_hash(const void *key)
+{
+   uint32_t h;
+   memcpy(&h, key, sizeof(h));
+   return h;
+}
+
+static bool
+kk_rt_key_equal(const void *a, const void *b)
+{
+   return !memcmp(a, b, 32);
+}
+
+void
+kk_rt_functions_init(struct kk_device *dev)
+{
+   simple_mtx_init(&dev->rt.fn_lock, mtx_plain);
+   dev->rt.functions =
+      _mesa_hash_table_create(NULL, kk_rt_key_hash, kk_rt_key_equal);
+   util_dynarray_init(&dev->rt.function_list, NULL);
+}
+
+void
+kk_rt_functions_finish(struct kk_device *dev)
+{
+   util_dynarray_foreach(&dev->rt.function_list, struct kk_rt_function *, f) {
+      mtl_release((*f)->fn);
+      free(*f);
+   }
+   util_dynarray_fini(&dev->rt.function_list);
+   if (dev->rt.functions)
+      _mesa_hash_table_destroy(dev->rt.functions, NULL);
+   dev->rt.functions = NULL;
+   simple_mtx_destroy(&dev->rt.fn_lock);
 }
 
 static nir_def *
@@ -146,23 +188,37 @@ kk_rt_load_dispatch(nir_builder *b, unsigned offset, unsigned comps,
 }
 
 static nir_def *
-kk_rt_scratch_load(nir_builder *b, unsigned comps, unsigned bit_size,
-                   nir_def *offset)
+kk_rt_block_load(nir_builder *b, unsigned comps, unsigned bit_size,
+                 nir_def *offset)
 {
    if (bit_size == 1)
-      return nir_ine_imm(b, nir_load_scratch(b, comps, 32, offset), 0);
-   return nir_load_scratch(b, comps, bit_size, offset,
-                           .align_mul = bit_size / 8);
+      return nir_ine_imm(b, nir_load_rt_kk(b, comps, 32, offset, .align_mul = 4), 0);
+   return nir_load_rt_kk(b, comps, bit_size, offset, .align_mul = bit_size / 8);
 }
 
 static void
-kk_rt_scratch_store(nir_builder *b, nir_def *value, nir_def *offset,
-                    unsigned write_mask)
+kk_rt_block_store(nir_builder *b, nir_def *value, nir_def *offset,
+                  unsigned write_mask)
 {
    if (value->bit_size == 1)
       value = nir_b2i32(b, value);
-   nir_store_scratch(b, value, offset, .align_mul = value->bit_size / 8,
-                     .write_mask = write_mask);
+   nir_store_rt_kk(b, value, offset, .align_mul = value->bit_size / 8,
+                   .write_mask = write_mask);
+}
+
+static nir_def *
+kk_rt_state_load(nir_builder *b, unsigned field, unsigned comps,
+                 unsigned bit_size)
+{
+   return kk_rt_block_load(b, comps, bit_size,
+                           nir_imm_int(b, KK_RT_STATE_BASE + field));
+}
+
+static void
+kk_rt_state_store(nir_builder *b, unsigned field, nir_def *value)
+{
+   kk_rt_block_store(b, value, nir_imm_int(b, KK_RT_STATE_BASE + field),
+                     nir_component_mask(value->num_components));
 }
 
 static nir_def *
@@ -201,12 +257,12 @@ kk_rt_lower_payload(nir_shader *nir, uint32_t *payload_size)
                break;
             nir_def *off = kk_rt_payload_offset(&b, deref);
             if (intr->intrinsic == nir_intrinsic_load_deref) {
-               nir_def *v = kk_rt_scratch_load(&b, intr->def.num_components,
-                                               intr->def.bit_size, off);
+               nir_def *v = kk_rt_block_load(&b, intr->def.num_components,
+                                             intr->def.bit_size, off);
                nir_def_replace(&intr->def, v);
             } else {
-               kk_rt_scratch_store(&b, intr->src[1].ssa, off,
-                                   nir_intrinsic_write_mask(intr));
+               kk_rt_block_store(&b, intr->src[1].ssa, off,
+                                 nir_intrinsic_write_mask(intr));
                nir_instr_remove(instr);
             }
             break;
@@ -350,141 +406,126 @@ kk_rt_process_stage(struct kk_device *dev, VkPipelineCreateFlags2KHR flags,
    return VK_SUCCESS;
 }
 
+struct kk_rt_kernel_vars {
+   nir_variable *rq;
+   nir_variable *record;
+};
+
 struct kk_rt_role_ctx {
-   const struct kk_rt_vars *v;
    enum kk_rt_role role;
+   const struct kk_rt_kernel_vars *v;
+   uint32_t needs;
+   bool dropped_trace;
 };
 
 static nir_def *
-kk_rt_rq_load(nir_builder *b, const struct kk_rt_role_ctx *ctx,
-              nir_ray_query_value value, unsigned comps, unsigned bit_size,
-              unsigned column)
+kk_rt_role_state(nir_builder *b, struct kk_rt_role_ctx *ctx, unsigned field,
+                 unsigned comps, unsigned bit_size, uint32_t need)
 {
-   nir_def *rq = &nir_build_deref_var(b, ctx->v->rq)->def;
-   return nir_rq_load(b, comps, bit_size, rq, .ray_query_value = value,
-                      .committed = ctx->role == KK_RT_ROLE_CLOSEST_HIT,
-                      .column = column);
+   ctx->needs |= need;
+   return kk_rt_state_load(b, field, comps, bit_size);
 }
 
 static bool
 kk_rt_lower_role_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   const struct kk_rt_role_ctx *ctx = data;
-   const struct kk_rt_vars *v = ctx->v;
-   bool hit = ctx->role == KK_RT_ROLE_ANY_HIT ||
-              ctx->role == KK_RT_ROLE_CLOSEST_HIT;
+   struct kk_rt_role_ctx *ctx = data;
+   bool raygen = ctx->role == KK_RT_ROLE_RAYGEN;
    nir_def *def = NULL;
 
    b->cursor = nir_before_instr(&intr->instr);
 
    switch (intr->intrinsic) {
    case nir_intrinsic_load_ray_launch_id:
-      def = nir_load_global_invocation_id(b, 32);
+      def = raygen ? nir_load_global_invocation_id(b, 32)
+                   : kk_rt_state_load(b, KK_RT_S_LAUNCH_ID, 3, 32);
       break;
    case nir_intrinsic_load_ray_launch_size:
-      def = kk_rt_load_dispatch(b, offsetof(struct kk_rt_dispatch, launch_size),
-                                3, 32);
+      def = raygen ? kk_rt_load_dispatch(
+                        b, offsetof(struct kk_rt_dispatch, launch_size), 3, 32)
+                   : kk_rt_state_load(b, KK_RT_S_LAUNCH_SIZE, 3, 32);
       break;
    case nir_intrinsic_load_shader_record_ptr:
-      def = nir_load_var(b, v->record);
+      def = raygen ? nir_load_var(b, ctx->v->record)
+                   : kk_rt_state_load(b, KK_RT_S_RECORD, 1, 64);
       break;
    case nir_intrinsic_load_ray_flags:
-      def = nir_load_var(b, v->flags);
+      def = kk_rt_state_load(b, KK_RT_S_FLAGS, 1, 32);
       break;
    case nir_intrinsic_load_cull_mask:
-      def = nir_iand_imm(b, nir_load_var(b, v->cull_mask), 0xff);
+      def = nir_iand_imm(b, kk_rt_state_load(b, KK_RT_S_CULL, 1, 32), 0xff);
       break;
    case nir_intrinsic_load_ray_t_min:
-      def = nir_load_var(b, v->tmin);
-      break;
-   case nir_intrinsic_load_ray_world_origin:
-      def = nir_load_var(b, v->origin);
-      break;
-   case nir_intrinsic_load_ray_world_direction:
-      def = nir_load_var(b, v->dir);
-      break;
-   case nir_intrinsic_load_shader_call_data_offset_lvp:
-      def = nir_load_var(b, v->payload_off);
+      def = kk_rt_state_load(b, KK_RT_S_TMIN, 1, 32);
       break;
    case nir_intrinsic_load_ray_t_max:
-      def = hit ? kk_rt_rq_load(b, ctx, nir_ray_query_value_intersection_t, 1,
-                                32, 0)
-                : nir_load_var(b, v->tmax);
+      def = kk_rt_state_load(b, KK_RT_S_TMAX, 1, 32);
+      break;
+   case nir_intrinsic_load_ray_world_origin:
+      def = kk_rt_state_load(b, KK_RT_S_WORLD_ORIGIN, 3, 32);
+      break;
+   case nir_intrinsic_load_ray_world_direction:
+      def = kk_rt_state_load(b, KK_RT_S_WORLD_DIR, 3, 32);
+      break;
+   case nir_intrinsic_load_shader_call_data_offset_lvp:
+      def = kk_rt_state_load(b, KK_RT_S_PAYLOAD, 1, 32);
       break;
    case nir_intrinsic_load_ray_instance_custom_index:
-      def = hit ? kk_rt_rq_load(
-                     b, ctx,
-                     nir_ray_query_value_intersection_instance_custom_index, 1,
-                     32, 0)
-                : nir_imm_int(b, 0);
+      def = kk_rt_role_state(b, ctx, KK_RT_S_CUSTOM, 1, 32, KK_RT_NEED_CUSTOM);
       break;
    case nir_intrinsic_load_instance_id:
-      def = hit ? kk_rt_rq_load(b, ctx,
-                                nir_ray_query_value_intersection_instance_id, 1,
-                                32, 0)
-                : nir_imm_int(b, 0);
+      def = kk_rt_role_state(b, ctx, KK_RT_S_INSTANCE, 1, 32,
+                             KK_RT_NEED_INSTANCE);
       break;
    case nir_intrinsic_load_primitive_id:
-      def = hit ? kk_rt_rq_load(
-                     b, ctx, nir_ray_query_value_intersection_primitive_index,
-                     1, 32, 0)
-                : nir_imm_int(b, 0);
+      def = kk_rt_role_state(b, ctx, KK_RT_S_PRIMITIVE, 1, 32,
+                             KK_RT_NEED_PRIMITIVE);
       break;
    case nir_intrinsic_load_ray_geometry_index:
-      def = hit ? kk_rt_rq_load(
-                     b, ctx, nir_ray_query_value_intersection_geometry_index, 1,
-                     32, 0)
-                : nir_imm_int(b, 0);
+      def = kk_rt_role_state(b, ctx, KK_RT_S_GEOMETRY, 1, 32,
+                             KK_RT_NEED_GEOMETRY);
       break;
    case nir_intrinsic_load_ray_hit_kind:
-      def = hit ? nir_bcsel(b,
-                            kk_rt_rq_load(
-                               b, ctx,
-                               nir_ray_query_value_intersection_front_face, 1,
-                               1, 0),
-                            nir_imm_int(b, 0xfe), nir_imm_int(b, 0xff))
-                : nir_imm_int(b, 0);
-      break;
-   case nir_intrinsic_load_ray_object_to_world:
-      def = hit ? kk_rt_rq_load(
-                     b, ctx, nir_ray_query_value_intersection_object_to_world,
-                     3, 32, nir_intrinsic_column(intr))
-                : nir_imm_zero(b, 3, 32);
-      break;
-   case nir_intrinsic_load_ray_world_to_object:
-      def = hit ? kk_rt_rq_load(
-                     b, ctx, nir_ray_query_value_intersection_world_to_object,
-                     3, 32, nir_intrinsic_column(intr))
-                : nir_imm_zero(b, 3, 32);
+      def = kk_rt_role_state(b, ctx, KK_RT_S_HIT_KIND, 1, 32,
+                             KK_RT_NEED_HIT_KIND);
       break;
    case nir_intrinsic_load_ray_object_origin:
-      def = hit ? kk_rt_rq_load(
-                     b, ctx,
-                     nir_ray_query_value_intersection_object_ray_origin, 3, 32,
-                     0)
-                : nir_load_var(b, v->origin);
+      def = kk_rt_role_state(b, ctx, KK_RT_S_OBJECT_ORIGIN, 3, 32,
+                             KK_RT_NEED_OBJECT_ORIGIN);
       break;
    case nir_intrinsic_load_ray_object_direction:
-      def = hit ? kk_rt_rq_load(
-                     b, ctx,
-                     nir_ray_query_value_intersection_object_ray_direction, 3,
-                     32, 0)
-                : nir_load_var(b, v->dir);
+      def = kk_rt_role_state(b, ctx, KK_RT_S_OBJECT_DIR, 3, 32,
+                             KK_RT_NEED_OBJECT_DIR);
+      break;
+   case nir_intrinsic_load_ray_object_to_world:
+      def = kk_rt_role_state(b, ctx,
+                             KK_RT_S_O2W + 16 * nir_intrinsic_column(intr), 3,
+                             32, KK_RT_NEED_O2W);
+      break;
+   case nir_intrinsic_load_ray_world_to_object:
+      def = kk_rt_role_state(b, ctx,
+                             KK_RT_S_W2O + 16 * nir_intrinsic_column(intr), 3,
+                             32, KK_RT_NEED_W2O);
       break;
    case nir_intrinsic_load_ray_triangle_vertex_positions:
       def = nir_imm_zero(b, 3, 32);
       break;
    case nir_intrinsic_ignore_ray_intersection:
-      nir_store_var(b, v->accept, nir_imm_false(b), 1);
+      kk_rt_state_store(b, KK_RT_S_ACCEPT, nir_imm_int(b, 0));
       break;
    case nir_intrinsic_terminate_ray:
-      nir_store_var(b, v->accept, nir_imm_true(b), 1);
-      nir_store_var(b, v->terminate, nir_imm_true(b), 1);
+      kk_rt_state_store(b, KK_RT_S_ACCEPT, nir_imm_int(b, 1));
+      kk_rt_state_store(b, KK_RT_S_TERMINATE, nir_imm_int(b, 1));
       break;
    case nir_intrinsic_report_ray_intersection:
       def = nir_imm_false(b);
       break;
    case nir_intrinsic_execute_callable:
+      break;
+   case nir_intrinsic_trace_ray:
+      if (raygen)
+         return false;
+      ctx->dropped_trace = true;
       break;
    default:
       return false;
@@ -497,129 +538,234 @@ kk_rt_lower_role_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
-struct kk_rt_builder {
-   struct kk_rt_pipeline *pipeline;
-   struct kk_rt_vars vars;
-   void *tmp_ctx;
-};
+static void
+kk_rt_function_key(const struct kk_rt_pipeline *p,
+                   const struct kk_rt_stage *stage, enum kk_rt_role role,
+                   const struct vk_pipeline_robustness_state *rs,
+                   unsigned char *key)
+{
+   struct mesa_blake3 ctx;
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, stage->hash, sizeof(stage->hash));
+   _mesa_blake3_update(&ctx, &role, sizeof(role));
+   _mesa_blake3_update(&ctx, rs, sizeof(*rs));
+   if (p->layout) {
+      for (uint32_t i = 0; i < p->layout->set_count; i++) {
+         if (p->layout->set_layouts[i])
+            _mesa_blake3_update(&ctx, p->layout->set_layouts[i]->blake3,
+                                sizeof(p->layout->set_layouts[i]->blake3));
+         else
+            _mesa_blake3_update(&ctx, &i, sizeof(i));
+      }
+   }
+   blake3_hash out;
+   _mesa_blake3_final(&ctx, out);
+   memcpy(key, out, 32);
+}
+
+static VkResult
+kk_rt_get_function(struct kk_device *dev, const struct kk_rt_pipeline *p,
+                   const struct kk_rt_stage *stage, enum kk_rt_role role,
+                   const struct vk_pipeline_robustness_state *rs,
+                   uint32_t *fn_out, uint32_t *needs_out)
+{
+   unsigned char key[32];
+   kk_rt_function_key(p, stage, role, rs, key);
+
+   simple_mtx_lock(&dev->rt.fn_lock);
+   struct hash_entry *e = _mesa_hash_table_search(dev->rt.functions, key);
+   if (e) {
+      struct kk_rt_function *f = e->data;
+      *fn_out = f->index + 1;
+      *needs_out = f->needs;
+      simple_mtx_unlock(&dev->rt.fn_lock);
+      return VK_SUCCESS;
+   }
+
+   simple_mtx_unlock(&dev->rt.fn_lock);
+
+   char name[48];
+   snprintf(name, sizeof(name),
+            "kk_rt_fn_%02x%02x%02x%02x%02x%02x%02x%02x", key[0], key[1],
+            key[2], key[3], key[4], key[5], key[6], key[7]);
+
+   nir_shader *nir = nir_shader_clone(NULL, stage->nir);
+   struct kk_rt_role_ctx ctx = {.role = role};
+   nir_shader_intrinsics_pass(nir, kk_rt_lower_role_instr, nir_metadata_none,
+                              &ctx);
+   if (ctx.dropped_trace)
+      fprintf(stderr, "kk rt: %s traces rays; recursion is not supported\n",
+              name);
+
+   char *msl = NULL;
+   VkResult result = kk_compile_rt_function_msl(
+      dev, nir, rs, p->layout ? p->layout->set_count : 0,
+      p->layout ? p->layout->set_layouts : NULL, name, &msl);
+   mtl_binary_function *fn = NULL;
+   if (result == VK_SUCCESS) {
+      struct kk_physical_device *pdev = kk_device_physical(dev);
+      mtl_library *lib =
+         mtl_new_library(dev->mtl_compiler_handle, msl, pdev->info.msl_version,
+                         MTL_MATH_MODE_FAST,
+                         MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+      if (lib) {
+         fn = mtl_new_binary_function(dev->mtl_compiler_handle, lib, name);
+         mtl_release(lib);
+      }
+      if (!fn) {
+         if (debug_get_bool_option("HB_KK_RT_DUMP", false))
+            fprintf(stderr, "kk rt: %s failed:\n%s\n", name, msl);
+         result = VK_ERROR_INVALID_SHADER_NV;
+      }
+   }
+   free(msl);
+
+   if (result != VK_SUCCESS)
+      return result;
+
+   simple_mtx_lock(&dev->rt.fn_lock);
+   e = _mesa_hash_table_search(dev->rt.functions, key);
+   if (e) {
+      struct kk_rt_function *f = e->data;
+      *fn_out = f->index + 1;
+      *needs_out = f->needs;
+      simple_mtx_unlock(&dev->rt.fn_lock);
+      mtl_release(fn);
+      return VK_SUCCESS;
+   }
+   struct kk_rt_function *f = calloc(1, sizeof(*f));
+   memcpy(f->key, key, sizeof(key));
+   f->index = util_dynarray_num_elements(&dev->rt.function_list,
+                                         struct kk_rt_function *);
+   f->needs = ctx.needs;
+   f->fn = fn;
+   util_dynarray_append(&dev->rt.function_list, f);
+   _mesa_hash_table_insert(dev->rt.functions, f->key, f);
+   simple_mtx_unlock(&dev->rt.fn_lock);
+
+   *fn_out = f->index + 1;
+   *needs_out = f->needs;
+   return VK_SUCCESS;
+}
 
 static void
-kk_rt_inline_stage(nir_builder *b, struct kk_rt_builder *rb,
-                   const struct kk_rt_stage *stage, enum kk_rt_role role)
+kk_rt_inline_raygen(nir_builder *b, const struct kk_rt_kernel_vars *v,
+                    const struct kk_rt_stage *stage, void *tmp_ctx)
 {
-   nir_shader *clone = nir_shader_clone(rb->tmp_ctx, stage->nir);
-   struct kk_rt_vars standin;
-   kk_rt_create_vars(clone, &standin);
-
-   struct kk_rt_role_ctx ctx = {.v = &standin, .role = role};
+   nir_shader *clone = nir_shader_clone(tmp_ctx, stage->nir);
+   nir_variable *record = nir_variable_create(clone, nir_var_shader_temp,
+                                              glsl_uint64_t_type(), "record");
+   struct kk_rt_kernel_vars standin = {.record = record};
+   struct kk_rt_role_ctx ctx = {.role = KK_RT_ROLE_RAYGEN, .v = &standin};
    nir_shader_intrinsics_pass(clone, kk_rt_lower_role_instr, nir_metadata_none,
                               &ctx);
 
    struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
-   kk_rt_remap_vars(remap, &standin, &rb->vars);
+   _mesa_hash_table_insert(remap, record, v->record);
    nir_inline_function_impl(b, nir_shader_get_entrypoint(clone), NULL, remap);
    _mesa_hash_table_destroy(remap, NULL);
-}
-
-static uint32_t
-kk_rt_group_stage(const struct kk_rt_pipeline *p, const struct kk_rt_group *g,
-                  enum kk_rt_role role)
-{
-   uint32_t index = VK_SHADER_UNUSED_KHR;
-   mesa_shader_stage want = MESA_SHADER_NONE;
-   switch (role) {
-   case KK_RT_ROLE_RAYGEN:
-      index = g->general;
-      want = MESA_SHADER_RAYGEN;
-      break;
-   case KK_RT_ROLE_MISS:
-      index = g->general;
-      want = MESA_SHADER_MISS;
-      break;
-   case KK_RT_ROLE_ANY_HIT:
-      if (g->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
-         index = g->any_hit;
-      want = MESA_SHADER_ANY_HIT;
-      break;
-   case KK_RT_ROLE_CLOSEST_HIT:
-      if (g->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
-         index = g->closest_hit;
-      want = MESA_SHADER_CLOSEST_HIT;
-      break;
-   }
-   if (index == VK_SHADER_UNUSED_KHR || index >= p->stage_count ||
-       p->stages[index].nir->info.stage != want)
-      return VK_SHADER_UNUSED_KHR;
-   return index;
-}
-
-static uint32_t
-kk_rt_count_unique(const struct kk_rt_pipeline *p, enum kk_rt_role role)
-{
-   uint32_t n = 0;
-   for (uint32_t i = 0; i < p->group_count; i++) {
-      uint32_t si = kk_rt_group_stage(p, &p->groups[i], role);
-      if (si == VK_SHADER_UNUSED_KHR)
-         continue;
-      bool seen = false;
-      for (uint32_t j = 0; j < i && !seen; j++) {
-         uint32_t sj = kk_rt_group_stage(p, &p->groups[j], role);
-         seen = sj != VK_SHADER_UNUSED_KHR &&
-                !memcmp(p->stages[si].hash, p->stages[sj].hash, 32);
-      }
-      n += !seen;
-   }
-   return n;
-}
-
-static void
-kk_rt_dispatch_groups(nir_builder *b, struct kk_rt_builder *rb,
-                      nir_def *handle, enum kk_rt_role role)
-{
-   struct kk_rt_pipeline *p = rb->pipeline;
-   bool *done = calloc(MAX2(p->group_count, 1), sizeof(bool));
-   if (!done)
-      return;
-
-   for (uint32_t i = 0; i < p->group_count; i++) {
-      if (done[i])
-         continue;
-      uint32_t si = kk_rt_group_stage(p, &p->groups[i], role);
-      if (si == VK_SHADER_UNUSED_KHR)
-         continue;
-
-      nir_def *cond = nir_ieq_imm(b, handle, p->groups[i].handle);
-      for (uint32_t j = i + 1; j < p->group_count; j++) {
-         if (done[j])
-            continue;
-         uint32_t sj = kk_rt_group_stage(p, &p->groups[j], role);
-         if (sj == VK_SHADER_UNUSED_KHR ||
-             memcmp(p->stages[si].hash, p->stages[sj].hash, 32))
-            continue;
-         done[j] = true;
-         cond = nir_ior(b, cond, nir_ieq_imm(b, handle, p->groups[j].handle));
-      }
-
-      nir_push_if(b, cond);
-      kk_rt_inline_stage(b, rb, &p->stages[si], role);
-      nir_pop_if(b, NULL);
-   }
-   free(done);
+   nir_index_ssa_defs(b->impl);
 }
 
 static nir_def *
-kk_rt_load_record(nir_builder *b, struct kk_rt_builder *rb, nir_def *addr)
+kk_rt_rq_load(nir_builder *b, nir_variable *rq, nir_ray_query_value value,
+              bool committed, unsigned comps, unsigned bit_size,
+              unsigned column)
 {
-   nir_store_var(b, rb->vars.record,
-                 nir_iadd_imm(b, addr, KK_RT_HANDLE_SIZE), 1);
-   return nir_load_global(b, 1, 32, addr, .align_mul = 4);
+   return nir_rq_load(b, comps, bit_size, &nir_build_deref_var(b, rq)->def,
+                      .ray_query_value = value, .committed = committed,
+                      .column = column);
 }
 
 static void
-kk_rt_lower_trace(nir_builder *b, struct kk_rt_builder *rb,
+kk_rt_write_hit(nir_builder *b, nir_variable *rq, bool committed,
+                uint32_t needs)
+{
+   nir_def *bary = kk_rt_rq_load(
+      b, rq, nir_ray_query_value_intersection_barycentrics, committed, 2, 32, 0);
+   kk_rt_block_store(b, bary, nir_imm_int(b, 0), 0x3);
+   kk_rt_state_store(
+      b, KK_RT_S_TMAX,
+      kk_rt_rq_load(b, rq, nir_ray_query_value_intersection_t, committed, 1,
+                    32, 0));
+   if (needs & KK_RT_NEED_CUSTOM)
+      kk_rt_state_store(
+         b, KK_RT_S_CUSTOM,
+         kk_rt_rq_load(b, rq,
+                       nir_ray_query_value_intersection_instance_custom_index,
+                       committed, 1, 32, 0));
+   if (needs & KK_RT_NEED_INSTANCE)
+      kk_rt_state_store(
+         b, KK_RT_S_INSTANCE,
+         kk_rt_rq_load(b, rq, nir_ray_query_value_intersection_instance_id,
+                       committed, 1, 32, 0));
+   if (needs & KK_RT_NEED_PRIMITIVE)
+      kk_rt_state_store(
+         b, KK_RT_S_PRIMITIVE,
+         kk_rt_rq_load(b, rq, nir_ray_query_value_intersection_primitive_index,
+                       committed, 1, 32, 0));
+   if (needs & KK_RT_NEED_GEOMETRY)
+      kk_rt_state_store(
+         b, KK_RT_S_GEOMETRY,
+         kk_rt_rq_load(b, rq, nir_ray_query_value_intersection_geometry_index,
+                       committed, 1, 32, 0));
+   if (needs & KK_RT_NEED_HIT_KIND)
+      kk_rt_state_store(
+         b, KK_RT_S_HIT_KIND,
+         nir_bcsel(b,
+                   kk_rt_rq_load(b, rq,
+                                 nir_ray_query_value_intersection_front_face,
+                                 committed, 1, 1, 0),
+                   nir_imm_int(b, 0xfe), nir_imm_int(b, 0xff)));
+   if (needs & KK_RT_NEED_OBJECT_ORIGIN)
+      kk_rt_state_store(
+         b, KK_RT_S_OBJECT_ORIGIN,
+         kk_rt_rq_load(b, rq,
+                       nir_ray_query_value_intersection_object_ray_origin,
+                       committed, 3, 32, 0));
+   if (needs & KK_RT_NEED_OBJECT_DIR)
+      kk_rt_state_store(
+         b, KK_RT_S_OBJECT_DIR,
+         kk_rt_rq_load(b, rq,
+                       nir_ray_query_value_intersection_object_ray_direction,
+                       committed, 3, 32, 0));
+   for (unsigned c = 0; c < 4; c++) {
+      if (needs & KK_RT_NEED_O2W)
+         kk_rt_state_store(
+            b, KK_RT_S_O2W + 16 * c,
+            kk_rt_rq_load(b, rq,
+                          nir_ray_query_value_intersection_object_to_world,
+                          committed, 3, 32, c));
+      if (needs & KK_RT_NEED_W2O)
+         kk_rt_state_store(
+            b, KK_RT_S_W2O + 16 * c,
+            kk_rt_rq_load(b, rq,
+                          nir_ray_query_value_intersection_world_to_object,
+                          committed, 3, 32, c));
+   }
+}
+
+static nir_def *
+kk_rt_set_record(nir_builder *b, nir_def *rec, unsigned slot)
+{
+   kk_rt_state_store(b, KK_RT_S_RECORD, nir_iadd_imm(b, rec, KK_RT_HANDLE_SIZE));
+   return nir_load_global(b, 1, 32, nir_iadd_imm(b, rec, 4 * slot),
+                          .align_mul = 4);
+}
+
+static void
+kk_rt_call(nir_builder *b, nir_def *fn)
+{
+   nir_push_if(b, nir_ine_imm(b, fn, 0));
+   nir_rt_call_kk(b, nir_iadd_imm(b, fn, -1));
+   nir_pop_if(b, NULL);
+}
+
+static void
+kk_rt_lower_trace(nir_builder *b, const struct kk_rt_kernel_vars *v,
+                  uint32_t ahit_needs, uint32_t chit_needs,
                   nir_intrinsic_instr *intr)
 {
-   const struct kk_rt_vars *v = &rb->vars;
    b->cursor = nir_before_instr(&intr->instr);
 
    nir_def *as = intr->src[0].ssa;
@@ -634,17 +780,12 @@ kk_rt_lower_trace(nir_builder *b, struct kk_rt_builder *rb,
    nir_def *tmax = intr->src[9].ssa;
    nir_def *payload = intr->src[10].ssa;
 
-   nir_def *saved_record = nir_load_var(b, v->record);
-   nir_store_var(b, v->flags, flags, 1);
-   nir_store_var(b, v->cull_mask, cull, 1);
-   nir_store_var(b, v->sbt_offset, sbt_offset, 1);
-   nir_store_var(b, v->sbt_stride, sbt_stride, 1);
-   nir_store_var(b, v->miss_index, miss_index, 1);
-   nir_store_var(b, v->origin, origin, 0x7);
-   nir_store_var(b, v->tmin, tmin, 1);
-   nir_store_var(b, v->dir, dir, 0x7);
-   nir_store_var(b, v->tmax, tmax, 1);
-   nir_store_var(b, v->payload_off, payload, 1);
+   kk_rt_state_store(b, KK_RT_S_FLAGS, flags);
+   kk_rt_state_store(b, KK_RT_S_CULL, cull);
+   kk_rt_state_store(b, KK_RT_S_TMIN, tmin);
+   kk_rt_state_store(b, KK_RT_S_WORLD_ORIGIN, origin);
+   kk_rt_state_store(b, KK_RT_S_WORLD_DIR, dir);
+   kk_rt_state_store(b, KK_RT_S_PAYLOAD, payload);
 
    nir_def *hit_addr =
       kk_rt_load_dispatch(b, offsetof(struct kk_rt_dispatch, hit_addr), 1, 64);
@@ -655,48 +796,61 @@ kk_rt_lower_trace(nir_builder *b, struct kk_rt_builder *rb,
    nir_def *miss_stride = kk_rt_load_dispatch(
       b, offsetof(struct kk_rt_dispatch, miss_stride), 1, 32);
 
-   nir_def *rq = &nir_build_deref_var(b, v->rq)->def;
-   nir_rq_initialize(b, rq, as, flags, cull, origin, tmin, dir, tmax);
+   nir_rq_initialize(b, &nir_build_deref_var(b, v->rq)->def, as, flags, cull,
+                     origin, tmin, dir, tmax);
 
    nir_push_loop(b);
    {
-      rq = &nir_build_deref_var(b, v->rq)->def;
+      nir_def *rq = &nir_build_deref_var(b, v->rq)->def;
       nir_break_if(b, nir_inot(b, nir_rq_proceed(b, 1, rq)));
 
-      nir_def *ctype = nir_rq_load(
-         b, 1, 32, rq, .ray_query_value = nir_ray_query_value_intersection_type,
-         .committed = false);
+      nir_def *ctype = kk_rt_rq_load(
+         b, v->rq, nir_ray_query_value_intersection_type, false, 1, 32, 0);
       nir_push_if(b, nir_ieq_imm(b, ctype, 0));
       {
-         nir_def *bary = nir_rq_load(
-            b, 2, 32, rq,
-            .ray_query_value = nir_ray_query_value_intersection_barycentrics,
-            .committed = false);
-         kk_rt_scratch_store(b, bary, nir_imm_int(b, 0), 0x3);
-         nir_store_var(b, v->accept, nir_imm_true(b), 1);
-         nir_store_var(b, v->terminate,
-                       nir_test_mask(b, flags, 0x4), 1);
-
-         nir_def *inst_sbt = nir_rq_load(
-            b, 1, 32, rq,
-            .ray_query_value = nir_ray_query_value_intersection_instance_sbt_index,
-            .committed = false);
-         nir_def *geom = nir_rq_load(
-            b, 1, 32, rq,
-            .ray_query_value = nir_ray_query_value_intersection_geometry_index,
-            .committed = false);
+         nir_def *inst_sbt = kk_rt_rq_load(
+            b, v->rq, nir_ray_query_value_intersection_instance_sbt_index,
+            false, 1, 32, 0);
+         nir_def *geom = kk_rt_rq_load(
+            b, v->rq, nir_ray_query_value_intersection_geometry_index, false,
+            1, 32, 0);
          nir_def *index = nir_iadd(b, nir_iadd(b, inst_sbt, sbt_offset),
                                    nir_imul(b, geom, sbt_stride));
          nir_def *rec = nir_iadd(
             b, hit_addr, nir_u2u64(b, nir_imul(b, index, hit_stride)));
-         nir_def *handle = kk_rt_load_record(b, rb, rec);
-         kk_rt_dispatch_groups(b, rb, handle, KK_RT_ROLE_ANY_HIT);
+         nir_def *fn = nir_load_global(b, 1, 32, nir_iadd_imm(b, rec, 8),
+                                       .align_mul = 4);
+
+         nir_variable *accept =
+            nir_local_variable_create(b->impl, glsl_bool_type(), "accept");
+         nir_variable *terminate =
+            nir_local_variable_create(b->impl, glsl_bool_type(), "terminate");
+         nir_store_var(b, accept, nir_imm_true(b), 1);
+         nir_store_var(b, terminate, nir_test_mask(b, flags, 0x4), 1);
+
+         nir_push_if(b, nir_ine_imm(b, fn, 0));
+         {
+            kk_rt_write_hit(b, v->rq, false, ahit_needs);
+            kk_rt_state_store(b, KK_RT_S_ACCEPT, nir_imm_int(b, 1));
+            kk_rt_state_store(b, KK_RT_S_TERMINATE,
+                              nir_b2i32(b, nir_test_mask(b, flags, 0x4)));
+            kk_rt_set_record(b, rec, 2);
+            nir_rt_call_kk(b, nir_iadd_imm(b, fn, -1));
+            nir_store_var(b, accept,
+                          nir_ine_imm(b, kk_rt_state_load(b, KK_RT_S_ACCEPT, 1, 32), 0),
+                          1);
+            nir_store_var(
+               b, terminate,
+               nir_ine_imm(b, kk_rt_state_load(b, KK_RT_S_TERMINATE, 1, 32), 0),
+               1);
+         }
+         nir_pop_if(b, NULL);
 
          rq = &nir_build_deref_var(b, v->rq)->def;
-         nir_push_if(b, nir_load_var(b, v->accept));
+         nir_push_if(b, nir_load_var(b, accept));
          {
             nir_rq_confirm_intersection(b, rq);
-            nir_push_if(b, nir_load_var(b, v->terminate));
+            nir_push_if(b, nir_load_var(b, terminate));
             nir_rq_terminate(b, rq);
             nir_pop_if(b, NULL);
          }
@@ -706,33 +860,31 @@ kk_rt_lower_trace(nir_builder *b, struct kk_rt_builder *rb,
    }
    nir_pop_loop(b, NULL);
 
-   rq = &nir_build_deref_var(b, v->rq)->def;
-   nir_def *committed = nir_rq_load(
-      b, 1, 32, rq, .ray_query_value = nir_ray_query_value_intersection_type,
-      .committed = true);
+   nir_def *committed = kk_rt_rq_load(
+      b, v->rq, nir_ray_query_value_intersection_type, true, 1, 32, 0);
    nir_push_if(b, nir_ine_imm(b, committed, 0));
    {
       nir_push_if(b, nir_inot(b, nir_test_mask(b, flags, 0x8)));
       {
-         nir_def *bary = nir_rq_load(
-            b, 2, 32, rq,
-            .ray_query_value = nir_ray_query_value_intersection_barycentrics,
-            .committed = true);
-         kk_rt_scratch_store(b, bary, nir_imm_int(b, 0), 0x3);
-         nir_def *inst_sbt = nir_rq_load(
-            b, 1, 32, rq,
-            .ray_query_value = nir_ray_query_value_intersection_instance_sbt_index,
-            .committed = true);
-         nir_def *geom = nir_rq_load(
-            b, 1, 32, rq,
-            .ray_query_value = nir_ray_query_value_intersection_geometry_index,
-            .committed = true);
+         nir_def *inst_sbt = kk_rt_rq_load(
+            b, v->rq, nir_ray_query_value_intersection_instance_sbt_index,
+            true, 1, 32, 0);
+         nir_def *geom = kk_rt_rq_load(
+            b, v->rq, nir_ray_query_value_intersection_geometry_index, true, 1,
+            32, 0);
          nir_def *index = nir_iadd(b, nir_iadd(b, inst_sbt, sbt_offset),
                                    nir_imul(b, geom, sbt_stride));
          nir_def *rec = nir_iadd(
             b, hit_addr, nir_u2u64(b, nir_imul(b, index, hit_stride)));
-         nir_def *handle = kk_rt_load_record(b, rb, rec);
-         kk_rt_dispatch_groups(b, rb, handle, KK_RT_ROLE_CLOSEST_HIT);
+         nir_def *fn = nir_load_global(b, 1, 32, nir_iadd_imm(b, rec, 4),
+                                       .align_mul = 4);
+         nir_push_if(b, nir_ine_imm(b, fn, 0));
+         {
+            kk_rt_write_hit(b, v->rq, true, chit_needs);
+            kk_rt_set_record(b, rec, 1);
+            nir_rt_call_kk(b, nir_iadd_imm(b, fn, -1));
+         }
+         nir_pop_if(b, NULL);
       }
       nir_pop_if(b, NULL);
    }
@@ -740,18 +892,29 @@ kk_rt_lower_trace(nir_builder *b, struct kk_rt_builder *rb,
    {
       nir_def *rec = nir_iadd(
          b, miss_addr, nir_u2u64(b, nir_imul(b, miss_index, miss_stride)));
-      nir_def *handle = kk_rt_load_record(b, rb, rec);
-      kk_rt_dispatch_groups(b, rb, handle, KK_RT_ROLE_MISS);
+      kk_rt_state_store(b, KK_RT_S_TMAX, tmax);
+      nir_def *fn = kk_rt_set_record(b, rec, 3);
+      kk_rt_call(b, fn);
    }
    nir_pop_if(b, NULL);
 
-   nir_store_var(b, v->record, saved_record, 1);
    nir_instr_remove(&intr->instr);
+}
+
+static bool
+kk_rt_set_block_range(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_rt_kk &&
+       intr->intrinsic != nir_intrinsic_store_rt_kk)
+      return false;
+   nir_intrinsic_set_range(intr, *(uint32_t *)data);
+   return true;
 }
 
 static nir_shader *
 kk_rt_build_shader(struct kk_device *dev, struct kk_rt_pipeline *p,
-                   const struct vk_pipeline_robustness_state *rs)
+                   const struct vk_pipeline_robustness_state *rs,
+                   uint32_t ahit_needs, uint32_t chit_needs)
 {
    const struct nir_shader_compiler_options *nir_options =
       dev->vk.shader_ops->get_nir_options(dev->vk.physical,
@@ -763,70 +926,66 @@ kk_rt_build_shader(struct kk_device *dev, struct kk_rt_pipeline *p,
    s->info.workgroup_size[1] = 8;
    s->info.workgroup_size[2] = 1;
 
-   struct kk_rt_builder rb = {
-      .pipeline = p,
-      .tmp_ctx = ralloc_context(NULL),
+   void *tmp_ctx = ralloc_context(NULL);
+   struct kk_rt_kernel_vars v = {
+      .rq = nir_variable_create(s, nir_var_shader_temp, glsl_uint64_t_type(),
+                                "kk_rt_rq"),
+      .record = nir_variable_create(s, nir_var_shader_temp,
+                                    glsl_uint64_t_type(), "kk_rt_record"),
    };
-   kk_rt_create_vars(s, &rb.vars);
+   v.rq->data.ray_query = true;
 
    uint32_t payload = 0;
    for (uint32_t i = 0; i < p->stage_count; i++)
       payload = MAX2(payload, p->stages[i].payload_size);
-   s->scratch_size = KK_RT_PAYLOAD_BASE + align(payload, 16);
-   if (debug_get_bool_option("HB_KK_RT_DUMP", false))
-      fprintf(stderr, "kk rt: payload %u scratch %u\n", payload, s->scratch_size);
+   uint32_t block = KK_RT_PAYLOAD_BASE + align(MAX2(payload, 4), 16);
 
    nir_def *size = kk_rt_load_dispatch(
       &b, offsetof(struct kk_rt_dispatch, launch_size), 3, 32);
    nir_def *id = nir_load_global_invocation_id(&b, 32);
-   nir_def *oob = nir_bany(&b, nir_uge(&b, id, size));
-   nir_push_if(&b, nir_inot(&b, oob));
+   nir_push_if(&b, nir_inot(&b, nir_bany(&b, nir_uge(&b, id, size))));
    {
-      nir_store_var(&b, rb.vars.accept, nir_imm_true(&b), 1);
-      nir_store_var(&b, rb.vars.terminate, nir_imm_false(&b), 1);
+      kk_rt_state_store(&b, KK_RT_S_LAUNCH_ID, id);
+      kk_rt_state_store(&b, KK_RT_S_LAUNCH_SIZE, size);
       nir_def *rg_addr = kk_rt_load_dispatch(
          &b, offsetof(struct kk_rt_dispatch, raygen_addr), 1, 64);
-      nir_def *handle = kk_rt_load_record(&b, &rb, rg_addr);
-      kk_rt_dispatch_groups(&b, &rb, handle, KK_RT_ROLE_RAYGEN);
+      nir_store_var(&b, v.record, nir_iadd_imm(&b, rg_addr, KK_RT_HANDLE_SIZE),
+                    1);
+      nir_def *handle = nir_load_global(&b, 1, 32, rg_addr, .align_mul = 4);
+      for (uint32_t i = 0; i < p->group_count; i++) {
+         const struct kk_rt_group *g = &p->groups[i];
+         if (g->type != VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR ||
+             g->general >= p->stage_count ||
+             p->stages[g->general].nir->info.stage != MESA_SHADER_RAYGEN)
+            continue;
+         nir_push_if(&b, nir_ieq_imm(&b, handle, g->handle));
+         kk_rt_inline_raygen(&b, &v, &p->stages[g->general], tmp_ctx);
+         nir_pop_if(&b, NULL);
+      }
    }
    nir_pop_if(&b, NULL);
 
    nir_function_impl *impl = nir_shader_get_entrypoint(s);
    struct util_dynarray traces;
    util_dynarray_init(&traces, NULL);
-   nir_foreach_block(block, impl) {
-      nir_foreach_instr(instr, block) {
+   nir_foreach_block(block_it, impl) {
+      nir_foreach_instr(instr, block_it) {
          if (instr->type == nir_instr_type_intrinsic &&
              nir_instr_as_intrinsic(instr)->intrinsic ==
                 nir_intrinsic_trace_ray)
             util_dynarray_append(&traces, nir_instr_as_intrinsic(instr));
       }
    }
-   fprintf(stderr,
-           "kk rt: pipeline stages=%u groups=%u traces=%u unique raygen=%u "
-           "miss=%u chit=%u ahit=%u payload=%u\n",
-           p->stage_count, p->group_count,
-           (unsigned)util_dynarray_num_elements(&traces, nir_intrinsic_instr *),
-           kk_rt_count_unique(p, KK_RT_ROLE_RAYGEN),
-           kk_rt_count_unique(p, KK_RT_ROLE_MISS),
-           kk_rt_count_unique(p, KK_RT_ROLE_CLOSEST_HIT),
-           kk_rt_count_unique(p, KK_RT_ROLE_ANY_HIT), payload);
    util_dynarray_foreach(&traces, nir_intrinsic_instr *, it)
-      kk_rt_lower_trace(&b, &rb, *it);
+      kk_rt_lower_trace(&b, &v, ahit_needs, chit_needs, *it);
    util_dynarray_fini(&traces);
 
-   nir_foreach_block_safe(block, impl) {
-      nir_foreach_instr_safe(instr, block) {
-         if (instr->type == nir_instr_type_intrinsic &&
-             nir_instr_as_intrinsic(instr)->intrinsic ==
-                nir_intrinsic_trace_ray)
-            nir_instr_remove(instr);
-      }
-   }
-
    nir_progress(true, impl, nir_metadata_none);
+   nir_index_ssa_defs(impl);
+   nir_shader_intrinsics_pass(s, kk_rt_set_block_range, nir_metadata_all,
+                              &block);
    nir_fixup_deref_modes(s);
-   ralloc_free(rb.tmp_ctx);
+   ralloc_free(tmp_ctx);
    nir_validate_shader(s, "kk_rt_build_shader");
    return s;
 }
@@ -859,17 +1018,92 @@ static const struct vk_pipeline_ops kk_rt_pipeline_ops = {
 };
 
 static VkResult
+kk_rt_compile_group_functions(struct kk_device *dev, struct kk_rt_pipeline *p,
+                              uint32_t first, uint32_t count,
+                              const struct vk_pipeline_robustness_state *rs)
+{
+   for (uint32_t i = first; i < first + count; i++) {
+      struct kk_rt_group *g = &p->groups[i];
+      VkResult result = VK_SUCCESS;
+      if (g->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR) {
+         if (g->general < p->stage_count &&
+             p->stages[g->general].nir->info.stage == MESA_SHADER_MISS)
+            result = kk_rt_get_function(dev, p, &p->stages[g->general],
+                                        KK_RT_ROLE_MISS, rs, &g->fn[2],
+                                        &g->needs[2]);
+      } else if (g->type ==
+                 VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR) {
+         if (g->closest_hit < p->stage_count)
+            result = kk_rt_get_function(dev, p, &p->stages[g->closest_hit],
+                                        KK_RT_ROLE_CLOSEST_HIT, rs, &g->fn[0],
+                                        &g->needs[0]);
+         if (result == VK_SUCCESS && g->any_hit < p->stage_count)
+            result = kk_rt_get_function(dev, p, &p->stages[g->any_hit],
+                                        KK_RT_ROLE_ANY_HIT, rs, &g->fn[1],
+                                        &g->needs[1]);
+      }
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+static struct kk_rt_link *
+kk_rt_make_link(struct kk_device *dev, struct kk_rt_pipeline *p)
+{
+   struct kk_rt_link *link = calloc(1, sizeof(*link));
+   if (!link)
+      return NULL;
+   link->ref = 1;
+   uint32_t max_fns = p->group_count * 3;
+   link->functions = calloc(MAX2(max_fns, 1), sizeof(*link->functions));
+   link->indices = calloc(MAX2(max_fns, 1), sizeof(*link->indices));
+   if (!link->functions || !link->indices) {
+      kk_rt_link_unref(link);
+      return NULL;
+   }
+
+   simple_mtx_lock(&dev->rt.fn_lock);
+   struct kk_rt_function **list = util_dynarray_begin(&dev->rt.function_list);
+   for (uint32_t i = 0; i < p->group_count; i++) {
+      for (unsigned s = 0; s < 3; s++) {
+         uint32_t fn = p->groups[i].fn[s];
+         if (!fn)
+            continue;
+         bool seen = false;
+         for (uint32_t j = 0; j < link->count && !seen; j++)
+            seen = link->indices[j] == fn - 1;
+         if (seen)
+            continue;
+         link->indices[link->count] = fn - 1;
+         link->functions[link->count] = list[fn - 1]->fn;
+         link->count++;
+         link->table_size = MAX2(link->table_size, fn);
+      }
+   }
+   simple_mtx_unlock(&dev->rt.fn_lock);
+   return link;
+}
+
+static VkResult
 kk_rt_compile(struct kk_device *dev, struct kk_rt_pipeline *p,
               const VkRayTracingPipelineCreateInfoKHR *info,
+              const struct vk_pipeline_robustness_state *rs,
               const VkAllocationCallbacks *alloc)
 {
-   struct vk_pipeline_robustness_state rs;
-   vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &rs,
-                                     info->pNext, NULL);
+   uint32_t ahit_needs = 0, chit_needs = 0;
+   for (uint32_t i = 0; i < p->group_count; i++) {
+      chit_needs |= p->groups[i].needs[0];
+      ahit_needs |= p->groups[i].needs[1];
+   }
 
-   nir_shader *nir = kk_rt_build_shader(dev, p, &rs);
+   struct kk_rt_link *link = kk_rt_make_link(dev, p);
+   if (!link)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   nir_shader *nir = kk_rt_build_shader(dev, p, rs, ahit_needs, chit_needs);
    if (dev->vk.shader_ops->preprocess_nir)
-      dev->vk.shader_ops->preprocess_nir(dev->vk.physical, nir, &rs);
+      dev->vk.shader_ops->preprocess_nir(dev->vk.physical, nir, rs);
    if (debug_get_bool_option("HB_KK_RT_DUMP", false))
       nir_print_shader(nir, stderr);
 
@@ -884,14 +1118,24 @@ kk_rt_compile(struct kk_device *dev, struct kk_rt_pipeline *p,
    struct vk_shader_compile_info compile_info = {
       .stage = MESA_SHADER_COMPUTE,
       .nir = nir,
-      .robustness = &rs,
+      .robustness = rs,
       .set_layout_count = p->layout ? p->layout->set_count : 0,
       .set_layouts = p->layout ? p->layout->set_layouts : NULL,
       .push_constant_range_count = range.size ? 1 : 0,
       .push_constant_ranges = range.size ? &range : NULL,
    };
-   return vk_compile_shaders(&dev->vk, 1, &compile_info, NULL,
-                             &dev->vk.enabled_features, alloc, &p->cs);
+   kk_rt_set_pending_link(link);
+   VkResult result = vk_compile_shaders(&dev->vk, 1, &compile_info, NULL,
+                                        &dev->vk.enabled_features, alloc,
+                                        &p->cs);
+   kk_rt_set_pending_link(NULL);
+   fprintf(stderr,
+           "kk rt: pipeline stages=%u groups=%u functions=%u table=%u "
+           "needs ahit=%x chit=%x result=%d\n",
+           p->stage_count, p->group_count, link->count, link->table_size,
+           ahit_needs, chit_needs, result);
+   kk_rt_link_unref(link);
+   return result;
 }
 
 static VkResult
@@ -901,6 +1145,7 @@ kk_rt_pipeline_create(struct kk_device *dev,
 {
    VkPipelineCreateFlags2KHR flags = vk_rt_pipeline_create_flags(info);
    VK_FROM_HANDLE(vk_pipeline_layout, layout, info->layout);
+   int64_t t0 = os_time_get_nano();
 
    uint32_t stage_count = info->stageCount;
    uint32_t group_count = info->groupCount;
@@ -925,6 +1170,10 @@ kk_rt_pipeline_create(struct kk_device *dev,
    p->group_count = group_count;
    p->stages = rzalloc_array(p->mem_ctx, struct kk_rt_stage, MAX2(stage_count, 1));
    p->groups = rzalloc_array(p->mem_ctx, struct kk_rt_group, MAX2(group_count, 1));
+
+   struct vk_pipeline_robustness_state rs;
+   vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &rs,
+                                     info->pNext, NULL);
 
    VkResult result = VK_SUCCESS;
    for (uint32_t i = 0; i < info->stageCount; i++) {
@@ -977,11 +1226,23 @@ kk_rt_pipeline_create(struct kk_device *dev,
       group_base += lib->group_count;
    }
 
+   result = kk_rt_compile_group_functions(dev, p, 0, info->groupCount, &rs);
+   if (result != VK_SUCCESS)
+      goto fail;
+
    if (!(flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR)) {
-      result = kk_rt_compile(dev, p, info, alloc);
+      result = kk_rt_compile(dev, p, info, &rs, alloc);
       if (result != VK_SUCCESS)
          goto fail;
    }
+
+   if (debug_get_bool_option("HB_KK_RT_DUMP", false) ||
+       !(flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR))
+      fprintf(stderr, "kk rt: %s stages=%u groups=%u created in %.1f ms\n",
+              (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ? "library"
+                                                             : "pipeline",
+              p->stage_count, p->group_count,
+              (os_time_get_nano() - t0) / 1e6);
 
    *out = vk_pipeline_to_handle(&p->base);
    return VK_SUCCESS;
@@ -1032,9 +1293,10 @@ kk_GetRayTracingShaderGroupHandlesKHR(VkDevice device, VkPipeline pipeline,
    for (uint32_t i = 0; i < groupCount; i++) {
       if ((i + 1) * KK_RT_HANDLE_SIZE > dataSize)
          break;
-      memset(out + i * KK_RT_HANDLE_SIZE, 0, KK_RT_HANDLE_SIZE);
-      uint32_t handle = p->groups[firstGroup + i].handle;
-      memcpy(out + i * KK_RT_HANDLE_SIZE, &handle, sizeof(handle));
+      const struct kk_rt_group *g = &p->groups[firstGroup + i];
+      uint32_t words[KK_RT_HANDLE_SIZE / 4] = {g->handle, g->fn[0], g->fn[1],
+                                               g->fn[2]};
+      memcpy(out + i * KK_RT_HANDLE_SIZE, words, KK_RT_HANDLE_SIZE);
    }
    return VK_SUCCESS;
 }

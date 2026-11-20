@@ -8,6 +8,7 @@
 #ifndef KK_SHADER_H
 #define KK_SHADER_H 1
 
+#include "kk_rt_link.h"
 #include "kk_cb_record.h"
 #include "kk_device_memory.h"
 #include "kk_private.h"
@@ -149,6 +150,8 @@ struct kk_pipeline_handles {
    };
    /* MSL hashes and features command buffer records name it by */
    struct kk_cb_program record;
+   mtl_visible_function_table *rt_table;
+   uint64_t rt_table_id;
 };
 
 struct kk_msl_source;
@@ -192,12 +195,20 @@ struct kk_shader {
    /* Destroyed while queued or compiling: the worker that compiles it frees
     * it afterwards */
    bool compile_orphaned;
+
+   struct kk_rt_link *rt_link;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
                                VK_OBJECT_TYPE_SHADER_EXT);
 
 extern const struct vk_device_shader_ops kk_device_shader_ops;
+
+VkResult kk_compile_rt_function_msl(
+   struct kk_device *dev, nir_shader *nir,
+   const struct vk_pipeline_robustness_state *rs, uint32_t set_layout_count,
+   struct vk_descriptor_set_layout *const *set_layouts, const char *name,
+   char **msl_out);
 
 /* Sets up and tears down the pool that compiles queued programs. */
 void kk_compile_pool_init(struct kk_device *dev);

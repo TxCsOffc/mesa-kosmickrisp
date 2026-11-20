@@ -25,6 +25,9 @@ struct nir_to_msl_ctx {
    struct _mesa_string_buffer *text;
    uint64_t disabled_workarounds;
    bool uses_per_draw_data;
+   bool rt_calls;
+   unsigned rt_block_size;
+   const char *rt_function_name;
    unsigned short indentlevel;
    unsigned next_cf_predicate;
    struct io_slot_info inputs_info[NUM_TOTAL_VARYING_SLOTS];

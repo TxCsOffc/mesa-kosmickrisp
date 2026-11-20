@@ -180,7 +180,9 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    {
       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
       /* Root at 0, samplers at 1 and per draw data at 2 */
-      mtl_set_max_buffer_binding_count(desc, 3u);
+      mtl_set_max_buffer_binding_count(
+         desc, kk_physical_device_has_raytracing(kk_device_physical(dev)) ? 4u
+                                                                          : 3u);
       cmd->argument_table = mtl_new_argument_table(dev->mtl_handle, desc);
       mtl_set_address(cmd->argument_table, dev->samplers.table.bo->gpu, 1u);
       mtl_release(desc);

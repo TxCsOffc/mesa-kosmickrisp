@@ -22,6 +22,9 @@ struct kk_rt_state {
    struct hash_table *as_by_id;
    struct hash_table *sidecars;
    struct util_dynarray sidecar_garbage;
+   simple_mtx_t fn_lock;
+   struct hash_table *functions;
+   struct util_dynarray function_list;
 };
 
 struct kk_acceleration_structure {
@@ -41,5 +44,7 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_acceleration_structure, base,
 VkResult kk_rt_init(struct kk_device *dev);
 void kk_rt_finish(struct kk_device *dev);
 void kk_rt_get_va_table(struct kk_device *dev, uint64_t *addr, uint32_t *mask);
+void kk_rt_functions_init(struct kk_device *dev);
+void kk_rt_functions_finish(struct kk_device *dev);
 
 #endif

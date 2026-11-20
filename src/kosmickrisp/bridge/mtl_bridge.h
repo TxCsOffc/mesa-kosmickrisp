@@ -22,6 +22,7 @@
 #include "mtl_types.h"
 
 #include "mtl_acceleration_structure.h"
+#include "mtl_rt_function.h"
 #include "mtl_argument_table.h"
 #include "mtl_buffer.h"
 #include "mtl_command_buffer.h"

@@ -1085,6 +1085,13 @@ kk_shader_free(struct kk_device *dev, struct kk_shader *shader,
    if (shader->info.stage == MESA_SHADER_COMPUTE) {
       mtl_release(pipe->cs);
       pipe->cs = NULL;
+      if (pipe->rt_table) {
+         kk_device_remove_allocation_from_residency_set(dev, pipe->rt_table);
+         mtl_release(pipe->rt_table);
+         pipe->rt_table = NULL;
+      }
+      kk_rt_link_unref(shader->rt_link);
+      shader->rt_link = NULL;
    } else if (shader->info.stage == MESA_SHADER_VERTEX) {
       /* Pre-render compute pipelines. */
       for (uint32_t i = 0u; i < pipe->gfx.pre_render_count; ++i) {
@@ -1256,6 +1263,42 @@ kk_nir_lower_vertex_id_zero_base(struct nir_shader *nir)
    return progress;
 }
 
+VkResult
+kk_compile_rt_function_msl(struct kk_device *dev, nir_shader *nir,
+                           const struct vk_pipeline_robustness_state *rs,
+                           uint32_t set_layout_count,
+                           struct vk_descriptor_set_layout *const *set_layouts,
+                           const char *name, char **msl_out)
+{
+   struct kk_physical_device *pdev = kk_device_physical(dev);
+
+   nir->info.stage = MESA_SHADER_COMPUTE;
+   memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+   nir->info.workgroup_size[0] = 1;
+   nir->info.workgroup_size[1] = 1;
+   nir->info.workgroup_size[2] = 1;
+
+   kk_preprocess_nir(&pdev->vk, nir, rs);
+   msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
+   uint32_t minmax_sets = 0;
+   kk_lower_nir(dev, nir, false, rs, set_layout_count, set_layouts, NULL,
+                kk_make_feature_key(&dev->vk.enabled_features), &minmax_sets);
+   NIR_PASS(_, nir, kk_nir_lower_poly);
+   msl_optimize_nir(nir);
+   modify_nir_info(nir);
+
+   struct nir_to_msl_options options = {
+      .mem_ctx = NULL,
+      .disabled_workarounds = pdev->settings.disabled_workarounds,
+      .rt_function_name = name,
+   };
+   char *code = nir_to_msl(nir, &options);
+   *msl_out = code ? strdup(code) : NULL;
+   ralloc_free(code);
+   ralloc_free(nir);
+   return *msl_out ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
 /* Consumes nir */
 static void
 kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
@@ -1291,6 +1334,22 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
       }
    }
 
+   if (debug_get_bool_option("HB_KK_RT_DUMP_FINAL", false) &&
+       nir->info.stage == MESA_SHADER_COMPUTE) {
+      bool rt = false;
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic ==
+                      nir_intrinsic_rt_call_kk)
+                  rt = true;
+            }
+         }
+      }
+      if (rt)
+         nir_print_shader(nir, stderr);
+   }
    data->code = nir_to_msl(nir, &translate_options);
    kk_msl_source_intern(data);
    const char *entrypoint_name = nir_shader_get_entrypoint(nir)->function->name;
@@ -1344,6 +1403,8 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
    }
 
    gather_shader_info(shader, nir, state);
+   if (stage == MESA_SHADER_COMPUTE)
+      shader->rt_link = kk_rt_link_ref(kk_rt_get_pending_link());
 
    unsigned num_cull_distances =
       prev_stage ? prev_stage->info.num_cull_distances : 0;
@@ -1999,6 +2060,51 @@ kk_compile_compute_pipeline(struct kk_device *device, mtl_compiler *compiler,
 
    *pipe = pipeline;
 
+   return VK_SUCCESS;
+}
+
+static VkResult
+kk_compile_rt_kernel(struct kk_device *device, mtl_compiler *compiler,
+                     struct kk_shader *s, uint32_t local_size_threads)
+{
+   const struct msl_compile_data *data = &s->msl_data[MESA_SHADER_COMPUTE];
+   const struct kk_rt_link *link = s->rt_link;
+   blake3_hash source;
+   mtl_library *library = kk_get_msl_library(device, data->code, source);
+   if (library == NULL)
+      return VK_ERROR_INVALID_SHADER_NV;
+
+   mtl_function_descriptor *function =
+      mtl_new_library_function_descriptor(library, data->entrypoint_name);
+   int64_t t0 = os_time_get_nano();
+   mtl_compute_pipeline_state *pipeline = mtl_new_compute_pipeline_state_linked(
+      compiler, function, local_size_threads, link->functions, link->count);
+   fprintf(stderr, "kk rt: linked kernel with %u functions in %.1f ms%s\n",
+           link->count, (os_time_get_nano() - t0) / 1e6,
+           pipeline ? "" : " (failed)");
+   mtl_release(function);
+   mtl_release(library);
+   if (pipeline == NULL)
+      return VK_ERROR_INVALID_SHADER_NV;
+
+   mtl_visible_function_table *table =
+      mtl_new_visible_function_table(pipeline, link->table_size);
+   if (table == NULL) {
+      mtl_release(pipeline);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   for (uint32_t i = 0; i < link->count; i++) {
+      if (!mtl_visible_function_table_set(table, pipeline, link->functions[i],
+                                          link->indices[i])) {
+         mtl_release(table);
+         mtl_release(pipeline);
+         return VK_ERROR_INVALID_SHADER_NV;
+      }
+   }
+   kk_device_add_allocation_to_residency_set(device, table);
+   s->pipeline.cs = pipeline;
+   s->pipeline.rt_table = table;
+   s->pipeline.rt_table_id = mtl_visible_function_table_resource_id(table);
    return VK_SUCCESS;
 }
 
@@ -2750,10 +2856,13 @@ kk_compile_program(struct kk_device *dev, struct kk_shader *s,
       uint32_t local_size_threads = s->info.cs.local_size.x *
                                     s->info.cs.local_size.y *
                                     s->info.cs.local_size.z;
-      result =
-         kk_compile_compute_pipeline(dev, compiler,
-                                     &s->msl_data[MESA_SHADER_COMPUTE],
-                                     local_size_threads, &s->pipeline.cs);
+      if (s->rt_link)
+         result = kk_compile_rt_kernel(dev, compiler, s, local_size_threads);
+      else
+         result =
+            kk_compile_compute_pipeline(dev, compiler,
+                                        &s->msl_data[MESA_SHADER_COMPUTE],
+                                        local_size_threads, &s->pipeline.cs);
    } else {
       result = kk_compile_graphics_pipeline(dev, compiler, s);
    }
