@@ -8,6 +8,7 @@
 #include "kk_cmd_buffer.h"
 #include "util/simple_mtx.h"
 
+#include "kk_acceleration_structure.h"
 #include "kk_buffer.h"
 #include "kk_cmd_pool.h"
 #include "kk_descriptor_set_layout.h"
@@ -1369,6 +1370,10 @@ kk_upload_descriptor_root(struct kk_cmd_buffer *cmd,
       return 0u;
 
    root->addr = root_ptr.gpu;
+
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   if (kk_physical_device_has_raytracing(kk_device_physical(dev)))
+      kk_rt_get_va_table(dev, &root->rt_va_table, &root->rt_va_mask);
 
    memcpy(root_ptr.cpu, root, sizeof(*root));
    desc->root_dirty = false;

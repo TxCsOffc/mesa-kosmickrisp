@@ -60,6 +60,9 @@ struct kk_root_descriptor_table {
 
    /* Start index in dynamic_buffers where each set starts */
    uint8_t set_dynamic_buffer_start[KK_MAX_SETS];
+
+   uint64_t rt_va_table;
+   uint32_t rt_va_mask;
 };
 
 struct kk_descriptor_state {

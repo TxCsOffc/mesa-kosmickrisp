@@ -158,6 +158,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .KHR_maintenance8 = true,
       .KHR_maintenance9 = true,
       .KHR_maintenance10 = true,
+      .KHR_ray_query = kk_physical_device_has_raytracing(pdev),
 #ifdef KK_USE_WSI_PLATFORM
       .KHR_present_id = true,
       .KHR_present_id2 = true,
@@ -563,6 +564,8 @@ kk_get_device_features(
       .accelerationStructure = supported_extensions->KHR_acceleration_structure,
       .descriptorBindingAccelerationStructureUpdateAfterBind =
          supported_extensions->KHR_acceleration_structure,
+
+      .rayQuery = supported_extensions->KHR_ray_query,
    };
 }
 

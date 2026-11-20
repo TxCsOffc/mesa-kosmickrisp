@@ -15,6 +15,7 @@
 
 #include "nir.h"
 #include "nir_builder.h"
+#include "util/u_dynarray.h"
 #include "nir_builder_opcodes.h"
 #include "nir_intrinsics.h"
 #include "nir_intrinsics_indices.h"
@@ -351,8 +352,7 @@ static bool
 try_lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
                                  const struct lower_descriptors_ctx *ctx)
 {
-   ASSERTED const nir_descriptor_type desc_type =
-      nir_intrinsic_desc_type(intrin);
+   const nir_descriptor_type desc_type = nir_intrinsic_desc_type(intrin);
    b->cursor = nir_before_instr(&intrin->instr);
 
    nir_intrinsic_instr *idx_intrin = nir_src_as_intrinsic(intrin->src[0]);
@@ -361,7 +361,20 @@ try_lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
       return false;
    }
 
-   nir_def *desc = load_descriptor_for_idx_intrin(b, idx_intrin, ctx);
+   nir_def *desc;
+   if (desc_type == nir_descriptor_type_acceleration_structure) {
+      nir_def *index = nir_imm_int(b, 0);
+      nir_intrinsic_instr *it = idx_intrin;
+      while (it->intrinsic == nir_intrinsic_vulkan_resource_reindex) {
+         index = nir_iadd(b, index, it->src[1].ssa);
+         it = nir_src_as_intrinsic(it->src[0]);
+      }
+      index = nir_iadd(b, index, it->src[0].ssa);
+      desc = load_descriptor(b, 1, 64, nir_intrinsic_desc_set(it),
+                             nir_intrinsic_binding(it), index, 0, ctx);
+   } else {
+      desc = load_descriptor_for_idx_intrin(b, idx_intrin, ctx);
+   }
 
    nir_def_rewrite_uses(&intrin->def, desc);
 
@@ -1428,6 +1441,92 @@ lower_ssbo_descriptor(nir_builder *b, nir_intrinsic_instr *intr, void *_data)
    }
 }
 
+static nir_def *
+kk_rt_hash_u64(nir_builder *b, nir_def *x)
+{
+   x = nir_ixor(b, x, nir_ushr_imm(b, x, 30));
+   x = nir_imul(b, x, nir_imm_int64(b, 0xbf58476d1ce4e5b9ull));
+   x = nir_ixor(b, x, nir_ushr_imm(b, x, 27));
+   x = nir_imul(b, x, nir_imm_int64(b, 0x94d049bb133111ebull));
+   return nir_ixor(b, x, nir_ushr_imm(b, x, 31));
+}
+
+static nir_def *
+kk_rt_resolve_as(nir_builder *b, nir_def *ref)
+{
+   nir_def *table =
+      load_root(b, 1, 64, nir_imm_int(b, kk_root_descriptor_offset(rt_va_table)), 8);
+   nir_def *mask =
+      load_root(b, 1, 32, nir_imm_int(b, kk_root_descriptor_offset(rt_va_mask)), 4);
+
+   nir_variable *res =
+      nir_local_variable_create(b->impl, glsl_uint64_t_type(), "kk_rt_as");
+   nir_variable *iter =
+      nir_local_variable_create(b->impl, glsl_uint_type(), "kk_rt_probe");
+   nir_store_var(b, res, ref, 1);
+
+   nir_push_if(b, nir_iand(b, nir_ine_imm(b, table, 0), nir_ine_imm(b, ref, 0)));
+   {
+      nir_def *slot = nir_iand(b, nir_u2u32(b, kk_rt_hash_u64(b, ref)), mask);
+      nir_store_var(b, iter, nir_imm_int(b, 0), 1);
+      nir_push_loop(b);
+      {
+         nir_def *i = nir_load_var(b, iter);
+         nir_break_if(b, nir_ult(b, mask, i));
+         nir_def *idx = nir_iand(b, nir_iadd(b, slot, i), mask);
+         nir_def *addr = nir_iadd(b, table, nir_u2u64(b, nir_imul_imm(b, idx, 16)));
+         nir_def *entry = nir_build_load_global(b, 2, 64, addr, .align_mul = 16);
+         nir_def *key = nir_channel(b, entry, 0);
+         nir_push_if(b, nir_ieq(b, key, ref));
+         {
+            nir_store_var(b, res, nir_channel(b, entry, 1), 1);
+            nir_jump(b, nir_jump_break);
+         }
+         nir_pop_if(b, NULL);
+         nir_break_if(b, nir_ieq_imm(b, key, 0));
+         nir_store_var(b, iter, nir_iadd_imm(b, i, 1), 1);
+      }
+      nir_pop_loop(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+
+   return nir_load_var(b, res);
+}
+
+static bool
+kk_nir_lower_rq_as(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      struct util_dynarray inits;
+      util_dynarray_init(&inits, NULL);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_rq_initialize)
+               util_dynarray_append(&inits, intr);
+         }
+      }
+      nir_builder b = nir_builder_create(impl);
+      util_dynarray_foreach(&inits, nir_intrinsic_instr *, it) {
+         nir_intrinsic_instr *intr = *it;
+         b.cursor = nir_before_instr(&intr->instr);
+         nir_def *id = kk_rt_resolve_as(&b, intr->src[1].ssa);
+         nir_src_rewrite(&intr->src[1], id);
+      }
+      if (util_dynarray_num_elements(&inits, nir_intrinsic_instr *)) {
+         progress = true;
+         nir_progress(true, impl, nir_metadata_none);
+      } else {
+         nir_no_progress(impl);
+      }
+      util_dynarray_fini(&inits);
+   }
+   return progress;
+}
+
 bool
 kk_nir_lower_descriptors(nir_shader *nir,
                          const struct vk_pipeline_robustness_state *rs,
@@ -1463,7 +1562,9 @@ kk_nir_lower_descriptors(nir_shader *nir,
    bool pass_lower_ssbo = nir_shader_intrinsics_pass(
       nir, lower_ssbo_descriptor, nir_metadata_control_flow, &ctx);
 
-   return pass_lower_descriptors || pass_lower_ssbo;
+   bool pass_lower_rq = kk_nir_lower_rq_as(nir);
+
+   return pass_lower_descriptors || pass_lower_ssbo || pass_lower_rq;
 }
 
 static bool

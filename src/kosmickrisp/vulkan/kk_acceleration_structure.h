@@ -37,5 +37,6 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_acceleration_structure, base,
 
 VkResult kk_rt_init(struct kk_device *dev);
 void kk_rt_finish(struct kk_device *dev);
+void kk_rt_get_va_table(struct kk_device *dev, uint64_t *addr, uint32_t *mask);
 
 #endif

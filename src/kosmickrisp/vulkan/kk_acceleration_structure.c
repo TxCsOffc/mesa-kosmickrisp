@@ -11,6 +11,7 @@
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
 #include "util/hash_table.h"
+#include "util/u_atomic.h"
 #include "util/u_math.h"
 #include "vk_alloc.h"
 
@@ -213,6 +214,20 @@ kk_rt_ensure_buffers_locked(struct kk_device *dev)
       dev->rt.va_table_mask = KK_RT_VA_TABLE_SLOTS - 1u;
    }
    return VK_SUCCESS;
+}
+
+void
+kk_rt_get_va_table(struct kk_device *dev, uint64_t *addr, uint32_t *mask)
+{
+   struct kk_bo *bo = p_atomic_read(&dev->rt.va_table_bo);
+   if (!bo) {
+      simple_mtx_lock(&dev->rt.lock);
+      kk_rt_ensure_buffers_locked(dev);
+      bo = dev->rt.va_table_bo;
+      simple_mtx_unlock(&dev->rt.lock);
+   }
+   *addr = bo ? bo->gpu : 0;
+   *mask = bo ? KK_RT_VA_TABLE_SLOTS - 1u : 0;
 }
 
 static mtl_compute_pipeline_state *

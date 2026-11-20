@@ -308,6 +308,40 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
       set_type(types, &instr->src[0], TYPE_UINT);
       break;
 
+   case nir_intrinsic_rq_initialize:
+      set_type(types, &instr->src[1], TYPE_UINT);
+      set_type(types, &instr->src[2], TYPE_UINT);
+      set_type(types, &instr->src[3], TYPE_UINT);
+      for (unsigned i = 4; i < 8; i++)
+         set_type(types, &instr->src[i], TYPE_FLOAT);
+      break;
+   case nir_intrinsic_rq_proceed:
+      set_type(types, &instr->def, TYPE_BOOL);
+      break;
+   case nir_intrinsic_rq_generate_intersection:
+      set_type(types, &instr->src[1], TYPE_FLOAT);
+      break;
+   case nir_intrinsic_rq_load:
+      switch (nir_intrinsic_ray_query_value(instr)) {
+      case nir_ray_query_value_intersection_type:
+      case nir_ray_query_value_intersection_instance_custom_index:
+      case nir_ray_query_value_intersection_instance_id:
+      case nir_ray_query_value_intersection_instance_sbt_index:
+      case nir_ray_query_value_intersection_geometry_index:
+      case nir_ray_query_value_intersection_primitive_index:
+      case nir_ray_query_value_flags:
+         set_type(types, &instr->def, TYPE_UINT);
+         break;
+      case nir_ray_query_value_intersection_front_face:
+      case nir_ray_query_value_intersection_candidate_aabb_opaque:
+         set_type(types, &instr->def, TYPE_BOOL);
+         break;
+      default:
+         set_type(types, &instr->def, TYPE_FLOAT);
+         break;
+      }
+      break;
+
    case nir_intrinsic_global_atomic:
    case nir_intrinsic_global_atomic_swap:
    case nir_intrinsic_shared_atomic:
