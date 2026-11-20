@@ -11,6 +11,7 @@
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
 #include "util/hash_table.h"
+#include "util/u_dynarray.h"
 #include "util/u_atomic.h"
 #include "util/u_math.h"
 #include "vk_alloc.h"
@@ -19,6 +20,11 @@
 
 #define KK_RT_VA_TABLE_SLOTS 65536u
 #define KK_RT_VA_TOMBSTONE   1ull
+
+struct kk_rt_sidecar {
+   struct kk_bo *bo;
+   uint32_t cap;
+};
 
 struct kk_rt_va_entry {
    uint64_t key;
@@ -33,6 +39,7 @@ struct kk_rt_convert_params {
    uint32_t count;
    uint32_t array_of_pointers;
    uint32_t pad;
+   uint64_t sidecar_addr;
 };
 
 static const char kk_rt_instance_convert_msl[] =
@@ -46,6 +53,7 @@ static const char kk_rt_instance_convert_msl[] =
    "   uint32_t count;\n"
    "   uint32_t array_of_pointers;\n"
    "   uint32_t pad;\n"
+   "   uint64_t sidecar_addr;\n"
    "};\n"
    "struct kk_vk_as_instance {\n"
    "   float m00, m01, m02, m03;\n"
@@ -112,6 +120,8 @@ static const char kk_rt_instance_convert_msl[] =
    "         dst->intersection_function_table_offset = 0u;\n"
    "         dst->user_id = 0u;\n"
    "         dst->acceleration_structure_id = 0ul;\n"
+   "         if (params.sidecar_addr != 0ul)\n"
+   "            reinterpret_cast<device uint32_t *>(params.sidecar_addr)[gid] = 0u;\n"
    "         return;\n"
    "      }\n"
    "      src = reinterpret_cast<const device kk_vk_as_instance *>(ptr);\n"
@@ -130,6 +140,9 @@ static const char kk_rt_instance_convert_msl[] =
    "   dst->intersection_function_table_offset = src->sbt_offset_and_flags & 0xffffffu;\n"
    "   dst->user_id = src->custom_index_and_mask & 0xffffffu;\n"
    "   dst->acceleration_structure_id = blas_id;\n"
+   "   if (params.sidecar_addr != 0ul)\n"
+   "      reinterpret_cast<device uint32_t *>(params.sidecar_addr)[gid] =\n"
+   "         src->sbt_offset_and_flags & 0xffffffu;\n"
    "}\n";
 
 static inline uint64_t
@@ -165,6 +178,9 @@ kk_rt_init(struct kk_device *dev)
    dev->rt.va_table_mask = 0;
    dev->rt.as_by_id = _mesa_hash_table_create(NULL, kk_u64_key_hash,
                                               kk_u64_key_equal);
+   dev->rt.sidecars = _mesa_hash_table_create(NULL, kk_u64_key_hash,
+                                              kk_u64_key_equal);
+   util_dynarray_init(&dev->rt.sidecar_garbage, NULL);
    if (!dev->rt.as_by_id) {
       simple_mtx_destroy(&dev->rt.lock);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -191,6 +207,19 @@ kk_rt_finish(struct kk_device *dev)
       _mesa_hash_table_destroy(dev->rt.as_by_id, NULL);
       dev->rt.as_by_id = NULL;
    }
+   if (dev->rt.sidecars) {
+      hash_table_foreach(dev->rt.sidecars, e) {
+         struct kk_rt_sidecar *sc = e->data;
+         if (sc->bo)
+            kk_destroy_bo(dev, sc->bo);
+         free(sc);
+      }
+      _mesa_hash_table_destroy(dev->rt.sidecars, NULL);
+      dev->rt.sidecars = NULL;
+   }
+   util_dynarray_foreach(&dev->rt.sidecar_garbage, struct kk_bo *, bo)
+      kk_destroy_bo(dev, *bo);
+   util_dynarray_fini(&dev->rt.sidecar_garbage);
    simple_mtx_destroy(&dev->rt.lock);
 }
 
@@ -603,6 +632,45 @@ kk_GetDeviceAccelerationStructureCompatibilityKHR(
    *pCompatibility = VK_ACCELERATION_STRUCTURE_COMPATIBILITY_INCOMPATIBLE_KHR;
 }
 
+static uint64_t
+kk_rt_get_sidecar(struct kk_device *dev, struct kk_acceleration_structure *as,
+                  uint32_t count)
+{
+   if (!as)
+      return 0;
+
+   simple_mtx_lock(&dev->rt.lock);
+   void *key = (void *)(uintptr_t)as->buffer_va;
+   struct hash_entry *e = _mesa_hash_table_search(dev->rt.sidecars, key);
+   struct kk_rt_sidecar *sc = e ? e->data : NULL;
+   if (!sc) {
+      sc = calloc(1, sizeof(*sc));
+      if (!sc) {
+         simple_mtx_unlock(&dev->rt.lock);
+         return 0;
+      }
+      _mesa_hash_table_insert(dev->rt.sidecars, key, sc);
+   }
+   if (sc->cap < count) {
+      uint32_t cap = MAX2(util_next_power_of_two(count), 256u);
+      struct kk_bo *bo = NULL;
+      if (kk_alloc_bo(dev, &dev->vk.base, cap * 4ull, 256u, &bo) == VK_SUCCESS) {
+         memset(bo->cpu, 0, cap * 4ull);
+         if (sc->bo)
+            util_dynarray_append(&dev->rt.sidecar_garbage, sc->bo);
+         sc->bo = bo;
+         sc->cap = cap;
+      }
+   }
+   uint64_t addr = sc->bo ? sc->bo->gpu : 0;
+   if (addr) {
+      kk_rt_va_table_insert_locked(dev, as->buffer_va | (1ull << 63), addr);
+      kk_rt_va_table_insert_locked(dev, as->mtl_resource_id | (1ull << 63), addr);
+   }
+   simple_mtx_unlock(&dev->rt.lock);
+   return sc->cap >= count ? addr : 0;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdBuildAccelerationStructuresKHR(
    VkCommandBuffer commandBuffer, uint32_t infoCount,
@@ -667,7 +735,9 @@ kk_CmdBuildAccelerationStructuresKHR(
                return;
             }
 
+            uint64_t sidecar_addr = kk_rt_get_sidecar(dev, dst, count);
             struct kk_rt_convert_params params = {
+               .sidecar_addr = sidecar_addr,
                .src_addr = src_addr,
                .dst_addr = dst_ptr.gpu,
                .va_table_addr = va_table_addr,

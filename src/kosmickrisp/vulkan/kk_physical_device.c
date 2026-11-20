@@ -159,6 +159,8 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .KHR_maintenance9 = true,
       .KHR_maintenance10 = true,
       .KHR_ray_query = kk_physical_device_has_raytracing(pdev),
+      .KHR_ray_tracing_pipeline = kk_physical_device_has_raytracing(pdev),
+      .KHR_pipeline_library = kk_physical_device_has_raytracing(pdev),
 #ifdef KK_USE_WSI_PLATFORM
       .KHR_present_id = true,
       .KHR_present_id2 = true,
@@ -566,6 +568,8 @@ kk_get_device_features(
          supported_extensions->KHR_acceleration_structure,
 
       .rayQuery = supported_extensions->KHR_ray_query,
+
+      .rayTracingPipeline = supported_extensions->KHR_ray_tracing_pipeline,
    };
 }
 
@@ -967,6 +971,15 @@ kk_get_device_properties(
       .maxDescriptorSetUpdateAfterBindAccelerationStructures =
          KK_MAX_DESCRIPTORS,
       .minAccelerationStructureScratchOffsetAlignment = 256,
+
+      .shaderGroupHandleSize = 32,
+      .maxRayRecursionDepth = 1,
+      .maxShaderGroupStride = 4096,
+      .shaderGroupBaseAlignment = 64,
+      .shaderGroupHandleCaptureReplaySize = 32,
+      .maxRayDispatchInvocationCount = 1u << 30,
+      .shaderGroupHandleAlignment = 32,
+      .maxRayHitAttributeSize = 32,
    };
 
    char gpu_name[256u];

@@ -372,6 +372,16 @@ try_lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
       index = nir_iadd(b, index, it->src[0].ssa);
       desc = load_descriptor(b, 1, 64, nir_intrinsic_desc_set(it),
                              nir_intrinsic_binding(it), index, 0, ctx);
+      nir_def_replace(&intrin->def, desc);
+      while (idx_intrin && nir_def_is_unused(&idx_intrin->def)) {
+         nir_intrinsic_instr *parent =
+            idx_intrin->intrinsic == nir_intrinsic_vulkan_resource_reindex
+               ? nir_src_as_intrinsic(idx_intrin->src[0])
+               : NULL;
+         nir_instr_remove(&idx_intrin->instr);
+         idx_intrin = parent;
+      }
+      return true;
    } else {
       desc = load_descriptor_for_idx_intrin(b, idx_intrin, ctx);
    }
@@ -716,6 +726,13 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
 
    case nir_intrinsic_load_base_workgroup_id:
       return lower_sysval_to_root_table(b, intrin, cs.base_group);
+   case nir_intrinsic_load_sbt_base_amd: {
+      b->cursor = nir_instr_remove(&intrin->instr);
+      nir_def *val = load_root(
+         b, 1, 64, nir_imm_int(b, kk_root_descriptor_offset(cs.rt_params)), 8);
+      nir_def_rewrite_uses(&intrin->def, val);
+      return true;
+   }
 
    case nir_intrinsic_load_blend_const_color_rgba:
       return lower_sysval_to_root_table(b, intrin, draw.blend_constant);
@@ -1452,18 +1469,14 @@ kk_rt_hash_u64(nir_builder *b, nir_def *x)
 }
 
 static nir_def *
-kk_rt_resolve_as(nir_builder *b, nir_def *ref)
+kk_rt_lookup(nir_builder *b, nir_def *table, nir_def *mask, nir_def *ref,
+             nir_def *dflt)
 {
-   nir_def *table =
-      load_root(b, 1, 64, nir_imm_int(b, kk_root_descriptor_offset(rt_va_table)), 8);
-   nir_def *mask =
-      load_root(b, 1, 32, nir_imm_int(b, kk_root_descriptor_offset(rt_va_mask)), 4);
-
    nir_variable *res =
       nir_local_variable_create(b->impl, glsl_uint64_t_type(), "kk_rt_as");
    nir_variable *iter =
       nir_local_variable_create(b->impl, glsl_uint_type(), "kk_rt_probe");
-   nir_store_var(b, res, ref, 1);
+   nir_store_var(b, res, dflt, 1);
 
    nir_push_if(b, nir_iand(b, nir_ine_imm(b, table, 0), nir_ine_imm(b, ref, 0)));
    {
@@ -1513,8 +1526,16 @@ kk_nir_lower_rq_as(nir_shader *nir)
       util_dynarray_foreach(&inits, nir_intrinsic_instr *, it) {
          nir_intrinsic_instr *intr = *it;
          b.cursor = nir_before_instr(&intr->instr);
-         nir_def *id = kk_rt_resolve_as(&b, intr->src[1].ssa);
-         nir_src_rewrite(&intr->src[1], id);
+         nir_def *ref = intr->src[1].ssa;
+         nir_def *table = load_root(
+            &b, 1, 64, nir_imm_int(&b, kk_root_descriptor_offset(rt_va_table)), 8);
+         nir_def *mask = load_root(
+            &b, 1, 32, nir_imm_int(&b, kk_root_descriptor_offset(rt_va_mask)), 4);
+         nir_def *id = kk_rt_lookup(&b, table, mask, ref, ref);
+         nir_def *sbt_key = nir_ior_imm(&b, ref, 1ull << 63);
+         nir_def *sidecar =
+            kk_rt_lookup(&b, table, mask, sbt_key, nir_imm_int64(&b, 0));
+         nir_src_rewrite(&intr->src[1], nir_vec2(&b, id, sidecar));
       }
       if (util_dynarray_num_elements(&inits, nir_intrinsic_instr *)) {
          progress = true;

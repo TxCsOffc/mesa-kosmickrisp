@@ -6,6 +6,7 @@
 #include "kosmickrisp/bridge/mtl_types.h"
 
 #include "util/simple_mtx.h"
+#include "util/u_dynarray.h"
 #include "vk_object.h"
 
 struct hash_table;
@@ -19,6 +20,8 @@ struct kk_rt_state {
    struct kk_bo *va_table_bo;
    uint32_t va_table_mask;
    struct hash_table *as_by_id;
+   struct hash_table *sidecars;
+   struct util_dynarray sidecar_garbage;
 };
 
 struct kk_acceleration_structure {

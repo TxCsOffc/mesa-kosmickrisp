@@ -1325,6 +1325,7 @@ emit_ray_query_vars(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
          P_IND(ctx, "intersection_query<triangle_data, instancing> rq%u;\n",
                var->index);
          P_IND(ctx, "uint rq%u_flags = 0u;\n", var->index);
+         P_IND(ctx, "ulong rq%u_sbt = 0ul;\n", var->index);
       }
    }
 }
@@ -1348,12 +1349,16 @@ rq_initialize_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
    P_IND(ctx, "p.set_geometry_cull_mode(((f & 0x100u) ? geometry_cull_mode::triangle : "
               "geometry_cull_mode::none) | ((f & 0x200u) ? geometry_cull_mode::bounding_box : "
               "geometry_cull_mode::none));\n");
-   P_IND(ctx, "ulong as_raw = ");
+   P_IND(ctx, "ulong2 as_raw = ulong2(");
    src_to_msl(ctx, &instr->src[1]);
-   P(ctx, ";\n");
-   P_IND(ctx, "instance_acceleration_structure as = as_raw != 0ul ? "
-              "*(const thread instance_acceleration_structure *)&as_raw : "
+   P(ctx, "%s);\n", instr->src[1].ssa->num_components == 1 ? ", 0ul" : "");
+   P_IND(ctx, "ulong as_id = as_raw.x;\n");
+   P_IND(ctx, "instance_acceleration_structure as = as_id != 0ul ? "
+              "*(const thread instance_acceleration_structure *)&as_id : "
               "instance_acceleration_structure();\n");
+   P_INDENT(ctx);
+   rq_name_to_msl(ctx, &instr->src[0]);
+   P(ctx, "_sbt = as_raw.y;\n");
    P_IND(ctx, "ray r(");
    src_to_msl(ctx, &instr->src[4]);
    P(ctx, ", ");
@@ -1401,7 +1406,11 @@ rq_load_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       P(ctx, ".get_%s_instance_id()", w);
       break;
    case nir_ray_query_value_intersection_instance_sbt_index:
-      P(ctx, ".get_%s_instance_id() * 0u", w);
+      P(ctx, "_sbt != 0ul ? ((const device uint *)");
+      rq_name_to_msl(ctx, &instr->src[0]);
+      P(ctx, "_sbt)[");
+      rq_name_to_msl(ctx, &instr->src[0]);
+      P(ctx, ".get_%s_instance_id()] : 0u", w);
       break;
    case nir_ray_query_value_intersection_geometry_index:
       P(ctx, ".get_%s_geometry_id()", w);
