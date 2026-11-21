@@ -2023,6 +2023,35 @@ kk_hb_math_functions(void)
              : MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST;
 }
 
+/* HB_KK_MSL_OVERRIDE_DIR: a library whose MSL hashes (_mesa_hash_string, as
+ * kk_msl_digest names programs) to H compiles <dir>/<H as %08x>.metal instead,
+ * when that file exists. */
+static char *
+kk_hb_msl_override(const char *source)
+{
+   const char *dir = getenv("HB_KK_MSL_OVERRIDE_DIR");
+   if (dir == NULL || dir[0] == '\0')
+      return NULL;
+   char path[1024];
+   snprintf(path, sizeof(path), "%s/%08x.metal", dir, _mesa_hash_string(source));
+   FILE *f = fopen(path, "rb");
+   if (f == NULL)
+      return NULL;
+   fseek(f, 0, SEEK_END);
+   long size = ftell(f);
+   fseek(f, 0, SEEK_SET);
+   char *text = size > 0 ? malloc(size + 1) : NULL;
+   if (text != NULL && fread(text, 1, size, f) == (size_t)size) {
+      text[size] = '\0';
+      mesa_logi("kk: MSL override from %s", path);
+   } else {
+      free(text);
+      text = NULL;
+   }
+   fclose(f);
+   return text;
+}
+
 /* The compiled library of an MSL source, from the device's table or compiled
  * into it (kk_device::msl_libraries): a title asks for the same program once
  * per pipeline, and while Metal's own cache answers each request in fractions
@@ -2045,9 +2074,12 @@ kk_get_msl_library(struct kk_device *device, const char *source,
       return library;
 
    struct kk_physical_device *pdev = kk_device_physical(device);
-   library = mtl_new_library(device->mtl_compiler_handle, source,
+   char *override = kk_hb_msl_override(source);
+   library = mtl_new_library(device->mtl_compiler_handle,
+                             override ? override : source,
                              pdev->info.msl_version, kk_hb_math_mode(),
                              kk_hb_math_functions());
+   free(override);
    /* Takes the key, which this caller no longer owns */
    kk_metal_cache_publish(&device->msl_libraries, key, library);
    return library;
