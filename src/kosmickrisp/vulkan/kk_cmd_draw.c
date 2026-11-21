@@ -1210,6 +1210,55 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
          mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
    }
 
+   /* Live test switch (HB_KK_LIVE zequal=1 always, 2 greater or equal,
+    * 3 less or equal): draws whose depth test is EQUAL use that instead. */
+   {
+      const uint32_t zmode = kk_hb_zequal();
+      const bool hb_override = zmode != 0u && dyn->ds.depth.test_enable &&
+                               dyn->ds.depth.compare_op == VK_COMPARE_OP_EQUAL;
+      if (hb_override) {
+         static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
+         static struct {
+            struct vk_depth_stencil_state ds;
+            bool has_depth, has_stencil;
+            mtl_depth_stencil_state *state;
+         } cache[32];
+         static uint32_t cache_count;
+         struct vk_depth_stencil_state ds = dyn->ds;
+         ds.depth.compare_op = zmode == 1u   ? VK_COMPARE_OP_ALWAYS
+                               : zmode == 2u ? VK_COMPARE_OP_GREATER_OR_EQUAL
+                                             : VK_COMPARE_OP_LESS_OR_EQUAL;
+         bool has_depth = dyn->rp.attachments & MESA_VK_RP_ATTACHMENT_DEPTH_BIT;
+         bool has_stencil =
+            dyn->rp.attachments & MESA_VK_RP_ATTACHMENT_STENCIL_BIT;
+         mtl_depth_stencil_state *state = NULL;
+         simple_mtx_lock(&lock);
+         for (uint32_t i = 0; i < cache_count && !state; i++) {
+            if (!memcmp(&cache[i].ds, &ds, sizeof(ds)) &&
+                cache[i].has_depth == has_depth &&
+                cache[i].has_stencil == has_stencil)
+               state = cache[i].state;
+         }
+         if (!state) {
+            state = kk_compile_depth_stencil_state(device, &ds, has_depth,
+                                                   has_stencil);
+            if (cache_count < ARRAY_SIZE(cache)) {
+               cache[cache_count].ds = ds;
+               cache[cache_count].has_depth = has_depth;
+               cache[cache_count].has_stencil = has_stencil;
+               cache[cache_count++].state = state;
+            }
+         }
+         simple_mtx_unlock(&lock);
+         mtl_set_depth_stencil_state(enc, state);
+         gfx->hb_ds_overridden = true;
+      } else if (gfx->hb_ds_overridden) {
+         gfx->hb_ds_overridden = false;
+         if (gfx->depth_stencil_state)
+            mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
+      }
+   }
+
    /* Merge tess info before GS construction since that depends on
     * gfx->tess.prim
     */

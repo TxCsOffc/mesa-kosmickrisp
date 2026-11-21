@@ -169,6 +169,7 @@ struct kk_graphics_state {
    struct kk_per_draw_data per_draw_data;
 
    mtl_depth_stencil_state *depth_stencil_state;
+   bool hb_ds_overridden;
    mtl_render_pass_descriptor *render_pass_descriptor;
    bool is_depth_stencil_dynamic;
    bool is_cull_front_and_back;
@@ -262,6 +263,7 @@ uint32_t kk_hb_rt_live_flags(void);
 struct kk_cb_program;
 uint32_t kk_hb_skip_filter(void);
 uint32_t kk_hb_msl_gen(void);
+uint32_t kk_hb_zequal(void);
 bool kk_hb_skip_draw(const struct kk_cb_program *record, const char *vs_msl,
                      const char *fs_msl);
 
