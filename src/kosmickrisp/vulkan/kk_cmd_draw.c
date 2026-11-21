@@ -1806,6 +1806,17 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
    if (unlikely(pipe == NULL))
       return false;
 
+   {
+      const uint32_t gen = kk_hb_msl_gen();
+      struct kk_shader *prog =
+         container_of(pipe, struct kk_shader, pipeline);
+      if (gen != 0u && prog->hb_msl_gen != gen) {
+         prog->hb_msl_gen = gen;
+         if (kk_hb_reload_program(kk_cmd_buffer_device(cmd), prog))
+            gfx->pipe = NULL;
+      }
+   }
+
    if (pipe != gfx->pipe) {
       gfx->pipe = pipe;
       cmd->state.dirty_shaders |= BITFIELD_BIT(MESA_SHADER_VERTEX);

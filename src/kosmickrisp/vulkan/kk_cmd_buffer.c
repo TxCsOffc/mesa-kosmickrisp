@@ -457,6 +457,7 @@ kk_hb_live_force(int keep_empty, int no_resume_merge, int no_begin_merge)
    p_atomic_set(&kk_hb_live_values[KK_HB_LIVE_NO_RESUME_MERGE], no_resume_merge);
    p_atomic_set(&kk_hb_live_values[KK_HB_LIVE_NO_BEGIN_MERGE], no_begin_merge);
 }
+static uint32_t kk_hb_msl_gen_value;
 static uint32_t kk_hb_skip_mask, kk_hb_skip_value, kk_hb_skip_epoch, kk_hb_skip_filter_bits;
 static int64_t kk_hb_live_next_check;
 static int64_t kk_hb_live_mtime = -1;
@@ -487,7 +488,7 @@ kk_hb_live_refresh(void)
       mtime = (int64_t)st.st_mtimespec.tv_sec * 1000000000ll + st.st_mtimespec.tv_nsec;
    if (mtime != kk_hb_live_mtime) {
       int values[KK_HB_LIVE_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-      uint32_t skip_mask = 0u, skip_value = 0u, skip_filter = 1u;
+      uint32_t skip_mask = 0u, skip_value = 0u, skip_filter = 1u, msl_gen = 0u;
       FILE *f = mtime >= 0 ? fopen(path, "r") : NULL;
       if (f) {
          char word[64];
@@ -506,6 +507,8 @@ kk_hb_live_refresh(void)
                skip_value = strtoul(eq + 1, NULL, 0);
             else if (!strcmp(word, "skip_filter"))
                skip_filter = strtoul(eq + 1, NULL, 0);
+            else if (!strcmp(word, "msl_gen"))
+               msl_gen = strtoul(eq + 1, NULL, 0);
          }
          fclose(f);
       }
@@ -513,6 +516,7 @@ kk_hb_live_refresh(void)
          p_atomic_set(&kk_hb_live_values[i], values[i]);
       p_atomic_set(&kk_hb_skip_value, skip_value);
       p_atomic_set(&kk_hb_skip_filter_bits, skip_filter);
+      p_atomic_set(&kk_hb_msl_gen_value, msl_gen);
       p_atomic_set(&kk_hb_skip_mask, skip_mask);
       p_atomic_inc(&kk_hb_skip_epoch);
       if (skip_mask)
@@ -554,6 +558,13 @@ kk_hb_rt_live_flags(void)
  * draws whose program hash (its Metal vertex function and FS MSL hashes)
  * matches are dropped. The programs of dropped draws are logged once per
  * skip setting, with their MSL while few of them match. */
+uint32_t
+kk_hb_msl_gen(void)
+{
+   kk_hb_live_refresh();
+   return p_atomic_read(&kk_hb_msl_gen_value);
+}
+
 uint32_t
 kk_hb_skip_filter(void)
 {

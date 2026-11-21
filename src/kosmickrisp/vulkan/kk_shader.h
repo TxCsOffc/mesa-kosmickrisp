@@ -181,6 +181,7 @@ struct kk_shader {
    /* Metal pipelines created, when minmax isn't NULL (one of the two
     * programs is compiled on first use) */
    bool pipeline_ready;
+   uint32_t hb_msl_gen;
 
    /* Background compilation (kk_device::compile_*): the program is queued at
     * creation and the pool compiles it, so the ring thread does not spend a
@@ -280,5 +281,7 @@ void kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd,
 const struct kk_pipeline_handles *
 kk_cmd_shader_pipeline(struct kk_cmd_buffer *cmd, struct kk_shader *shader,
                        const struct kk_descriptor_state *desc);
+
+bool kk_hb_reload_program(struct kk_device *dev, struct kk_shader *prog);
 
 #endif /* KK_SHADER_H */

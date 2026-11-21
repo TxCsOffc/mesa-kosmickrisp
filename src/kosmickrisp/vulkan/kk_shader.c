@@ -6,6 +6,7 @@
  */
 
 #include "kk_shader.h"
+#include <unistd.h>
 
 #include "util/u_debug.h"
 
@@ -2062,19 +2063,26 @@ static mtl_library *
 kk_get_msl_library(struct kk_device *device, const char *source,
                    blake3_hash source_digest)
 {
-   _mesa_blake3_compute(source, strlen(source), source_digest);
+   char *override = kk_hb_msl_override(source);
+   if (override)
+      _mesa_blake3_compute(override, strlen(override), source_digest);
+   else
+      _mesa_blake3_compute(source, strlen(source), source_digest);
 
    struct kk_msl_library_key *key = malloc(sizeof(*key));
-   if (key == NULL)
+   if (key == NULL) {
+      free(override);
       return NULL;
+   }
    memcpy(key->source, source_digest, sizeof(key->source));
 
    mtl_library *library = kk_metal_cache_find(&device->msl_libraries, key);
-   if (library != NULL)
+   if (library != NULL) {
+      free(override);
       return library;
+   }
 
    struct kk_physical_device *pdev = kk_device_physical(device);
-   char *override = kk_hb_msl_override(source);
    library = mtl_new_library(device->mtl_compiler_handle,
                              override ? override : source,
                              pdev->info.msl_version, kk_hb_math_mode(),
@@ -3675,3 +3683,34 @@ const struct vk_device_shader_ops kk_device_shader_ops = {
    .cmd_set_dynamic_graphics_state = vk_cmd_set_dynamic_graphics_state,
    .cmd_bind_shaders = kk_cmd_bind_shaders,
 };
+
+/* Live MSL overrides (HB_KK_MSL_OVERRIDE_DIR, kk_hb_msl_gen): recompiles the
+ * render pipeline of a plain VS + FS program from the override files. */
+bool
+kk_hb_reload_program(struct kk_device *dev, struct kk_shader *prog)
+{
+   const char *dir = getenv("HB_KK_MSL_OVERRIDE_DIR");
+   if (dir == NULL || prog->info.stage == MESA_SHADER_COMPUTE ||
+       prog->info.vs.additional_stages_bits &
+          ~BITFIELD_BIT(MESA_SHADER_FRAGMENT))
+      return false;
+   const char *codes[2] = {prog->msl_data[MESA_SHADER_VERTEX].code,
+                           prog->msl_data[MESA_SHADER_FRAGMENT].code};
+   bool any = false;
+   for (unsigned i = 0; i < 2; i++) {
+      if (codes[i] == NULL)
+         continue;
+      char path[1024];
+      snprintf(path, sizeof(path), "%s/%08x.metal", dir,
+               _mesa_hash_string(codes[i]));
+      any |= access(path, F_OK) == 0;
+   }
+   if (!any)
+      return false;
+   VkResult result =
+      kk_compile_graphics_pipeline(dev, dev->mtl_compiler_handle, prog);
+   mesa_logi("kk: live MSL reload of program vs %08x fs %08x: %d",
+             codes[0] ? _mesa_hash_string(codes[0]) : 0u,
+             codes[1] ? _mesa_hash_string(codes[1]) : 0u, result);
+   return result == VK_SUCCESS;
+}
